@@ -4,7 +4,7 @@
 #   image/build.sh [version]     (OUT=dir to choose the output directory)
 #
 # Produces, in image/mkosi.output/ by default:
-#   ephemeris-x86_64.qcow2                       the disk image, for new routers
+#   ephemeris_<v>_x86-64.qcow2                                the disk image, for new routers
 #   ephemeris_<v>_x86-64.root-x86-64.<uuid>.raw.xz           \
 #   ephemeris_<v>_x86-64.root-x86-64-verity.<uuid>.raw.xz     } what systemd-sysupdate
 #   ephemeris_<v>_x86-64.efi                                  /  downloads to update one
@@ -55,7 +55,7 @@ mkdir -p "$OUT"
 base="ephemeris_${VERSION}_x86-64"
 cd "$OUT"
 echo "== converting $base.raw to qcow2"
-qemu-img convert -c -O qcow2 "$base.raw" ephemeris-x86_64.qcow2
+qemu-img convert -c -O qcow2 "$base.raw" "$base.qcow2"
 
 echo "== compressing update artifacts"
 # The root slot is a fixed 1.5 GiB, mostly zeros: compresses very well.
@@ -66,7 +66,7 @@ for f in "$base".root-*.raw; do
 done
 
 echo "$VERSION" > VERSION
-sha256sum ephemeris-x86_64.qcow2 "$base".root-*.raw.xz "$base.efi" > SHA256SUMS
+sha256sum "$base.qcow2" "$base".root-*.raw.xz "$base.efi" > SHA256SUMS
 # Sign the manifest: routers only install updates whose SHA256SUMS.gpg
 # verifies against the release key baked into the image.
 if [[ ${SIGN_RELEASE:-0} == 1 ]]; then

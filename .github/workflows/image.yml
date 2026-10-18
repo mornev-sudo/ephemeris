@@ -3,10 +3,14 @@
 # the very same image to a release (release.yml), without rebuilding.
 name: image
 
+# Commits that only change documentation don't build or test an image
+# (keep this list in sync with DOCS_ONLY in release.yml).
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
   workflow_dispatch:
 
 permissions:
@@ -92,7 +96,7 @@ jobs:
       - name: End-to-end test
         run: |
           sudo -E env "PATH=$PATH" PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
-            ci/e2e.sh image/mkosi.output/ephemeris-x86_64.qcow2 "${{ steps.version.outputs.version }}" \
+            ci/e2e.sh "image/mkosi.output/ephemeris_${{ steps.version.outputs.version }}_x86-64.qcow2" "${{ steps.version.outputs.version }}" \
               update-v2 "${{ steps.version.outputs.version }}.1"
 
       - name: Upload test logs
@@ -109,7 +113,7 @@ jobs:
           # Fixed name, so release.yml can find it.
           name: ephemeris-image
           path: |
-            image/mkosi.output/ephemeris-x86_64.qcow2
+            image/mkosi.output/*.qcow2
             image/mkosi.output/*.raw.xz
             image/mkosi.output/*.efi
             image/mkosi.output/SHA256SUMS

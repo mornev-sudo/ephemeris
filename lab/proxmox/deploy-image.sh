@@ -4,7 +4,7 @@
 #
 #   ./deploy-image.sh                                  # latest release
 #   ./deploy-image.sh 0.3.0                            # specific version
-#   IMAGE=/root/ephemeris-x86_64.qcow2 ./deploy-image.sh # local file
+#   IMAGE=/root/ephemeris_0.5.0.2_x86-64.qcow2 ./deploy-image.sh # local file
 #   SSH_KEY=/root/id_ed25519.pub ./deploy-image.sh     # also install an SSH key
 #
 # It prints the generated admin password at the end.
@@ -49,12 +49,16 @@ if [[ -z $IMAGE ]]; then
     fi
     dir=$CACHE/$VERSION
     mkdir -p "$dir"
-    echo "downloading $base/ephemeris-x86_64.qcow2"
-    curl -fL --progress-bar -o "$dir/ephemeris-x86_64.qcow2" "$base/ephemeris-x86_64.qcow2" \
-        || die "download failed (is the repo private? then download the image yourself and set IMAGE=)"
+    # The image file is named after its build, e.g. ephemeris_0.5.0.2_x86-64.qcow2;
+    # the release's VERSION file says which build it holds.
+    build=$(curl -fsSL "$base/VERSION") || die "can't read $base/VERSION (is the repo private? then download the image yourself and set IMAGE=)"
+    file=ephemeris_${build}_x86-64.qcow2
+    echo "downloading $base/$file"
+    curl -fL --progress-bar -o "$dir/$file" "$base/$file" || die "download failed"
     curl -fsSL -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
-    (cd "$dir" && sha256sum -c SHA256SUMS) || die "checksum mismatch"
-    IMAGE=$dir/ephemeris-x86_64.qcow2
+    # SHA256SUMS also lists the update files, which aren't needed here.
+    (cd "$dir" && sha256sum -c --ignore-missing SHA256SUMS) || die "checksum mismatch"
+    IMAGE=$dir/$file
 fi
 [[ -s $IMAGE ]] || die "no image at $IMAGE"
 

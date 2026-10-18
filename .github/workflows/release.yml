@@ -1,6 +1,7 @@
 # Publish a release by *promoting* an image that the "image" workflow already
-# built and boot-tested for the tagged commit. Nothing is rebuilt, so the
-# released bytes are exactly the bytes that passed the boot test.
+# built and boot-tested for the tagged commit (or, if that commit only changed
+# docs, for the nearest earlier one). Nothing is rebuilt, so the released
+# bytes are exactly the bytes that passed the boot test.
 #
 #   git tag v0.1.0 <commit> && git push origin v0.1.0
 name: release
@@ -20,28 +21,55 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # History is needed to tell docs-only commits from code changes.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Find the tested image for this commit
         id: run
         run: |
-          sha=$GITHUB_SHA
-          # If the tag was pushed right after the commit, its image build may
-          # still be running: wait for it rather than failing.
-          for _ in $(seq 1 60); do
-            run=$(gh run list --workflow image.yml --commit "$sha" --event push \
-                    --json databaseId,status,conclusion \
-                    -q 'map(select(.conclusion == "success" or .status != "completed")) | .[0]')
-            [[ -n $run ]] || break
-            id=$(jq -r .databaseId <<<"$run")
-            [[ $(jq -r .status <<<"$run") == completed ]] && break
-            echo "image run $id for ${sha::8} still in progress, waiting..."
-            sleep 30
+          # Docs-only commits don't get an image of their own (image.yml
+          # skips them), so a tag on one promotes the image of the nearest
+          # earlier commit that has one, provided nothing but docs changed
+          # since. Keep DOCS_ONLY in sync with paths-ignore in image.yml.
+          DOCS_ONLY='(\.md$|^docs/|^LICENSE-)'
+          tag_sha=$GITHUB_SHA
+
+          # The image run for one commit: waits while it's still running.
+          # Prints "<id> <conclusion>", or nothing if the commit has no run.
+          image_run() {
+            local run
+            for _ in $(seq 1 60); do
+              run=$(gh run list --workflow image.yml --commit "$1" --event push \
+                      --json databaseId,status,conclusion \
+                      -q 'map(select(.conclusion == "success" or .status != "completed")) | .[0] // empty')
+              [[ -n $run ]] || { gh run list --workflow image.yml --commit "$1" --event push \
+                      --json databaseId,conclusion -q '.[0] | select(.) | "\(.databaseId) \(.conclusion)"'; return; }
+              [[ $(jq -r .status <<<"$run") == completed ]] && { jq -r '"\(.databaseId) \(.conclusion)"' <<<"$run"; return; }
+              echo "image run $(jq -r .databaseId <<<"$run") for ${1::8} still in progress, waiting..." >&2
+              sleep 30
+            done
+          }
+
+          for sha in $(git rev-list --max-count=100 "$tag_sha"); do
+            if [[ $sha != "$tag_sha" ]] && git diff --name-only "$sha" "$tag_sha" | grep -qvE "$DOCS_ONLY"; then
+              echo "::error::No successful 'image' run for ${tag_sha::8}, and code changed since the last tested commit. Push it to main, wait for its image build to pass, then tag it."
+              exit 1
+            fi
+            read -r id conclusion <<<"$(image_run "$sha")"
+            [[ -z ${id:-} ]] && continue   # no image for this commit: docs only
+            if [[ $conclusion != success ]]; then
+              echo "::error::The image run for ${sha::8} ($id) didn't pass. Fix it, push, wait for CI, then tag."
+              exit 1
+            fi
+            [[ $sha == "$tag_sha" ]] || echo "${tag_sha::8} only changes docs: promoting the image tested at ${sha::8}"
+            echo "id=$id" >> "$GITHUB_OUTPUT"
+            echo "Promoting image from run $id"
+            exit 0
           done
-          if [[ -z ${run:-} || $(jq -r .conclusion <<<"$run") != success ]]; then
-            echo "::error::No successful 'image' run for ${sha::8}. Push the commit to main, wait for its image build to pass, then tag it."
-            exit 1
-          fi
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-          echo "Promoting image from run $id"
+          echo "::error::No tested image found for ${tag_sha::8} or the commits before it."
+          exit 1
 
       - name: Download the tested image
         run: gh run download "${{ steps.run.outputs.id }}" -n ephemeris-image -D dist
@@ -64,4 +92,4 @@ jobs:
           # existing routers download to update themselves (systemd-sysupdate).
           gh release create "$GITHUB_REF_NAME" --title "Ephemeris $GITHUB_REF_NAME" \
             --notes "$notes" --generate-notes \
-            ephemeris-x86_64.qcow2 *.raw.xz *.efi SHA256SUMS SHA256SUMS.gpg VERSION
+            *.qcow2 *.raw.xz *.efi SHA256SUMS SHA256SUMS.gpg VERSION

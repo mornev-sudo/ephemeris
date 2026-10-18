@@ -145,7 +145,12 @@ is stored next to it rather than in it. On a router:
 | `/usr/lib/ephemeris/version`, `/usr/lib/ephemeris/commit` | the raw values |
 
 To release: set the new version in `Cargo.toml`, push, wait for CI to pass,
-then tag that commit `v<version>`. The release workflow refuses a tag that
+then tag that commit `v<version>`.
+
+Commits that only change documentation (Markdown files, `docs/`, the licence
+files) skip the image build entirely. A tag on such a commit releases the
+image tested at the nearest earlier commit, as long as nothing but docs
+changed in between. The release workflow refuses a tag that
 doesn't match the image's release, so a `v0.6.0` tag can't be put on a
 0.5.0 image by mistake. The tag is otherwise just a name attached to an image
 that already exists and already passed its tests. That's also why a release
@@ -209,5 +214,6 @@ and `qemu-img` (for example your dev VM):
 image/build.sh dev
 ```
 
-The image appears at `image/mkosi.output/ephemeris-x86_64.qcow2`. Copy it to
+The image appears at `image/mkosi.output/ephemeris_dev_x86-64.qcow2` (named
+after its version, like every release file). Copy it to
 the Proxmox host and run `IMAGE=/path/to/it ./deploy-image.sh`.
