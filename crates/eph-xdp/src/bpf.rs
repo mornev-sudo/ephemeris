@@ -30,16 +30,31 @@ pub struct XskMap {
     fd: OwnedFd,
 }
 
+/// A kernel object name: at most 15 bytes plus the terminating NUL. Built
+/// at compile time, so a name that doesn't fit fails the build instead of
+/// panicking on a router.
+const fn obj_name(s: &str) -> [u8; 16] {
+    let b = s.as_bytes();
+    assert!(b.len() < 16, "BPF object names hold at most 15 bytes");
+    let mut n = [0u8; 16];
+    let mut i = 0;
+    while i < b.len() {
+        n[i] = b[i];
+        i += 1;
+    }
+    n
+}
+const MAP_NAME: [u8; 16] = obj_name("eph_xsks");
+const PROG_NAME: [u8; 16] = obj_name("eph_redirect");
+
 impl XskMap {
     pub fn new(max_entries: u32) -> io::Result<Self> {
-        let mut name = [0u8; 16];
-        name[..8].copy_from_slice(b"eph_xsks\0");
         let mut attr = MapCreateAttr {
             map_type: BPF_MAP_TYPE_XSKMAP,
             key_size: 4,
             value_size: 4,
             max_entries,
-            map_name: name,
+            map_name: MAP_NAME,
             ..Default::default()
         };
         let fd = unsafe { bpf(BPF_MAP_CREATE, &mut attr) };
@@ -174,14 +189,12 @@ fn program(map_fd: RawFd) -> [BpfInsn; 6] {
 fn load_program(map_fd: RawFd) -> io::Result<OwnedFd> {
     let insns = program(map_fd);
     let license = b"Dual MIT/GPL\0";
-    let mut name = [0u8; 16];
-    name[..12].copy_from_slice(b"eph_redirect\0");
     let mut attr = ProgLoadAttr {
         prog_type: BPF_PROG_TYPE_XDP,
         insn_cnt: insns.len() as u32,
         insns: insns.as_ptr() as u64,
         license: license.as_ptr() as u64,
-        prog_name: name,
+        prog_name: PROG_NAME,
         expected_attach_type: BPF_XDP,
         ..Default::default()
     };
