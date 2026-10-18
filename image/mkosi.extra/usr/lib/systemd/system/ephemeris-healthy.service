@@ -1,0 +1,17 @@
+# Gate for boot-complete.target: systemd-bless-boot only marks a new version
+# as good once this passes. On failure, reboot and let the boot counter
+# count down towards falling back to the previous version.
+[Unit]
+Description=Check this Ephemeris version is healthy
+After=ephemerisd.service
+Before=boot-complete.target
+FailureAction=reboot
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/ephemeris/health-check
+StandardOutput=journal+console
+
+[Install]
+RequiredBy=boot-complete.target

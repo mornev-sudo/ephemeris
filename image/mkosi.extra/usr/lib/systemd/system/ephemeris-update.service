@@ -1,0 +1,11 @@
+# Started by the API ("ephctl system update"). Downloads the newest release
+# into the inactive root slot and adds its UKI with a boot counter. The
+# running version is never touched; reboot to switch.
+[Unit]
+Description=Install the newest Ephemeris version into the inactive slot
+Wants=network-online.target
+After=network-online.target ephemeris-update-source.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/systemd/systemd-sysupdate update

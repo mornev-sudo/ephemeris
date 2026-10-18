@@ -1,0 +1,11 @@
+/target
+*.qcow2
+*.raw
+.DS_Store
+/image/mkosi.output
+/image/mkosi.cache
+/image/mkosi.tools
+/image/stage
+/image/mkosi.key
+/ci/node_modules
+/.playwright

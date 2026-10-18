@@ -1,0 +1,18 @@
+#!/bin/sh
+# First boot: a self-signed certificate for the HTTPS portal (nginx, port
+# 8443). Replace /var/lib/ephemeris/tls/{cert,key}.pem with your own any time.
+set -eu
+umask 077
+dir=/var/lib/ephemeris/tls
+mkdir -p "$dir"
+host=$(cat /proc/sys/kernel/hostname)
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -days 3650 -nodes \
+    -subj "/CN=$host" -addext "subjectAltName=DNS:$host,DNS:$host.local" \
+    -keyout "$dir/key.pem.new" -out "$dir/cert.pem.new" 2>/dev/null
+chmod 0644 "$dir/cert.pem.new"
+mv "$dir/key.pem.new" "$dir/key.pem"
+mv "$dir/cert.pem.new" "$dir/cert.pem"
+# Shown on the console, so the first browser warning can be checked.
+openssl x509 -in "$dir/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2 > "$dir/fingerprint"
+chmod 0644 "$dir/fingerprint"
+echo "TLS certificate for $host created: SHA-256 $(cat "$dir/fingerprint")"

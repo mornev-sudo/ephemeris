@@ -1,0 +1,9 @@
+[Unit]
+Description=Generate this router's TLS certificate for the web portal
+ConditionPathExists=!/var/lib/ephemeris/tls/cert.pem
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/ephemeris/tls-cert

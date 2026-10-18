@@ -1,0 +1,12 @@
+[Unit]
+Description=Point systemd-sysupdate at this router's update server
+Before=ephemeris-update.service systemd-sysupdate.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ImportCredential=ephemeris.update_url
+ExecStart=/usr/lib/ephemeris/update-source
+
+[Install]
+WantedBy=multi-user.target

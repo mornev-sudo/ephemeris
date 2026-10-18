@@ -1,0 +1,117 @@
+# Test, build the Ephemeris OS image and boot it in QEMU. Every successful run
+# leaves a tested image as an artifact; tagging that commit v* later promotes
+# the very same image to a release (release.yml), without rebuilding.
+name: image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Version
+        id: version
+        run: |
+          # <release>.<build number>, e.g. 0.5.0.123: the release from
+          # Cargo.toml (so every image says which release it is), then this
+          # workflow's run number (so newer builds always sort as newer for
+          # A/B updates). Short on purpose: it ends up in GPT partition
+          # labels ("ephemeris_<version>_verity", at most 36 characters).
+          # The exact commit is recorded inside the image instead.
+          release=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [[ $release =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::no release version in Cargo.toml"; exit 1; }
+          v=$release.${{ github.run_number }}
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Image version: $v (commit ${GITHUB_SHA::7})"
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: systemd/mkosi@v27.1
+
+      - name: Tools for converting and booting the image
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-utils qemu-system-x86 ovmf xz-utils
+
+      # Private keys come from repository secrets and only exist on the
+      # runner for the duration of the job.
+      - name: Signing keys
+        env:
+          SECUREBOOT_KEY: ${{ secrets.SECUREBOOT_KEY }}
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+        run: |
+          [[ -n $SECUREBOOT_KEY && -n $RELEASE_GPG_KEY ]] || { echo "::error::signing secrets missing"; exit 1; }
+          umask 077
+          printf '%s\n' "$SECUREBOOT_KEY" > image/mkosi.key
+          printf '%s\n' "$RELEASE_GPG_KEY" | gpg --batch --import
+
+      - name: Build image
+        env:
+          SIGN_RELEASE: "1"
+        run: image/build.sh "${{ steps.version.outputs.version }}"
+
+      # A second, newer image, only used as the target of the update test.
+      - name: Build update test image
+        env:
+          SIGN_RELEASE: "1"
+        run: |
+          OUT=update-v2 image/build.sh "${{ steps.version.outputs.version }}.1" > build-v2.log 2>&1 || { tail -50 build-v2.log; exit 1; }
+
+      # Everything below runs on this CI machine, against the unmodified
+      # production image: see ci/e2e.sh.
+      - name: Test tools
+        run: |
+          sudo apt-get install -y -qq iperf3 sshpass >/dev/null
+          cd ci && npm install --no-save --silent playwright@1.48.2 && npx playwright install --with-deps chromium >/dev/null
+
+      - name: End-to-end test
+        run: |
+          sudo -E env "PATH=$PATH" PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+            ci/e2e.sh image/mkosi.output/ephemeris-x86_64.qcow2 "${{ steps.version.outputs.version }}" \
+              update-v2 "${{ steps.version.outputs.version }}.1"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs
+          path: e2e-logs
+          if-no-files-found: ignore
+
+      - name: Upload image
+        uses: actions/upload-artifact@v7
+        with:
+          # Fixed name, so release.yml can find it.
+          name: ephemeris-image
+          path: |
+            image/mkosi.output/ephemeris-x86_64.qcow2
+            image/mkosi.output/*.raw.xz
+            image/mkosi.output/*.efi
+            image/mkosi.output/SHA256SUMS
+            image/mkosi.output/SHA256SUMS.gpg
+            image/mkosi.output/VERSION

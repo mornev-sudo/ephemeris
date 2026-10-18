@@ -1,0 +1,1100 @@
+use anyhow::{bail, Context, Result};
+use eph_dataplane::nat::{NatAction, NatConfig, NatRule};
+use eph_dataplane::overlay::{Class, Overlay, Tether, TetherKey, DEFAULT_MTU};
+use eph_dataplane::{
+    build_fib, NextHop, OverlayRoute, Port, Role, SessionConfig, StaticRoute, Timeouts,
+};
+use eph_fib::{Fib, Prefix};
+use eph_packet::Mac;
+use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub dataplane: DataplaneCfg,
+    #[serde(default)]
+    pub sessions: SessionsCfg,
+    #[serde(default)]
+    pub management: ManagementCfg,
+    #[serde(rename = "interface")]
+    pub interfaces: Vec<InterfaceCfg>,
+    #[serde(default, rename = "route")]
+    pub routes: Vec<RouteCfg>,
+    /// Source NAT (on by default: inside → outside is translated to the
+    /// outside interface's address).
+    #[serde(default)]
+    pub nat: NatCfg,
+    /// SD-WAN overlay (absent = plain router).
+    #[serde(default)]
+    pub overlay: Option<OverlayCfg>,
+    #[serde(default, rename = "tether")]
+    pub tethers: Vec<TetherCfg>,
+    #[serde(default, rename = "overlay_route")]
+    pub overlay_routes: Vec<OverlayRouteCfg>,
+    #[serde(default, rename = "class")]
+    pub classes: Vec<ClassCfg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayCfg {
+    /// This site's id; every site in the overlay needs a different one.
+    pub site_id: u16,
+    #[serde(default = "default_overlay_port")]
+    pub udp_port: u16,
+    /// Largest inner IP packet carried (underlay MTU 1500 minus 60 bytes of
+    /// IPv4, UDP, header and authentication tag).
+    #[serde(default = "default_overlay_mtu")]
+    pub mtu: u16,
+    /// May hosts at other sites start sessions to this site?
+    #[serde(default = "default_true")]
+    pub allow_new_sessions: bool,
+}
+
+fn default_overlay_port() -> u16 {
+    4800
+}
+fn default_overlay_mtu() -> u16 {
+    DEFAULT_MTU
+}
+
+/// One overlay path: "reach site N over this WAN interface".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TetherCfg {
+    pub name: String,
+    /// The local WAN interface (by `[[interface]]` name).
+    pub interface: String,
+    /// The other router's address on the far end of that WAN.
+    pub remote: Ipv4Addr,
+    /// Underlay gateway, if `remote` isn't on the interface's own subnet.
+    pub gateway: Option<Ipv4Addr>,
+    /// The other router's site id.
+    pub site: u16,
+    /// Pre-shared key: 64 hex characters (32 random bytes, e.g. from
+    /// `openssl rand -hex 32`), the same on both routers and on every tether
+    /// to the same site. Without one the tether stays down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayRouteCfg {
+    pub prefix: String,
+    pub site: u16,
+}
+
+/// An application class and its path policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassCfg {
+    pub name: String,
+    /// "tcp", "udp", "icmp" or a protocol number.
+    pub protocol: Option<String>,
+    /// Destination port or range: "443" or "10000-20000".
+    pub ports: Option<String>,
+    pub dscp: Option<u8>,
+    /// Tether names in order of preference.
+    #[serde(default)]
+    pub prefer: Vec<String>,
+    pub max_latency_ms: Option<u32>,
+    pub max_jitter_ms: Option<u32>,
+    pub max_loss_pct: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DataplaneCfg {
+    /// Worker threads. Worker N serves RX queue N of every interface.
+    pub workers: u32,
+    /// "auto" | "native" | "generic"
+    pub xdp_mode: String,
+    /// "auto" | "copy" | "zerocopy"
+    pub bind_mode: String,
+    /// Size of each AF_XDP ring (power of two).
+    pub ring_size: u32,
+    /// Spin at 100% CPU even when idle (lowest latency, DPDK style).
+    pub busy_poll: bool,
+    /// Optional CPU to pin each worker to, in worker order.
+    pub cpus: Vec<usize>,
+    pub stats_interval_secs: u64,
+    /// How many sessions to list with each stats report.
+    pub show_sessions: usize,
+}
+
+impl Default for DataplaneCfg {
+    fn default() -> Self {
+        DataplaneCfg {
+            workers: 1,
+            xdp_mode: "auto".into(),
+            bind_mode: "auto".into(),
+            ring_size: 2048,
+            busy_poll: false,
+            cpus: vec![],
+            stats_interval_secs: 10,
+            show_sessions: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceCfg {
+    /// Friendly name used in logs, e.g. "lan-a".
+    pub name: String,
+    /// Linux network device, e.g. "ens19".
+    pub device: String,
+    /// The router's address and prefix length on this link, e.g. "10.10.1.1/24".
+    pub address: String,
+    /// "inside" (your networks, the default) or "outside" (the internet).
+    #[serde(default)]
+    pub role: RoleCfg,
+    /// May traffic arriving here start new sessions? Defaults to yes on
+    /// inside and no on outside interfaces (only replies get in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_new_sessions: Option<bool>,
+    /// TCP MSS adjust: lower the MSS that TCP SYNs through this interface
+    /// announce to at most this value (e.g. 1452 for PPPoE). Unset: no change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mss_adjust: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoleCfg {
+    #[default]
+    Inside,
+    Outside,
+}
+
+impl InterfaceCfg {
+    pub fn role(&self) -> Role {
+        match self.role {
+            RoleCfg::Inside => Role::Inside,
+            RoleCfg::Outside => Role::Outside,
+        }
+    }
+    pub fn allows_new_sessions(&self) -> bool {
+        self.allow_new_sessions
+            .unwrap_or(self.role == RoleCfg::Inside)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NatCfg {
+    /// Translate inside → outside traffic (not matched by a rule) to the
+    /// outside interface's address.
+    pub masquerade: bool,
+    #[serde(rename = "pool", skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<NatPoolCfg>,
+    #[serde(rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<NatRuleCfg>,
+}
+
+impl Default for NatCfg {
+    fn default() -> Self {
+        NatCfg {
+            masquerade: true,
+            pools: vec![],
+            rules: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NatPoolCfg {
+    pub name: String,
+    /// Addresses: "203.0.113.10", "203.0.113.16/29" or "203.0.113.10-203.0.113.20".
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NatRuleCfg {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// Outbound interface name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<String>,
+    /// "interface", "pool" or "none".
+    pub translate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SessionsCfg {
+    /// Session table capacity per worker thread.
+    pub max_per_worker: u32,
+    /// Only a TCP SYN may open a session (no mid-stream pickup).
+    pub tcp_strict: bool,
+    pub tcp_handshake_timeout_secs: u64,
+    pub tcp_established_timeout_secs: u64,
+    pub udp_timeout_secs: u64,
+    pub udp_stream_timeout_secs: u64,
+    pub icmp_timeout_secs: u64,
+}
+
+impl Default for SessionsCfg {
+    fn default() -> Self {
+        let s = SessionConfig::default();
+        SessionsCfg {
+            max_per_worker: s.max_sessions,
+            tcp_strict: s.tcp_strict,
+            tcp_handshake_timeout_secs: s.timeouts.tcp_handshake,
+            tcp_established_timeout_secs: s.timeouts.tcp_established,
+            udp_timeout_secs: s.timeouts.udp,
+            udp_stream_timeout_secs: s.timeouts.udp_stream,
+            icmp_timeout_secs: s.timeouts.icmp,
+        }
+    }
+}
+
+impl SessionsCfg {
+    pub fn to_config(&self) -> SessionConfig {
+        SessionConfig {
+            max_sessions: self.max_per_worker,
+            tcp_strict: self.tcp_strict,
+            timeouts: Timeouts {
+                tcp_handshake: self.tcp_handshake_timeout_secs,
+                tcp_established: self.tcp_established_timeout_secs,
+                udp: self.udp_timeout_secs,
+                udp_stream: self.udp_stream_timeout_secs,
+                icmp: self.icmp_timeout_secs,
+                ..Timeouts::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteCfg {
+    pub prefix: String,
+    pub via: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ManagementCfg {
+    /// Serve the REST API and web portal.
+    pub enabled: bool,
+    /// Where ephemerisd serves plain HTTP. On the router this stays on
+    /// loopback: nginx serves the portal over HTTPS (port 8443) and passes
+    /// requests on. A non-loopback address is only used with
+    /// `insecure_remote_http`.
+    pub listen: String,
+    /// API token; generated on first start if the file doesn't exist.
+    pub token_file: String,
+    /// Host names the portal may be reached by, besides addresses,
+    /// `localhost` and the router's own host name (requests for any other
+    /// name are refused: DNS rebinding).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hostnames: Vec<String>,
+    /// Allow `listen` on a non-loopback address: the API (password, cookie,
+    /// token) then crosses the network unencrypted. For labs only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_remote_http: bool,
+}
+
+impl ManagementCfg {
+    /// The address to bind: `listen`, unless that would put plain HTTP on
+    /// the network without `insecure_remote_http`; then the same port on
+    /// loopback. The bool is true when that substitution happened.
+    pub fn bind_addr(&self) -> (std::net::SocketAddr, bool) {
+        let addr: std::net::SocketAddr = self.listen.parse().expect("validated");
+        if addr.ip().is_loopback() || self.insecure_remote_http {
+            (addr, false)
+        } else {
+            ((Ipv4Addr::LOCALHOST, addr.port()).into(), true)
+        }
+    }
+}
+
+impl Default for ManagementCfg {
+    fn default() -> Self {
+        ManagementCfg {
+            enabled: true,
+            listen: "127.0.0.1:8080".into(),
+            token_file: "/var/lib/ephemeris/api-token".into(),
+            hostnames: vec![],
+            insecure_remote_http: false,
+        }
+    }
+}
+
+/// Allowed `mss_adjust` values: from the smallest MSS every IPv4 host must
+/// accept (RFC 879) up to what a 1500-byte MTU carries. Anything larger would
+/// never lower a real SYN's MSS.
+const MSS_ADJUST_RANGE: std::ops::RangeInclusive<u16> = 536..=1460;
+
+/// A friendly name: used in logs, routes and NAT rules.
+fn valid_name(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+/// What Linux accepts as a network interface name (IFNAMSIZ - 1 bytes).
+fn valid_ifname(s: &str) -> bool {
+    (1..=15).contains(&s.len())
+        && s != "."
+        && s != ".."
+        && !s.chars().any(|c| c == '/' || c == ':' || c.is_whitespace())
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("in {}", path.display()))
+    }
+
+    /// Parse and fully validate configuration text (including resolving the
+    /// routes into a forwarding table), without touching the data plane.
+    pub fn parse(text: &str) -> Result<Self> {
+        let cfg: Config = toml::from_str(text)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Can a running router switch from `self` to `new` without restarting?
+    /// Addresses, policy and routes can change live; anything that shapes the
+    /// sockets, threads or memory (interfaces, workers, table sizes) can't.
+    pub fn live_applicable(&self, new: &Config) -> bool {
+        self.dataplane == new.dataplane
+            && self.sessions == new.sessions
+            && self.management == new.management
+            && self.overlay == new.overlay
+            && self.tethers == new.tethers
+            && self.classes == new.classes
+            && self.interfaces.len() == new.interfaces.len()
+            && self
+                .interfaces
+                .iter()
+                .zip(&new.interfaces)
+                .all(|(a, b)| a.name == b.name && a.device == b.device)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let d = &self.dataplane;
+        if d.workers == 0 {
+            bail!("dataplane.workers must be at least 1");
+        }
+        if !d.ring_size.is_power_of_two() || !(64..=16384).contains(&d.ring_size) {
+            bail!("dataplane.ring_size must be a power of two between 64 and 16384");
+        }
+        if d.workers > 256 {
+            bail!("dataplane.workers must be at most 256");
+        }
+        if !d.cpus.is_empty() && d.cpus.len() != d.workers as usize {
+            bail!("dataplane.cpus must list exactly one CPU per worker");
+        }
+        if self.sessions.max_per_worker == 0 || self.sessions.max_per_worker > 16_000_000 {
+            bail!("sessions.max_per_worker must be between 1 and 16000000");
+        }
+        if self.management.enabled {
+            self.management
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| format!("management.listen {:?}", self.management.listen))?;
+        }
+        for h in &self.management.hostnames {
+            let label_ok = |l: &str| {
+                (1..=63).contains(&l.len())
+                    && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            };
+            if h.len() > 253 || !h.split('.').all(label_ok) {
+                bail!("management.hostnames: {h:?} isn't a host name");
+            }
+        }
+        if self.interfaces.is_empty() {
+            bail!("at least one [[interface]] is required");
+        }
+        for (n, i) in self.interfaces.iter().enumerate() {
+            let which = if i.name.is_empty() {
+                format!("interface #{}", n + 1)
+            } else {
+                format!("interface {}", i.name)
+            };
+            if !valid_name(&i.name) {
+                bail!(
+                    "{which}: needs a name (letters, digits, '-', '_' or '.', up to 32 characters)"
+                );
+            }
+            if i.device.is_empty() {
+                bail!("{which}: choose the network card (device) it uses");
+            }
+            if !valid_ifname(&i.device) {
+                bail!(
+                    "{which}: {:?} isn't a valid Linux interface name (e.g. ens19)",
+                    i.device
+                );
+            }
+            if let Some(mss) = i.mss_adjust {
+                if !MSS_ADJUST_RANGE.contains(&mss) {
+                    bail!(
+                        "{which}: mss_adjust must be between {} and {} (MTU minus 40)",
+                        MSS_ADJUST_RANGE.start(),
+                        MSS_ADJUST_RANGE.end()
+                    );
+                }
+            }
+        }
+        let addrs = self.interface_addrs()?;
+        for (i, a) in self.interfaces.iter().enumerate() {
+            for b in &self.interfaces[i + 1..] {
+                if a.device == b.device {
+                    bail!("device {} is used by two interfaces", a.device);
+                }
+                if a.name == b.name {
+                    bail!("two interfaces are named {}", a.name);
+                }
+            }
+            let (ip, net) = addrs[i];
+            if net.len() < 31 && (ip == net.addr() || ip == broadcast(net)) {
+                bail!(
+                    "interface {}: {ip} is the network or broadcast address of {net}",
+                    a.name
+                );
+            }
+            for (j, &(_, other)) in addrs.iter().enumerate().skip(i + 1) {
+                if net.contains(other.addr()) || other.contains(net.addr()) {
+                    bail!(
+                        "interfaces {} and {} have overlapping subnets",
+                        a.name,
+                        self.interfaces[j].name
+                    );
+                }
+            }
+        }
+        self.nat()?;
+        // Resolving the routes catches gateways that aren't on any subnet.
+        self.fib(&self.ports(|_| Ok([0; 6]))?)?;
+        Ok(())
+    }
+
+    pub fn interface_addrs(&self) -> Result<Vec<(Ipv4Addr, Prefix)>> {
+        self.interfaces
+            .iter()
+            .map(|i| {
+                let (ip, len) = i.address.split_once('/').with_context(|| {
+                    format!("interface {}: address must look like 10.0.0.1/24", i.name)
+                })?;
+                let ip: Ipv4Addr = ip
+                    .parse()
+                    .with_context(|| format!("interface {}", i.name))?;
+                let len: u8 = len
+                    .parse()
+                    .with_context(|| format!("interface {}", i.name))?;
+                let net = Prefix::new(ip, len)
+                    .with_context(|| format!("interface {}: bad prefix length", i.name))?;
+                Ok((ip, net))
+            })
+            .collect()
+    }
+
+    pub fn static_routes(&self) -> Result<Vec<StaticRoute>> {
+        self.routes
+            .iter()
+            .map(|r| {
+                Ok(StaticRoute {
+                    prefix: r.prefix.parse().map_err(anyhow::Error::msg)?,
+                    via: r
+                        .via
+                        .parse()
+                        .with_context(|| format!("route {}: bad gateway", r.prefix))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Build the port table; `mac_of` supplies each device's MAC address.
+    pub fn ports(&self, mut mac_of: impl FnMut(&InterfaceCfg) -> Result<Mac>) -> Result<Vec<Port>> {
+        let addrs = self.interface_addrs()?;
+        self.interfaces
+            .iter()
+            .zip(addrs)
+            .enumerate()
+            .map(|(id, (i, (addr, subnet)))| {
+                Ok(Port {
+                    id: id as u16,
+                    name: i.name.clone(),
+                    mac: mac_of(i)?,
+                    addr,
+                    subnet,
+                    allow_new_sessions: i.allows_new_sessions(),
+                    role: i.role(),
+                    mss_adjust: i.mss_adjust,
+                })
+            })
+            .collect()
+    }
+
+    pub fn fib(&self, ports: &[Port]) -> Result<Fib<NextHop>> {
+        let overlay = self.overlay()?;
+        let routes = self
+            .overlay_routes
+            .iter()
+            .map(|r| {
+                let prefix = r.prefix.parse().map_err(anyhow::Error::msg)?;
+                let site_idx = overlay
+                    .sites
+                    .iter()
+                    .position(|&s| s == r.site)
+                    .with_context(|| {
+                        format!("overlay_route {}: no tether to site {}", r.prefix, r.site)
+                    })?;
+                Ok(OverlayRoute { prefix, site_idx })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        build_fib(ports, &self.static_routes()?, &routes).map_err(anyhow::Error::msg)
+    }
+
+    /// Compile the NAT section into the data plane's form.
+    pub fn nat(&self) -> Result<NatConfig> {
+        let n = &self.nat;
+        let mut pools = Vec::new();
+        for (i, p) in n.pools.iter().enumerate() {
+            if n.pools[..i].iter().any(|q| q.name == p.name) {
+                bail!("two NAT pools are named {}", p.name);
+            }
+            let mut addrs = Vec::new();
+            for a in &p.addresses {
+                expand_addresses(a, &mut addrs)
+                    .with_context(|| format!("NAT pool {}: {a:?}", p.name))?;
+            }
+            if addrs.is_empty() {
+                bail!("NAT pool {} has no addresses", p.name);
+            }
+            pools.push(addrs);
+        }
+        let prefix = |s: &Option<String>, what: &str, rule: &str| -> Result<Option<Prefix>> {
+            s.as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let s = if s.contains('/') {
+                        s.to_string()
+                    } else {
+                        format!("{s}/32")
+                    };
+                    s.parse::<Prefix>().map_err(anyhow::Error::msg)
+                })
+                .transpose()
+                .with_context(|| format!("NAT rule {rule}: {what}"))
+        };
+        let mut rules = Vec::new();
+        for r in &n.rules {
+            let action =
+                match r.translate.as_str() {
+                    "interface" => NatAction::Interface,
+                    "none" => NatAction::Exempt,
+                    "pool" => {
+                        let name = r.pool.as_deref().with_context(|| {
+                            format!("NAT rule {}: translate = \"pool\" needs `pool`", r.name)
+                        })?;
+                        NatAction::Pool(n.pools.iter().position(|p| p.name == name).with_context(
+                            || format!("NAT rule {}: no pool named {name:?}", r.name),
+                        )?)
+                    }
+                    t => bail!(
+                    "NAT rule {}: translate must be \"interface\", \"pool\" or \"none\", not {t:?}",
+                    r.name
+                ),
+                };
+            let outbound = r
+                .outbound
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|o| {
+                    self.interfaces
+                        .iter()
+                        .position(|i| i.name == o)
+                        .map(|i| i as u16)
+                        .with_context(|| format!("NAT rule {}: no interface named {o:?}", r.name))
+                })
+                .transpose()?;
+            rules.push(NatRule {
+                name: r.name.clone(),
+                source: prefix(&r.source, "source", &r.name)?,
+                destination: prefix(&r.destination, "destination", &r.name)?,
+                outbound,
+                action,
+            });
+        }
+        Ok(NatConfig {
+            masquerade: n.masquerade,
+            pools,
+            rules,
+        })
+    }
+
+    /// Compile the SD-WAN section into the data plane's form (ids, not names).
+    pub fn overlay(&self) -> Result<Overlay> {
+        let mut o = Overlay::disabled();
+        let Some(oc) = &self.overlay else {
+            if !self.tethers.is_empty() || !self.overlay_routes.is_empty() {
+                bail!("[[tether]] and [[overlay_route]] need an [overlay] section");
+            }
+            return Ok(o);
+        };
+        o.site_id = oc.site_id;
+        o.udp_port = oc.udp_port;
+        o.mtu = oc.mtu;
+        o.allow_new_sessions = oc.allow_new_sessions;
+        if !(576..=9000).contains(&oc.mtu) {
+            bail!("overlay.mtu must be between 576 and 9000");
+        }
+        let addrs = self.interface_addrs()?;
+        for (i, t) in self.tethers.iter().enumerate() {
+            let port = self
+                .interfaces
+                .iter()
+                .position(|x| x.name == t.interface)
+                .with_context(|| {
+                    format!("tether {}: no interface named {:?}", t.name, t.interface)
+                })?;
+            let subnet = addrs[port].1;
+            match t.gateway {
+                None if !subnet.contains(t.remote) => bail!(
+                    "tether {}: remote {} is not on {}'s subnet {subnet}; set `gateway`",
+                    t.name,
+                    t.remote,
+                    t.interface
+                ),
+                Some(gw) if !subnet.contains(gw) => {
+                    bail!(
+                        "tether {}: gateway {gw} is not on {}'s subnet {subnet}",
+                        t.name,
+                        t.interface
+                    )
+                }
+                _ => {}
+            }
+            if t.site == oc.site_id {
+                bail!("tether {}: site {} is this site", t.name, t.site);
+            }
+            if self.tethers[..i].iter().any(|x| x.name == t.name) {
+                bail!("two tethers are named {}", t.name);
+            }
+            let site_idx = match o.sites.iter().position(|&s| s == t.site) {
+                Some(i) => i,
+                None => {
+                    o.sites.push(t.site);
+                    o.sites.len() - 1
+                }
+            };
+            let key = t
+                .key
+                .as_deref()
+                .map(parse_key)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("tether {}: key {e:#}", t.name))?;
+            // Both sites seal with the key, so a site's tethers share one.
+            if let Some(other) = o.tethers.iter().find(|x| x.site_idx == site_idx) {
+                if other.key != key {
+                    bail!(
+                        "tethers {} and {} lead to the same site ({}) and need the same key",
+                        other.name,
+                        t.name,
+                        t.site
+                    );
+                }
+            }
+            o.tethers.push(Tether {
+                id: i as u16,
+                name: t.name.clone(),
+                port: port as u16,
+                remote: t.remote,
+                gateway: t.gateway,
+                peer_site: t.site,
+                site_idx,
+                key,
+            });
+        }
+        for c in &self.classes {
+            let proto = match c.protocol.as_deref() {
+                None => None,
+                Some("tcp") => Some(6),
+                Some("udp") => Some(17),
+                Some("icmp") => Some(1),
+                Some(n) => Some(
+                    n.parse()
+                        .with_context(|| format!("class {}: protocol {n:?}", c.name))?,
+                ),
+            };
+            let ports = c
+                .ports
+                .as_deref()
+                .map(|p| -> Result<(u16, u16)> {
+                    let (lo, hi) = p.split_once('-').unwrap_or((p, p));
+                    Ok((lo.trim().parse()?, hi.trim().parse()?))
+                })
+                .transpose()
+                .with_context(|| {
+                    format!("class {}: ports must be \"443\" or \"10000-20000\"", c.name)
+                })?;
+            let prefer = c
+                .prefer
+                .iter()
+                .map(|n| {
+                    o.tethers
+                        .iter()
+                        .find(|t| &t.name == n)
+                        .map(|t| t.id)
+                        .with_context(|| format!("class {}: no tether named {n:?}", c.name))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            o.classes.push(Class {
+                name: c.name.clone(),
+                proto,
+                ports,
+                dscp: c.dscp,
+                prefer,
+                max_latency_ms: c.max_latency_ms,
+                max_jitter_ms: c.max_jitter_ms,
+                max_loss_pct: c.max_loss_pct,
+            });
+        }
+        Ok(o)
+    }
+}
+
+/// "a.b.c.d", "a.b.c.d/nn" or "a.b.c.d-e.f.g.h" -> addresses (at most 4096).
+fn expand_addresses(s: &str, out: &mut Vec<Ipv4Addr>) -> Result<()> {
+    let s = s.trim();
+    let (lo, hi): (u32, u32) = if let Some((a, b)) = s.split_once('-') {
+        (
+            a.trim().parse::<Ipv4Addr>()?.into(),
+            b.trim().parse::<Ipv4Addr>()?.into(),
+        )
+    } else if s.contains('/') {
+        let p: Prefix = s.parse().map_err(anyhow::Error::msg)?;
+        let lo = u32::from(p.addr());
+        (lo, lo | (u32::MAX.checked_shr(p.len() as u32).unwrap_or(0)))
+    } else {
+        let a: u32 = s.parse::<Ipv4Addr>()?.into();
+        (a, a)
+    };
+    if hi < lo || hi - lo >= 4096 {
+        bail!("range must be ascending and at most 4096 addresses");
+    }
+    out.extend((lo..=hi).map(Ipv4Addr::from));
+    Ok(())
+}
+
+/// A tether key: exactly 64 hex characters, not all zero.
+fn parse_key(s: &str) -> Result<TetherKey> {
+    let s = s.trim();
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("must be 64 hex characters (generate one with: openssl rand -hex 32)");
+    }
+    let mut k = [0u8; 32];
+    for (i, b) in k.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+    }
+    if k == [0; 32] {
+        bail!("must not be all zeros");
+    }
+    Ok(TetherKey(k))
+}
+
+fn broadcast(net: Prefix) -> Ipv4Addr {
+    (u32::from(net.addr()) | (u32::MAX >> net.len())).into()
+}
+
+pub fn print_summary(cfg: &Config) -> Result<()> {
+    let ports = cfg.ports(|_| Ok([0; 6]))?;
+    let fib = cfg.fib(&ports)?;
+    println!("Configuration OK\n\nInterfaces:");
+    for p in &ports {
+        let role = if p.role == Role::Outside {
+            "outside"
+        } else {
+            "inside"
+        };
+        let policy = if p.allow_new_sessions {
+            "new sessions allowed"
+        } else {
+            "replies only"
+        };
+        let mss = p
+            .mss_adjust
+            .map(|m| format!(", mss adjust {m}"))
+            .unwrap_or_default();
+        println!(
+            "  {:<10} {:<10} {:<18} {role:<8} {policy}{mss}",
+            p.name,
+            cfg.interfaces[p.id as usize].device,
+            format!("{}/{}", p.addr, p.subnet.len())
+        );
+    }
+    let nat = cfg.nat()?;
+    println!(
+        "\nSource NAT: masquerade inside -> outside {}",
+        if nat.masquerade { "on" } else { "off" }
+    );
+    for (r, rc) in nat.rules.iter().zip(&cfg.nat.rules) {
+        println!(
+            "  rule {:<14} from {:<18} to {:<18} out {:<8} -> {}",
+            r.name,
+            rc.source.as_deref().unwrap_or("any"),
+            rc.destination.as_deref().unwrap_or("any"),
+            rc.outbound.as_deref().unwrap_or("any"),
+            match &rc.translate[..] {
+                "pool" => format!("pool {}", rc.pool.as_deref().unwrap_or("?")),
+                t => t.to_string(),
+            }
+        );
+    }
+    println!("\nForwarding table:");
+    let overlay = cfg.overlay()?;
+    for (prefix, nh) in fib.routes() {
+        match *nh {
+            NextHop::Ip {
+                port,
+                gateway: Some(gw),
+            } => {
+                println!(
+                    "  {prefix:<18} via {gw:<15} dev {}",
+                    ports[port as usize].name
+                )
+            }
+            NextHop::Ip {
+                port,
+                gateway: None,
+            } => {
+                println!(
+                    "  {prefix:<18} {:<19} dev {}",
+                    "connected", ports[port as usize].name
+                )
+            }
+            NextHop::Site(i) => println!("  {prefix:<18} overlay to site {}", overlay.sites[i]),
+        }
+    }
+    if overlay.enabled() {
+        println!(
+            "\nSD-WAN: site {}, overlay MTU {}",
+            overlay.site_id, overlay.mtu
+        );
+        if overlay.mtu > DEFAULT_MTU {
+            println!(
+                "  note: an overlay MTU above {DEFAULT_MTU} needs an underlay MTU of at least {}",
+                overlay.mtu as usize + 60
+            );
+        }
+        for t in &overlay.tethers {
+            let key = if t.key.is_some() {
+                "encrypted"
+            } else {
+                "NO KEY: stays down"
+            };
+            println!(
+                "  tether {:<12} {} -> {} (site {}, {key})",
+                t.name, ports[t.port as usize].name, t.remote, t.peer_site
+            );
+        }
+        for c in overlay.classes.iter().skip(1) {
+            let prefer: Vec<&str> = c
+                .prefer
+                .iter()
+                .map(|&t| overlay.tethers[t as usize].name.as_str())
+                .collect();
+            println!("  class  {:<12} prefer [{}]", c.name, prefer.join(", "));
+        }
+    }
+    let d = &cfg.dataplane;
+    println!(
+        "\nData plane: {} worker(s), xdp_mode={}, bind_mode={}, ring_size={}, busy_poll={}",
+        d.workers, d.xdp_mode, d.bind_mode, d.ring_size, d.busy_poll
+    );
+    let sc = cfg.sessions.to_config();
+    println!(
+        "Sessions: up to {} per worker, tcp_strict={}, timeouts tcp={}s udp={}s/{}s icmp={}s",
+        sc.max_sessions,
+        sc.tcp_strict,
+        sc.timeouts.tcp_established,
+        sc.timeouts.udp,
+        sc.timeouts.udp_stream,
+        sc.timeouts.icmp
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Result<Config> {
+        let c: Config = toml::from_str(s)?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    #[test]
+    fn example_config_is_valid() {
+        let text = include_str!("../../../config/ephemeris.example.toml");
+        let c = parse(text).unwrap();
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        c.fib(&ports).unwrap();
+    }
+
+    #[test]
+    fn interfaces_need_a_name_and_a_device() {
+        let iface = |name: &str, device: &str| {
+            format!(
+                "[[interface]]\nname = {name:?}\ndevice = {device:?}\naddress = \"10.0.0.1/24\"\n"
+            )
+        };
+        let err = |t: String| parse(&t).unwrap_err().to_string();
+        assert!(err(iface("lan", "")).contains("choose the network card"));
+        assert!(err(iface("", "ens19")).contains("interface #1: needs a name"));
+        assert!(err(iface("my lan", "ens19")).contains("needs a name"));
+        assert!(err(iface("lan", "en s19")).contains("valid Linux interface name"));
+        assert!(err(iface("lan", "a-very-long-device-name")).contains("valid Linux interface name"));
+        let two = format!(
+            "{}[[interface]]\nname = \"lan\"\ndevice = \"ens20\"\naddress = \"10.0.1.1/24\"\n",
+            iface("lan", "ens19")
+        );
+        assert!(err(two).contains("two interfaces are named lan"));
+        assert!(parse(&iface("lan", "ens19")).is_ok());
+    }
+
+    #[test]
+    fn rejects_overlapping_subnets() {
+        let e = parse(
+            r#"
+            [[interface]]
+            name = "a"
+            device = "eth1"
+            address = "10.0.0.1/16"
+            [[interface]]
+            name = "b"
+            device = "eth2"
+            address = "10.0.5.1/24"
+            "#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("overlapping"), "{e}");
+    }
+
+    #[test]
+    fn rejects_unreachable_gateway() {
+        let e = parse(
+            r#"
+            [[interface]]
+            name = "a"
+            device = "eth1"
+            address = "10.0.0.1/24"
+            [[route]]
+            prefix = "0.0.0.0/0"
+            via = "192.168.1.1"
+            "#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("not on any connected subnet"), "{e}");
+    }
+
+    #[test]
+    fn plain_http_stays_on_loopback_unless_asked() {
+        const BASE: &str = r#"
+            [[interface]]
+            name = "lan"
+            device = "eth1"
+            address = "10.0.0.1/24"
+        "#;
+        let with = |management: &str| parse(&format!("[management]\n{management}\n{BASE}"));
+        let addr = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        let c = parse(BASE).unwrap();
+        assert_eq!(c.management.bind_addr(), (addr("127.0.0.1:8080"), false));
+        // An older config asking for the network: kept on loopback.
+        let c = with(r#"listen = "0.0.0.0:8080""#).unwrap();
+        assert_eq!(c.management.bind_addr(), (addr("127.0.0.1:8080"), true));
+        let c = with("listen = \"0.0.0.0:9000\"\ninsecure_remote_http = true").unwrap();
+        assert_eq!(c.management.bind_addr(), (addr("0.0.0.0:9000"), false));
+        assert!(with(r#"hostnames = ["evil name"]"#).is_err());
+        assert!(with(r#"hostnames = ["router.example.net"]"#).is_ok());
+    }
+
+    #[test]
+    fn tether_keys_are_checked() {
+        let cfg = |k1: &str, k2: &str| {
+            format!(
+                r#"
+                [overlay]
+                site_id = 1
+                [[interface]]
+                name = "wan"
+                device = "eth1"
+                address = "192.0.2.1/30"
+                [[interface]]
+                name = "wan2"
+                device = "eth2"
+                address = "198.51.100.1/30"
+                [[tether]]
+                name = "a"
+                interface = "wan"
+                remote = "192.0.2.2"
+                site = 2
+                {k1}
+                [[tether]]
+                name = "b"
+                interface = "wan2"
+                remote = "198.51.100.2"
+                site = 2
+                {k2}
+                "#
+            )
+        };
+        let k = |hex: &str| format!("key = \"{hex}\"");
+        let good = "ab".repeat(32);
+        let c = parse(&cfg(&k(&good), &k(&good))).unwrap();
+        let o = c.overlay().unwrap();
+        assert_eq!(o.tethers[0].key, Some(TetherKey([0xab; 32])));
+        assert!(format!("{:?}", o.tethers[0]).contains("redacted"));
+        // No key: allowed, but that tether stays down.
+        let c = parse(&cfg("", "")).unwrap();
+        assert!(c.overlay().unwrap().tethers.iter().all(|t| t.key.is_none()));
+        let err = |a: String, b: String| parse(&cfg(&a, &b)).unwrap_err().to_string();
+        assert!(err(k("abc"), k(&good)).contains("64 hex characters"));
+        assert!(err(k(&"zz".repeat(32)), k(&good)).contains("64 hex characters"));
+        let zeros = "00".repeat(32);
+        assert!(err(k(&zeros), k(&zeros)).contains("all zeros"));
+        let other = "cd".repeat(32);
+        assert!(err(k(&good), k(&other)).contains("need the same key"));
+    }
+
+    #[test]
+    fn mss_adjust_reaches_the_port_and_is_range_checked() {
+        let iface = |mss: u32| {
+            format!(
+                "[[interface]]\nname = \"wan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\nmss_adjust = {mss}\n"
+            )
+        };
+        let c = parse(&iface(1452)).unwrap();
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!(ports[0].mss_adjust, Some(1452));
+        for bad in [535, 1461] {
+            let e = parse(&iface(bad)).unwrap_err().to_string();
+            assert!(e.contains("mss_adjust must be between 536 and 1460"), "{e}");
+        }
+        assert!(parse(&iface(70000)).is_err(), "not a u16");
+        let none = "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n";
+        let ports = parse(none).unwrap().ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!(ports[0].mss_adjust, None);
+    }
+}

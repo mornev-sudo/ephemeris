@@ -1,0 +1,22 @@
+# The UKI goes in last: until it exists, nothing can boot the new slot.
+# TriesLeft=3: systemd-boot tries the new version at most 3 times; it's only
+# kept for good ("blessed") once ephemeris-healthy.service passes.
+[Transfer]
+ProtectVersion=%A
+
+[Source]
+Type=url-file
+Path=https://github.com/mornev-sudo/ephemeris/releases/latest/download/
+MatchPattern=%M_@v_%a.efi
+
+[Target]
+Type=regular-file
+Path=/EFI/Linux
+PathRelativeTo=boot
+MatchPattern=%M_@v_%a+@l-@d.efi \
+             %M_@v_%a+@l.efi \
+             %M_@v_%a.efi
+Mode=0644
+TriesLeft=3
+TriesDone=0
+InstancesMax=2

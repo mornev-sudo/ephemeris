@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# End-to-end test of the *production* image, driven entirely from outside.
+#
+# Nothing test-related is inside the image. The router boots exactly as on
+# Proxmox (UEFI + Secure Boot in setup mode, virtio NICs, credentials via
+# SMBIOS like deploy-image.sh), and this script plays the part of the
+# network and the operator:
+#
+#   [netns ci-ha] 10.10.1.10 ─ veth ─ bridge ─ tap ─ enp0s19 ┐
+#                                                             ├─ router VM ─ enp0s18 (QEMU user net: SSH 2222, HTTPS 8443)
+#   [netns ci-hb] 10.10.2.10 ─ veth ─ bridge ─ tap ─ enp0s20 ┘
+#
+# usage: sudo ci/e2e.sh <image.qcow2> <expected-version> [<update-dir> <update-version>]
+set -euo pipefail
+
+IMAGE=$1
+VERSION=$2
+UPDATE_DIR=${3:-}
+UPDATE_VERSION=${4:-}
+HERE=$(cd "$(dirname "$0")" && pwd)
+WORK=$(mktemp -d)
+LOGS=${LOGS:-$PWD/e2e-logs}
+mkdir -p "$LOGS"
+QEMU_PID= HTTP_PID=
+
+cleanup() {
+    [[ -n $QEMU_PID ]] && kill "$QEMU_PID" 2>/dev/null || true
+    [[ -n $HTTP_PID ]] && kill "$HTTP_PID" 2>/dev/null || true
+    ip netns del ci-ha 2>/dev/null || true
+    ip netns del ci-hb 2>/dev/null || true
+    for l in ephtap-a ephtap-b ephbr-a ephbr-b; do ip link del "$l" 2>/dev/null || true; done
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- deploy
+# Like deploy-image.sh: generated admin password (only its hash goes to the
+# VM), an SSH key, a hostname and the router config, as credentials.
+PASSWORD=$(head -c 600 /dev/urandom | LC_ALL=C tr -dc 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789' | cut -c1-20)
+HASH=$(printf '%s' "$PASSWORD" | openssl passwd -6 -stdin)
+ssh-keygen -q -t ed25519 -N "" -f "$WORK/key"
+cat > "$WORK/ephemeris.toml" <<'CFG'
+[dataplane]
+workers = 1
+stats_interval_secs = 5
+
+[[interface]]
+name = "lan-a"
+device = "enp0s19"
+address = "10.10.1.1/24"
+
+# lan-b plays the internet: outside role, so it only lets replies in and
+# traffic towards it is source-NATed to 10.10.2.1.
+[[interface]]
+name = "lan-b"
+device = "enp0s20"
+address = "10.10.2.1/24"
+role = "outside"
+CFG
+# QEMU puts the NICs on the root PCI bus, so they're named enp0s18..20
+# rather than Proxmox's ens18..20: point management DHCP at enp0s18.
+printf '[Match]\nName=enp0s18\n\n[Network]\nDHCP=yes\n' > "$WORK/mgmt.network"
+
+b64() { base64 -w0 < "$1"; }
+printf '%s' "$HASH" > "$WORK/hash"
+qemu-img create -q -f qcow2 -F qcow2 -b "$(realpath "$IMAGE")" "$WORK/disk.qcow2" 8G
+cp /usr/share/OVMF/OVMF_VARS_4M.fd "$WORK/vars.fd"
+for t in ephtap-a ephtap-b; do ip tuntap add dev "$t" mode tap; done
+accel=tcg; [[ -w /dev/kvm ]] && accel=kvm
+
+qemu-system-x86_64 \
+    -machine q35,smm=on,accel=$accel -cpu max -smp 2 -m 2048 \
+    -global driver=cfi.pflash01,property=secure,value=on \
+    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+    -drive if=pflash,format=raw,file="$WORK/vars.fd" \
+    -device virtio-scsi-pci,id=scsi \
+    -drive id=disk,if=none,format=qcow2,file="$WORK/disk.qcow2" -device scsi-hd,drive=disk \
+    -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8443-:8443 \
+    -device virtio-net-pci,netdev=mgmt,addr=0x12 \
+    -netdev tap,id=lana,ifname=ephtap-a,script=no,downscript=no -device virtio-net-pci,netdev=lana,addr=0x13 \
+    -netdev tap,id=lanb,ifname=ephtap-b,script=no,downscript=no -device virtio-net-pci,netdev=lanb,addr=0x14 \
+    -smbios type=11,value=io.systemd.credential:system.hostname=ci-router \
+    -smbios type=11,value=io.systemd.credential.binary:ephemeris.admin_password_hash=$(b64 "$WORK/hash") \
+    -smbios type=11,value=io.systemd.credential.binary:ssh.authorized_keys.root=$(b64 "$WORK/key.pub") \
+    -smbios type=11,value=io.systemd.credential.binary:ephemeris.config=$(b64 "$WORK/ephemeris.toml") \
+    -smbios type=11,value=io.systemd.credential.binary:network.network.10-mgmt=$(b64 "$WORK/mgmt.network") \
+    -smbios type=11,value=io.systemd.credential:ephemeris.update_url=http://10.0.2.2:8000/ \
+    -display none -serial file:"$LOGS/serial.log" &
+QEMU_PID=$!
+
+# The LAN hosts. Each tap stays in the main namespace (QEMU holds it open)
+# and is bridged to a veth pair whose other end lives in the host's netns.
+host() { # ns tap bridge address gateway
+    ip netns add "$1"
+    ip link add "$3" type bridge
+    ip link set dev "$2" master "$3" up
+    ip link add "$3-v" type veth peer name eth0 netns "$1"
+    ip link set dev "$3-v" master "$3" up
+    ip link set dev "$3" up
+    ip -n "$1" link set lo up
+    ip -n "$1" addr add "$4" dev eth0
+    ip -n "$1" link set dev eth0 up
+    ip -n "$1" route add default via "$5"
+    # Full-size, fully checksummed frames: there's no NIC on this path to
+    # finish the job for the host's TCP/IP stack.
+    ip netns exec "$1" ethtool -K eth0 tx off tso off gso off >/dev/null 2>&1 || true
+}
+host ci-ha ephtap-a ephbr-a 10.10.1.10/24 10.10.1.1
+host ci-hb ephtap-b ephbr-b 10.10.2.10/24 10.10.2.1
+
+if [[ -n $UPDATE_DIR ]]; then
+    (cd "$UPDATE_DIR" && exec python3 -m http.server 8000 --bind 0.0.0.0 > "$LOGS/http.log" 2>&1) &
+    HTTP_PID=$!
+fi
+
+SSH=(ssh -q -i "$WORK/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@127.0.0.1)
+on_router() { "${SSH[@]}" "$@"; }
+wait_for() { # seconds description command...
+    local t=$1 d=$2; shift 2
+    local end=$((SECONDS + t))
+    until "$@" >/dev/null 2>&1; do
+        (( SECONDS < end )) || { echo "timed out after ${t}s waiting for: $d"; return 1; }
+        sleep 2
+    done
+}
+
+pass=0 fail=0
+check() {
+    local d=$1; shift
+    if "$@" > "$WORK/out" 2>&1; then
+        echo "  PASS  $d"; pass=$((pass + 1))
+    else
+        echo "  FAIL  $d"; sed 's/^/        /' "$WORK/out" | tail -20; fail=$((fail + 1))
+    fi
+}
+
+echo "Booting the router (Secure Boot enrollment reboots it once)..."
+wait_for 300 "SSH on the router" on_router true || { tail -60 "$LOGS/serial.log"; exit 1; }
+wait_for 60 "boot to finish" sh -c "${SSH[*]} systemctl is-system-running --wait | grep -qE 'running|degraded'"
+
+# ------------------------------------------------------------ the system
+echo "System:"
+check "boots version $VERSION"             sh -c "[ \"\$(${SSH[*]} cat /usr/lib/ephemeris/version)\" = '$VERSION' ]"
+check "no failed services"                 sh -c "[ -z \"\$(${SSH[*]} systemctl --failed --plain --no-legend)\" ] || { ${SSH[*]} systemctl --failed; false; }"
+check "ephemerisd runs as a service"         on_router systemctl is-active --quiet ephemerisd.service
+check "Secure Boot is enabled"             sh -c "${SSH[*]} od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c | grep -q 1"
+check "root filesystem is read-only"       sh -c "! ${SSH[*]} touch /usr/bin/test-write"
+check "SSH with the admin password"        sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true
+check "wrong password refused"             sh -c "! sshpass -p wrong-password ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true"
+check "ephctl on the router"                sh -c "${SSH[*]} ephctl status | grep -q lan-b"
+
+# ------------------------------------------------------------ the web
+echo "Web portal:"
+WEB=https://127.0.0.1:8443
+check "portal reachable over HTTPS"        curl -skf -o /dev/null $WEB/
+check "TLS certificate generated"          sh -c "${SSH[*]} openssl x509 -in /var/lib/ephemeris/tls/cert.pem -noout -subject | grep -q ci-router"
+check "plain HTTP only on loopback"        sh -c "! ${SSH[*]} ss -Hltn | awk '{print \$4}' | grep ':8080\$' | grep -v '^127\.0\.0\.1:'"
+check "API refuses anonymous requests"     sh -c "[ \"\$(curl -sk -o /dev/null -w '%{http_code}' $WEB/api/v1/status)\" = 401 ]"
+check "unknown host names refused"         sh -c "[ \"\$(curl -sk -o /dev/null -w '%{http_code}' -H 'Host: rebind.example' $WEB/)\" = 421 ]"
+check "security headers sent"              sh -c "curl -skI $WEB/ | grep -qi \"content-security-policy: default-src 'none'; script-src 'self'\" && curl -skI $WEB/ | grep -qi strict-transport-security"
+check "web login with the admin password"  sh -c "curl -skf -c '$WORK/cookies' -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"$PASSWORD\"}' $WEB/api/v1/login && curl -skf -b '$WORK/cookies' $WEB/api/v1/status | grep -q lan-a"
+check "session cookie is Secure"           grep -q '^#HttpOnly_127.0.0.1.*TRUE' "$WORK/cookies"
+check "config file is private"             sh -c "[ \"\$(${SSH[*]} stat -c %a /var/lib/ephemeris/ephemeris.toml)\" = 600 ]"
+check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="$PASSWORD" SHOTS="$LOGS" node "$HERE/portal-test.mjs"
+
+# ------------------------------------------------------------ forwarding
+echo "Forwarding:"
+ip netns exec ci-ha ping -c1 -W1 10.10.2.10 >/dev/null 2>&1 || true   # first packet resolves ARP
+check "ping the router"                    ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.1.1
+check "ping through the router"            ip netns exec ci-ha ping -c5 -i0.2 -W1 10.10.2.10
+check "TTL decremented"                    sh -c "ip netns exec ci-ha ping -c1 -W1 10.10.2.10 | grep -q 'ttl=63'"
+# ICMP errors must come *from the router* (a host's own "Destination Host
+# Unreachable" means it couldn't even reach its gateway).
+check "Time Exceeded at TTL 1"             sh -c "ip netns exec ci-ha ping -c1 -W1 -t1 10.10.2.10 | grep -qi 'From 10.10.1.1 .*exceeded'"
+check "Net Unreachable without a route"    sh -c "ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'From 10.10.1.1 .*net unreachable'"
+check "lan-b reaches its gateway"          ip netns exec ci-hb ping -c2 -i0.2 -W1 10.10.2.1
+check "lan-b can't start sessions"         sh -c "! ip netns exec ci-hb ping -c2 -i0.2 -W1 10.10.1.10"
+ip netns exec ci-hb iperf3 -s -D -1 --logfile "$WORK/iperf-b.log"
+sleep 0.5
+check "TCP A->B (iperf3)"                  ip netns exec ci-ha iperf3 -c 10.10.2.10 -t3
+grep -E "receiver" "$WORK/out" | sed 's/^/        /' || true
+check "NAT: B sees the router's address"   grep -q "Accepted connection from 10.10.2.1," "$WORK/iperf-b.log"
+check "NAT shown on the session"           sh -c "curl -skf -b '$WORK/cookies' '$WEB/api/v1/sessions?limit=50' | grep -q '\"nat\":\"10.10.2.1:'"
+ip netns exec ci-hb iperf3 -s -D -1
+sleep 0.5
+check "TCP B->A on A's session"            ip netns exec ci-ha iperf3 -c 10.10.2.10 -t3 -R
+# With a default route via host B, 8.8.8.8 is forwarded to B (which drops
+# it): the router no longer answers Net Unreachable.
+check "live route add"                     sh -c "${SSH[*]} ephctl route add 0.0.0.0/0 10.10.2.10 && ! ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'net unreachable'"
+check "live route delete"                  sh -c "${SSH[*]} ephctl route del 0.0.0.0/0 && ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'From 10.10.1.1 .*net unreachable'"
+
+# A config the data plane can't start with (a card that doesn't exist,
+# written behind the API's back): the router must go back to the last one
+# that worked by itself, keep management up, and say what happened.
+on_router 'cp /var/lib/ephemeris/ephemeris.toml /run/good.toml && sed -i s/enp0s20/enp0s99/ /var/lib/ephemeris/ephemeris.toml && systemctl restart ephemerisd' || true
+check "bad config falls back by itself"    wait_for 60 "the fallback" on_router "ephctl status | grep -q 'newer config failed'"
+check "last good config restored"          on_router "cmp -s /var/lib/ephemeris/ephemeris.toml /run/good.toml && ls /var/lib/ephemeris/ephemeris.toml.failed-*"
+check "forwarding again after the fallback" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+
+# ------------------------------------------------------------ updates
+if [[ -n $UPDATE_DIR ]]; then
+    echo "A/B update to $UPDATE_VERSION:"
+    check "newer version offered"          sh -c "${SSH[*]} ephctl system check | grep -q '$UPDATE_VERSION'"
+    check "update starts"                  sh -c "${SSH[*]} ephctl system update"
+    # The new UKI is installed last, with a boot counter (+3-0): when it's
+    # there, the whole update is in place.
+    check "update installed"               wait_for 300 "new UKI" sh -c "${SSH[*]} 'ls \$(bootctl --print-esp-path)/EFI/Linux' | grep -q '_${UPDATE_VERSION}_x86-64+3-0.efi'"
+    check "update job succeeded"           sh -c "${SSH[*]} systemctl show -p Result --value ephemeris-update.service | grep -q success"
+    on_router ephctl system reboot >/dev/null 2>&1 || true
+    sleep 10
+    check "router comes back"              wait_for 300 "SSH after update reboot" on_router true
+    check "runs $UPDATE_VERSION"           wait_for 30 "new version" sh -c "[ \"\$(${SSH[*]} cat /usr/lib/ephemeris/version)\" = '$UPDATE_VERSION' ]"
+    check "new version blessed"            wait_for 120 "boot counter removed" sh -c "${SSH[*]} 'ls \$(bootctl --print-esp-path)/EFI/Linux' | grep -q '_${UPDATE_VERSION}_x86-64.efi\$'"
+    check "config and password survive"    sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 grep -q lan-b /var/lib/ephemeris/ephemeris.toml
+    check "still forwarding"               ip netns exec ci-ha ping -c3 -i0.2 -W2 10.10.2.10
+fi
+
+on_router journalctl -b --no-pager > "$LOGS/journal.log" 2>&1 || true
+# The boot before the A/B update reboot too: most checks run there.
+on_router journalctl -b -1 --no-pager > "$LOGS/journal-previous-boot.log" 2>&1 || true
+on_router systemctl poweroff >/dev/null 2>&1 || true
+echo
+echo "$pass passed, $fail failed"
+[[ $fail -eq 0 ]]

@@ -1,0 +1,686 @@
+//! `ephctl`: the Ephemeris CLI. A thin client of the same REST API the web
+//! portal uses, so the CLI, the portal and (later) a central controller can
+//! never disagree about what the router can do.
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Parser, Subcommand};
+use serde_json::Value;
+use std::io::{IsTerminal, Write};
+
+#[derive(Parser)]
+#[command(version, about = "Manage a Ephemeris router")]
+struct Cli {
+    /// API address.
+    #[arg(long, env = "EPHCTL_URL", default_value = "http://127.0.0.1:8080")]
+    url: String,
+    /// API token (default: read /var/lib/ephemeris/api-token on the router).
+    #[arg(long, env = "EPHCTL_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// Print raw JSON instead of tables.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Interfaces, counters, drops and session totals.
+    Status,
+    /// Live sessions, busiest first.
+    Sessions {
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// The ARP table.
+    Neighbors,
+    /// The forwarding table.
+    Routes,
+    /// SD-WAN: tethers, their measured health, and which path each class uses.
+    Overlay,
+    /// Add or remove static routes (validated and committed immediately).
+    Route {
+        #[command(subcommand)]
+        cmd: RouteCmd,
+    },
+    /// Candidate / commit / rollback configuration workflow.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// Restart ephemerisd (needed after interface or worker changes).
+    Restart,
+    /// OS image version and A/B updates.
+    System {
+        #[command(subcommand)]
+        cmd: SystemCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SystemCmd {
+    /// Running build and the state of the last update job.
+    Status,
+    /// List installed and available versions.
+    Check,
+    /// Install the newest version into the inactive slot (then reboot).
+    Update,
+    /// Reboot into the newest installed version.
+    Reboot,
+    /// Change the admin password (web "admin" and console/SSH "root").
+    Password {
+        /// Set a new password without the current one (forgotten password).
+        /// Works because ephctl, run as root on the router, uses the API token.
+        #[arg(long)]
+        reset: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouteCmd {
+    /// ephctl route add 192.168.50.0/24 10.10.2.254
+    Add { prefix: String, via: String },
+    /// ephctl route del 192.168.50.0/24
+    Del { prefix: String },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the running configuration.
+    Show,
+    /// Edit the configuration in $EDITOR, then validate and show the diff.
+    Edit,
+    /// Stage a configuration file as the candidate and show the diff.
+    Load { file: String },
+    /// Apply the candidate. --confirm N: roll back after N seconds unless confirmed.
+    Commit {
+        #[arg(long)]
+        confirm: Option<u64>,
+    },
+    /// Keep a "commit --confirm" change.
+    Confirm,
+    /// Throw away the staged candidate.
+    Discard,
+    /// Restore an earlier version (1 = the previous one).
+    Rollback {
+        #[arg(default_value_t = 1)]
+        to: usize,
+    },
+    /// List saved versions.
+    History,
+}
+
+struct Client {
+    base: String,
+    token: String,
+}
+
+impl Client {
+    fn call(&self, method: &str, path: &str, body: Option<(&str, &str)>) -> Result<Value> {
+        let url = format!("{}/api/v1{path}", self.base.trim_end_matches('/'));
+        let req =
+            ureq::request(method, &url).set("Authorization", &format!("Bearer {}", self.token));
+        let res = match body {
+            Some((ctype, b)) => req.set("Content-Type", ctype).send_string(b),
+            None => req.call(),
+        };
+        let (code, text) = match res {
+            Ok(r) => (r.status(), r.into_string()?),
+            Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+            Err(e) => return Err(anyhow!("cannot reach {url}: {e}")),
+        };
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        if code >= 400 {
+            let msg = v["error"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            bail!("{msg} (HTTP {code})");
+        }
+        Ok(v)
+    }
+    fn get(&self, path: &str) -> Result<Value> {
+        self.call("GET", path, None)
+    }
+}
+
+fn main() {
+    if let Err(e) = run(Cli::parse()) {
+        eprintln!("ephctl: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let token = match cli.token {
+        Some(t) => t,
+        None => std::fs::read_to_string("/var/lib/ephemeris/api-token")
+            .map(|t| t.trim().to_string())
+            .context(
+                "no API token: pass --token, set EPHCTL_TOKEN, or run on the router as root",
+            )?,
+    };
+    let c = Client {
+        base: cli.url,
+        token,
+    };
+    let json = cli.json;
+    let print = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap());
+
+    match cli.cmd {
+        Cmd::Status => {
+            let s = c.get("/status")?;
+            if json {
+                print(&s);
+                return Ok(());
+            }
+            println!(
+                "Ephemeris {}, build {}, up {}, {} worker(s)",
+                s["version"].as_str().unwrap_or("?"),
+                s["build"].as_str().unwrap_or("?"),
+                dur(s["uptime_secs"].as_u64().unwrap_or(0)),
+                s["workers"]
+            );
+            if let Some(secs) = s["pending_confirm_secs"].as_u64() {
+                println!("!! unconfirmed commit: rolls back in {secs}s (ephctl config confirm)");
+            }
+            if let Some(e) = s["dataplane_error"].as_str() {
+                println!("!! data plane NOT running: {e}");
+                println!("   fix the config (ephctl config edit / rollback), then: ephctl restart");
+            }
+            if let Some(f) = s["fallback"].as_object() {
+                println!(
+                    "!! a newer config failed to start ({}); running the last one that worked. Failed config kept as {}",
+                    str(&f["error"]),
+                    str(&f["failed_file"])
+                );
+            }
+            println!();
+            table(
+                &[
+                    "INTERFACE",
+                    "DEVICE",
+                    "ADDRESS",
+                    "MAC",
+                    "XDP",
+                    "ZC",
+                    "NEW SESSIONS",
+                ],
+                rows(&s["ports"], |p| {
+                    vec![
+                        str(&p["name"]),
+                        str(&p["device"]),
+                        str(&p["address"]),
+                        str(&p["mac"]),
+                        str(&p["xdp_mode"]),
+                        yesno(&p["zero_copy"]),
+                        if p["allow_new_sessions"].as_bool() == Some(true) {
+                            "allowed".into()
+                        } else {
+                            "replies only".into()
+                        },
+                    ]
+                }),
+            );
+            let k = &s["counters"];
+            println!(
+                "\nrx {}  forwarded {}  originated {}  kernel-drops {}  fill-empty {}",
+                k["rx"], k["forwarded"], k["originated"], k["kernel_drops"], k["fill_empty"]
+            );
+            let ss = &s["sessions"];
+            println!(
+                "sessions: {} active, {} created, {} expired   routes: {}   neighbours: {}",
+                ss["active"], ss["created"], ss["expired"], s["routes"], s["neighbors"]
+            );
+            if let Some(d) = s["drops"].as_object().filter(|d| !d.is_empty()) {
+                println!(
+                    "drops: {}",
+                    d.iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                );
+            }
+        }
+        Cmd::Sessions { limit } => {
+            let v = c.get(&format!("/sessions?limit={limit}"))?;
+            if json {
+                print(&v);
+                return Ok(());
+            }
+            table(
+                &[
+                    "PROTO",
+                    "INITIATOR",
+                    "RESPONDER",
+                    "STATE",
+                    "PKTS ->/<-",
+                    "BYTES ->/<-",
+                    "AGE",
+                    "IDLE",
+                ],
+                rows(&v, |x| {
+                    vec![
+                        str(&x["proto"]),
+                        str(&x["initiator"]),
+                        str(&x["responder"]),
+                        str(&x["state"]),
+                        format!("{}/{}", x["packets"][0], x["packets"][1]),
+                        format!("{}/{}", bytes(&x["bytes"][0]), bytes(&x["bytes"][1])),
+                        dur(x["age_secs"].as_u64().unwrap_or(0)),
+                        dur(x["idle_secs"].as_u64().unwrap_or(0)),
+                    ]
+                }),
+            );
+        }
+        Cmd::Neighbors => {
+            let v = c.get("/neighbors")?;
+            if json {
+                print(&v);
+                return Ok(());
+            }
+            table(
+                &["IP", "MAC", "INTERFACE"],
+                rows(&v, |x| vec![str(&x["ip"]), str(&x["mac"]), str(&x["port"])]),
+            );
+        }
+        Cmd::Routes => {
+            let v = c.get("/routes")?;
+            if json {
+                print(&v);
+                return Ok(());
+            }
+            table(
+                &["PREFIX", "VIA", "INTERFACE", "KIND"],
+                rows(&v, |x| {
+                    vec![
+                        str(&x["prefix"]),
+                        x["via"].as_str().unwrap_or("-").into(),
+                        str(&x["port"]),
+                        str(&x["kind"]),
+                    ]
+                }),
+            );
+        }
+        Cmd::Overlay => {
+            let v = c.get("/overlay")?;
+            if json {
+                print(&v);
+                return Ok(());
+            }
+            if v["enabled"].as_bool() != Some(true) {
+                println!("SD-WAN overlay not configured.");
+                return Ok(());
+            }
+            println!(
+                "Site {}  (overlay MTU {}, path generation {})\n",
+                v["site_id"], v["mtu"], v["path_generation"]
+            );
+            table(
+                &[
+                    "TETHER", "VIA", "REMOTE", "SITE", "STATE", "RTT", "JITTER", "LOSS", "TX PKTS",
+                    "RX PKTS",
+                ],
+                rows(&v["tethers"], |t| {
+                    vec![
+                        str(&t["name"]),
+                        str(&t["interface"]),
+                        str(&t["remote"]),
+                        t["site"].to_string(),
+                        if t["up"].as_bool() == Some(true) {
+                            "up".into()
+                        } else {
+                            "DOWN".into()
+                        },
+                        format!("{:.1} ms", t["rtt_ms"].as_f64().unwrap_or(0.0)),
+                        format!("{:.1} ms", t["jitter_ms"].as_f64().unwrap_or(0.0)),
+                        format!("{:.1}%", t["loss_pct"].as_f64().unwrap_or(0.0)),
+                        t["tx_packets"].to_string(),
+                        t["rx_packets"].to_string(),
+                    ]
+                }),
+            );
+            println!();
+            table(
+                &["SITE", "CLASS", "USING"],
+                rows(&v["paths"], |p| {
+                    vec![
+                        p["site"].to_string(),
+                        str(&p["class"]),
+                        p["tether"].as_str().unwrap_or("(no path)").into(),
+                    ]
+                }),
+            );
+        }
+        Cmd::Route { cmd } => {
+            let v = match cmd {
+                RouteCmd::Add { prefix, via } => {
+                    let body = serde_json::json!({ "prefix": prefix, "via": via }).to_string();
+                    c.call("POST", "/routes", Some(("application/json", &body)))?
+                }
+                RouteCmd::Del { prefix } => c.call(
+                    "DELETE",
+                    &format!("/routes?prefix={}", encode(&prefix)),
+                    None,
+                )?,
+            };
+            report_commit(&v, json);
+        }
+        Cmd::Config { cmd } => config(&c, cmd, json)?,
+        Cmd::System { cmd } => system(&c, cmd, json)?,
+        Cmd::Restart => {
+            let v = c.call("POST", "/restart", None)?;
+            println!("{}", v["note"].as_str().unwrap_or("restarting"));
+        }
+    }
+    Ok(())
+}
+
+fn config(c: &Client, cmd: ConfigCmd, json: bool) -> Result<()> {
+    let stage = |text: String| -> Result<()> {
+        let p = c.call("PUT", "/config/candidate", Some(("text/plain", &text)))?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&p)?);
+            return Ok(());
+        }
+        let diff = p["diff"].as_str().unwrap_or("");
+        if diff.is_empty() {
+            println!("No changes.");
+        } else {
+            print_diff(diff);
+            println!(
+                "\nCandidate staged ({}). Apply with: ephctl config commit",
+                describe(&p["apply"])
+            );
+        }
+        Ok(())
+    };
+    match cmd {
+        ConfigCmd::Show => {
+            let v = c.get("/config")?;
+            print!("{}", v["running"].as_str().unwrap_or(""));
+        }
+        ConfigCmd::Load { file } => {
+            stage(std::fs::read_to_string(&file).with_context(|| format!("reading {file}"))?)?
+        }
+        ConfigCmd::Edit => {
+            let v = c.get("/config")?;
+            let start = v["candidate"]
+                .as_str()
+                .or(v["running"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let path = std::env::temp_dir().join(format!("ephctl-{}.toml", std::process::id()));
+            std::fs::write(&path, &start)?;
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| "vi".into());
+            let ok = std::process::Command::new(&editor)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("running {editor}"))?;
+            let text = std::fs::read_to_string(&path)?;
+            let _ = std::fs::remove_file(&path);
+            if !ok.success() {
+                bail!("{editor} exited with {ok}; nothing staged");
+            }
+            if text == start {
+                println!("No changes.");
+                return Ok(());
+            }
+            stage(text)?;
+            if std::io::stdin().is_terminal() && ask("Commit now?")? {
+                report_commit(&c.call("POST", "/config/commit", None)?, json);
+            }
+        }
+        ConfigCmd::Commit { confirm } => {
+            let q = confirm.map(|s| format!("?confirm={s}")).unwrap_or_default();
+            report_commit(&c.call("POST", &format!("/config/commit{q}"), None)?, json);
+        }
+        ConfigCmd::Confirm => {
+            c.call("POST", "/config/confirm", None)?;
+            println!("Confirmed.");
+        }
+        ConfigCmd::Discard => {
+            c.call("DELETE", "/config/candidate", None)?;
+            println!("Candidate discarded.");
+        }
+        ConfigCmd::Rollback { to } => report_commit(
+            &c.call("POST", &format!("/config/rollback?to={to}"), None)?,
+            json,
+        ),
+        ConfigCmd::History => {
+            let v = c.get("/config/history")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            table(
+                &["#", "SAVED (unix)", "FILE"],
+                rows(&v, |e| {
+                    vec![
+                        e["index"].to_string(),
+                        e["saved_unix"].to_string(),
+                        str(&e["file"]),
+                    ]
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn system(c: &Client, cmd: SystemCmd, json: bool) -> Result<()> {
+    let v = match cmd {
+        SystemCmd::Status => c.get("/system")?,
+        SystemCmd::Check => c.call("POST", "/system/update/check", None)?,
+        SystemCmd::Update => c.call("POST", "/system/update", None)?,
+        SystemCmd::Reboot => c.call("POST", "/system/reboot", None)?,
+        SystemCmd::Password { reset } => {
+            let current = if reset {
+                None
+            } else {
+                Some(read_secret("Current password: ")?)
+            };
+            let new = read_secret("New password: ")?;
+            if read_secret("Repeat new password: ")? != new {
+                bail!("the passwords don't match");
+            }
+            let mut body = serde_json::json!({ "new": new });
+            if let Some(c) = current {
+                body["current"] = c.into();
+            }
+            let body = body.to_string();
+            c.call(
+                "POST",
+                "/system/password",
+                Some(("application/json", &body)),
+            )
+            .map_err(|e| {
+                match e.to_string().contains("current password is wrong") {
+                    true => {
+                        anyhow::anyhow!(
+                            "{e}\nForgotten it? As root: ephctl system password --reset"
+                        )
+                    }
+                    false => e,
+                }
+            })?;
+            println!("Password changed.");
+            return Ok(());
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    if let Some(build) = v["build"].as_str() {
+        println!(
+            "Ephemeris {}, build {build}",
+            v["version"].as_str().unwrap_or("?")
+        );
+        let j = &v["update_job"];
+        println!("update job: {} ({})", str(&j["state"]), str(&j["result"]));
+    }
+    if let Some(list) = v["versions"].as_str() {
+        print!("{list}");
+        match v["available"].as_str() {
+            Some(n) => {
+                println!("\nNewer version available: {n}. Install with: ephctl system update")
+            }
+            None => println!("\nUp to date."),
+        }
+    }
+    if let Some(note) = v["note"].as_str() {
+        println!("{note}");
+    } else if v["ok"].as_bool() == Some(true) {
+        println!("OK.");
+    }
+    Ok(())
+}
+
+fn report_commit(v: &Value, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(v).unwrap());
+        return;
+    }
+    if let Some(d) = v["diff"].as_str().filter(|d| !d.is_empty()) {
+        print_diff(d);
+        println!();
+    }
+    println!("Committed: {}.", describe(&v["applied"]));
+    if let Some(s) = v["confirm_within_secs"].as_u64() {
+        println!("Run `ephctl config confirm` within {s}s, or the change rolls back.");
+    }
+}
+
+fn describe(apply: &Value) -> &'static str {
+    match apply.as_str() {
+        Some("live") => "applied live",
+        Some("restart-required") => "saved; takes effect after `ephctl restart`",
+        _ => "no effect on the data plane",
+    }
+}
+
+fn print_diff(d: &str) {
+    let color = std::io::stdout().is_terminal();
+    for line in d.lines() {
+        match (color, line.chars().next()) {
+            (true, Some('+')) => println!("\x1b[32m{line}\x1b[0m"),
+            (true, Some('-')) => println!("\x1b[31m{line}\x1b[0m"),
+            _ => println!("{line}"),
+        }
+    }
+}
+
+/// Read a line from the terminal without echoing it.
+fn read_secret(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let tty = std::io::stdin().is_terminal();
+    let stty = |arg: &str| {
+        let _ = std::process::Command::new("stty")
+            .arg(arg)
+            .stdin(std::process::Stdio::inherit())
+            .status();
+    };
+    if tty {
+        stty("-echo");
+    }
+    let mut line = String::new();
+    let r = std::io::stdin().read_line(&mut line);
+    if tty {
+        stty("echo");
+        println!();
+    }
+    r?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn ask(q: &str) -> Result<bool> {
+    print!("{q} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut a = String::new();
+    std::io::stdin().read_line(&mut a)?;
+    Ok(matches!(a.trim(), "y" | "Y" | "yes"))
+}
+
+// ---- formatting helpers
+
+fn str(v: &Value) -> String {
+    v.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
+}
+
+fn yesno(v: &Value) -> String {
+    if v.as_bool() == Some(true) {
+        "yes".into()
+    } else {
+        "no".into()
+    }
+}
+
+fn rows(v: &Value, f: impl Fn(&Value) -> Vec<String>) -> Vec<Vec<String>> {
+    v.as_array()
+        .map(|a| a.iter().map(f).collect())
+        .unwrap_or_default()
+}
+
+fn table(head: &[&str], rows: Vec<Vec<String>>) {
+    let mut w: Vec<usize> = head.iter().map(|h| h.len()).collect();
+    for r in &rows {
+        for (i, c) in r.iter().enumerate() {
+            w[i] = w[i].max(c.chars().count());
+        }
+    }
+    let line = |cells: Vec<String>| {
+        let s: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c:<width$}", width = w[i]))
+            .collect();
+        println!("{}", s.join("  ").trim_end());
+    };
+    line(head.iter().map(|h| h.to_string()).collect());
+    if rows.is_empty() {
+        println!("(none)");
+    }
+    for r in rows {
+        line(r);
+    }
+}
+
+fn dur(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86399 => format!("{}h{}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
+fn bytes(v: &Value) -> String {
+    let mut b = v.as_f64().unwrap_or(0.0);
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut i = 0;
+    while b >= 1000.0 && i < units.len() - 1 {
+        b /= 1000.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b}B")
+    } else {
+        format!("{b:.1}{}", units[i])
+    }
+}
+
+/// Percent-encode a query value (prefixes contain '/').
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}

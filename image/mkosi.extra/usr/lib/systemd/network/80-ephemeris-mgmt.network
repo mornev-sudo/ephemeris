@@ -1,0 +1,11 @@
+# Management interface: the first virtio NIC in Proxmox (net0). Data-plane NICs
+# deliberately have no .network file, so the kernel stack leaves them alone.
+[Match]
+Name=ens18
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+# The machine ID could change if the VM's SMBIOS UUID does; the MAC won't.
+ClientIdentifier=mac

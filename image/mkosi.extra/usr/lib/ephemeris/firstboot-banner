@@ -1,0 +1,39 @@
+#!/bin/sh
+# Show the generated first-boot password on a console and wait for Enter.
+# Runs on every console (serial and screen) before its login prompt; the
+# first Enter anywhere wipes the password and releases all consoles.
+pwfile=/run/ephemeris/first-boot-password
+[ -s "$pwfile" ] || exit 0
+pw=$(cat "$pwfile")
+ip=
+for _ in $(seq 1 20); do
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }')
+    [ -n "$ip" ] && break
+    sleep 1
+done
+host=$(hostname)
+fp=$(cat /var/lib/ephemeris/tls/fingerprint 2>/dev/null || echo "not created yet")
+printf '\033[2J\033[H'
+cat <<MSG
+
+  ==================================================================
+    Ephemeris router "$host" -- first boot
+
+    Web portal : https://${ip:-<management address>}:8443/   user: admin
+    Console/SSH: user: root
+    Password   : $pw
+
+    The portal's certificate is self-signed. Its SHA-256 fingerprint:
+      $fp
+
+    This password is shown ONCE and is not stored anywhere readable.
+    Write it down or copy it now.
+  ==================================================================
+
+MSG
+printf '  Press Enter once you have saved the password... '
+read _ || true
+rm -f "$pwfile"
+# Release the other consoles too.
+systemctl stop --no-block 'ephemeris-firstboot-banner@*.service' >/dev/null 2>&1 || true
+printf '\033[2J\033[H'

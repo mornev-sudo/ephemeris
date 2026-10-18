@@ -1,0 +1,177 @@
+/// Why a packet was not forwarded. Counting drops per reason is the single
+/// most useful debugging tool a router has ("show interface counters").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum DropReason {
+    /// Frame too short or header fields inconsistent.
+    Malformed,
+    /// Unicast frame for some other MAC address.
+    NotForUs,
+    /// 802.1Q tagged frames are not supported yet.
+    Vlan,
+    /// Not IPv4 or ARP (e.g. IPv6, LLDP).
+    UnsupportedEthertype,
+    /// Bad IPv4 version, length or header checksum.
+    BadIpHeader,
+    /// Addresses that must never be routed: multicast, broadcast, loopback,
+    /// unspecified (0.0.0.0/8) or reserved (240.0.0.0/4). See `filter`.
+    Martian,
+    /// TTL ran out (an ICMP Time Exceeded may have been sent instead).
+    TtlExceeded,
+    /// No matching route (an ICMP Net Unreachable may have been sent instead).
+    NoRoute,
+    /// Next hop's MAC is unknown; an ARP request was sent.
+    NeighborMiss,
+    /// Addressed to the router but not something the data plane answers.
+    LocalUnhandled,
+    /// ICMP generation suppressed by the rate limiter.
+    IcmpRateLimited,
+    /// ARP packet consumed (answered or learned from), not really a drop.
+    ArpConsumed,
+    /// Egress TX ring was full (counted by the I/O layer).
+    TxRingFull,
+    /// TCP/UDP header truncated.
+    BadL4Header,
+    /// No session, and the ingress port may not start new ones.
+    NoSession,
+    /// TCP packet that doesn't fit the session's state (e.g. a stray ACK).
+    InvalidTcpState,
+    /// The session table is full; new flows are refused.
+    SessionTableFull,
+    /// Overlay route, but no tether to that site is up.
+    NoPath,
+    /// Too big for the overlay MTU with Don't Fragment set (an ICMP
+    /// Fragmentation Needed was sent instead), or too big to encapsulate.
+    TooBig,
+    /// Overlay packet from an address that isn't a configured tether peer.
+    UnknownTether,
+    /// Overlay packet with a bad header, version or site id.
+    BadOverlay,
+    /// Overlay probe or probe reply, consumed by the router.
+    OverlayControl,
+    /// Source NAT couldn't find a free port for a new session.
+    NatExhausted,
+    /// Source is one of the router's own addresses, or the destination itself.
+    SpoofedSource,
+    /// Source route, record route, timestamp or stream ID option, or a
+    /// malformed option list.
+    IpOption,
+    /// A fragment that can never be part of a valid packet.
+    BadFragment,
+    /// A fragment addressed to the router, which never reassembles.
+    FragmentToRouter,
+    /// Matches a session, but arrived on the wrong interface, or (NAT) was
+    /// sent to the inside host's own address instead of the translated one.
+    SessionMismatch,
+    /// ICMP error addressed to someone other than the sender of the packet
+    /// it quotes.
+    IcmpMismatch,
+    /// A non-first fragment that would need source NAT: it has no ports to
+    /// translate.
+    NatUntranslatable,
+    /// Overlay packet that failed authentication (wrong key, or modified).
+    OverlayAuth,
+    /// Overlay packet seen before (replayed), or too old.
+    OverlayReplay,
+}
+
+impl DropReason {
+    pub const ALL: [DropReason; 32] = [
+        DropReason::Malformed,
+        DropReason::NotForUs,
+        DropReason::Vlan,
+        DropReason::UnsupportedEthertype,
+        DropReason::BadIpHeader,
+        DropReason::Martian,
+        DropReason::TtlExceeded,
+        DropReason::NoRoute,
+        DropReason::NeighborMiss,
+        DropReason::LocalUnhandled,
+        DropReason::IcmpRateLimited,
+        DropReason::ArpConsumed,
+        DropReason::TxRingFull,
+        DropReason::BadL4Header,
+        DropReason::NoSession,
+        DropReason::InvalidTcpState,
+        DropReason::SessionTableFull,
+        DropReason::NoPath,
+        DropReason::TooBig,
+        DropReason::UnknownTether,
+        DropReason::BadOverlay,
+        DropReason::OverlayControl,
+        DropReason::NatExhausted,
+        DropReason::SpoofedSource,
+        DropReason::IpOption,
+        DropReason::BadFragment,
+        DropReason::FragmentToRouter,
+        DropReason::SessionMismatch,
+        DropReason::IcmpMismatch,
+        DropReason::NatUntranslatable,
+        DropReason::OverlayAuth,
+        DropReason::OverlayReplay,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DropReason::Malformed => "malformed",
+            DropReason::NotForUs => "not-for-us",
+            DropReason::Vlan => "vlan",
+            DropReason::UnsupportedEthertype => "unsupported-ethertype",
+            DropReason::BadIpHeader => "bad-ip-header",
+            DropReason::Martian => "martian",
+            DropReason::TtlExceeded => "ttl-exceeded",
+            DropReason::NoRoute => "no-route",
+            DropReason::NeighborMiss => "neighbor-miss",
+            DropReason::LocalUnhandled => "local-unhandled",
+            DropReason::IcmpRateLimited => "icmp-rate-limited",
+            DropReason::ArpConsumed => "arp-consumed",
+            DropReason::TxRingFull => "tx-ring-full",
+            DropReason::BadL4Header => "bad-l4-header",
+            DropReason::NoSession => "no-session",
+            DropReason::InvalidTcpState => "invalid-tcp-state",
+            DropReason::SessionTableFull => "session-table-full",
+            DropReason::NoPath => "no-path",
+            DropReason::TooBig => "too-big",
+            DropReason::UnknownTether => "unknown-tether",
+            DropReason::BadOverlay => "bad-overlay",
+            DropReason::OverlayControl => "overlay-control",
+            DropReason::NatExhausted => "nat-exhausted",
+            DropReason::SpoofedSource => "spoofed-source",
+            DropReason::IpOption => "ip-option",
+            DropReason::BadFragment => "bad-fragment",
+            DropReason::FragmentToRouter => "fragment-to-router",
+            DropReason::SessionMismatch => "session-mismatch",
+            DropReason::IcmpMismatch => "icmp-mismatch",
+            DropReason::NatUntranslatable => "nat-untranslatable",
+            DropReason::OverlayAuth => "overlay-auth",
+            DropReason::OverlayReplay => "overlay-replay",
+        }
+    }
+}
+
+/// Per-worker counters. Plain integers: only the owning worker writes them.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub rx: u64,
+    pub forwarded: u64,
+    /// Packets the router itself sent (ARP, ICMP).
+    pub originated: u64,
+    pub sessions_active: u64,
+    pub sessions_created: u64,
+    pub sessions_expired: u64,
+    /// TCP segments whose sequence number didn't fit their connection (any
+    /// RST or FIN in them was ignored).
+    pub tcp_blind: u64,
+    /// ARP packets that disagreed with a known neighbour (re-checked, not
+    /// believed).
+    pub arp_conflicts: u64,
+    pub drops: [u64; DropReason::COUNT],
+}
+
+impl Stats {
+    #[inline(always)]
+    pub fn drop(&mut self, r: DropReason) {
+        self.drops[r as usize] += 1;
+    }
+}

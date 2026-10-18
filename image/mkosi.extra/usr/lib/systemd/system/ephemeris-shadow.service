@@ -1,0 +1,14 @@
+[Unit]
+Description=Use the writable password file in /var
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target systemd-user-sessions.service
+RequiresMountsFor=/var/lib
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/ephemeris/shadow-setup
+
+[Install]
+WantedBy=sysinit.target

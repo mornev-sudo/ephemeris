@@ -1,0 +1,8 @@
+[package]
+name = "eph-packet"
+description = "Zero-copy Ethernet / ARP / IPv4 / ICMP header access for the Ephemeris data plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

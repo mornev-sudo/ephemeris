@@ -1,0 +1,67 @@
+# Publish a release by *promoting* an image that the "image" workflow already
+# built and boot-tested for the tagged commit. Nothing is rebuilt, so the
+# released bytes are exactly the bytes that passed the boot test.
+#
+#   git tag v0.1.0 <commit> && git push origin v0.1.0
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release
+  actions: read   # find the image run and download its artifact
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Find the tested image for this commit
+        id: run
+        run: |
+          sha=$GITHUB_SHA
+          # If the tag was pushed right after the commit, its image build may
+          # still be running: wait for it rather than failing.
+          for _ in $(seq 1 60); do
+            run=$(gh run list --workflow image.yml --commit "$sha" --event push \
+                    --json databaseId,status,conclusion \
+                    -q 'map(select(.conclusion == "success" or .status != "completed")) | .[0]')
+            [[ -n $run ]] || break
+            id=$(jq -r .databaseId <<<"$run")
+            [[ $(jq -r .status <<<"$run") == completed ]] && break
+            echo "image run $id for ${sha::8} still in progress, waiting..."
+            sleep 30
+          done
+          if [[ -z ${run:-} || $(jq -r .conclusion <<<"$run") != success ]]; then
+            echo "::error::No successful 'image' run for ${sha::8}. Push the commit to main, wait for its image build to pass, then tag it."
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "Promoting image from run $id"
+
+      - name: Download the tested image
+        run: gh run download "${{ steps.run.outputs.id }}" -n ephemeris-image -D dist
+
+      - name: Verify and publish
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+          # The image must be the release the tag names: v0.5.0 only for an
+          # image built from a commit whose Cargo.toml says 0.5.0.
+          build=$(cat VERSION)
+          rel=${GITHUB_REF_NAME#v}
+          if [[ ! $build =~ ^${rel//./\\.}\.[0-9]+$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match the image's release (build $build). Set version = \"${GITHUB_REF_NAME#v}\" in Cargo.toml, push, wait for CI, then tag that commit."
+            exit 1
+          fi
+          test -s SHA256SUMS.gpg || { echo "::error::image run produced no SHA256SUMS.gpg"; exit 1; }
+          notes="Image build \`$build\` (commit ${GITHUB_SHA::8}), boot-tested in [run ${{ steps.run.outputs.id }}](https://github.com/$GH_REPO/actions/runs/${{ steps.run.outputs.id }})."
+          # The qcow2 is for new routers; the .raw.xz and .efi files are what
+          # existing routers download to update themselves (systemd-sysupdate).
+          gh release create "$GITHUB_REF_NAME" --title "Ephemeris $GITHUB_REF_NAME" \
+            --notes "$notes" --generate-notes \
+            ephemeris-x86_64.qcow2 *.raw.xz *.efi SHA256SUMS SHA256SUMS.gpg VERSION

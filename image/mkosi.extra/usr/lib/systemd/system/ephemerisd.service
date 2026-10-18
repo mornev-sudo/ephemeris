@@ -1,0 +1,44 @@
+[Unit]
+Description=Ephemeris router data plane
+ConditionPathExists=/var/lib/ephemeris/ephemeris.toml
+After=systemd-udev-trigger.service systemd-tmpfiles-setup.service
+
+[Service]
+# Prepare the NICs the config names on *every* start, not just at boot: an
+# interface added in the portal followed by a restart needs its card
+# brought up too. "+" runs it outside the sandbox below (it changes links);
+# "-": a failure there must not keep management (in ephemerisd) from starting.
+ExecStartPre=-+/usr/lib/ephemeris/nic-setup
+ExecStart=/usr/bin/ephemerisd --config /var/lib/ephemeris/ephemeris.toml
+# always: `ephctl restart` makes ephemerisd exit cleanly and come back.
+Restart=always
+RestartSec=2
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_IPC_LOCK CAP_SYS_RESOURCE
+LimitMEMLOCK=infinity
+ProtectSystem=strict
+# The sandbox makes the whole file system read-only for ephemerisd, except its
+# own state: config + history, API token, admin password, sessions.
+ReadWritePaths=/var/lib/ephemeris
+ProtectHome=yes
+PrivateTmp=yes
+# Everything ephemerisd creates is private (configs can hold tether keys).
+UMask=0077
+# More of the system kept out of reach: ephemerisd needs its sockets, AF_XDP
+# and BPF, and nothing else of the kernel's.
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_XDP
+
+[Install]
+WantedBy=multi-user.target

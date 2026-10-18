@@ -1,0 +1,30 @@
+#!/bin/sh
+# First boot: set the admin password (root on the console/SSH, "admin" on
+# the web portal).
+#  - Deployed by deploy-image.sh: it generated the password, printed it on
+#    the Proxmox host, and passed only its hash (credential
+#    ephemeris.admin_password_hash).
+#  - Deployed by hand (e.g. the Proxmox GUI): generate one here and show it
+#    on the console until someone presses Enter (firstboot-banner).
+set -e
+umask 077
+state=/var/lib/ephemeris
+cred="$CREDENTIALS_DIRECTORY/ephemeris.admin_password_hash"
+if [ -s "$cred" ]; then
+    hash=$(cat "$cred")
+    echo "admin password set from deployment credential"
+else
+    # 20 characters from an alphabet without look-alikes (0/O, 1/l/I): ~115 bits.
+    pw=$(head -c 600 /dev/urandom | LC_ALL=C tr -dc 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789' | cut -c1-20 |
+        sed 's/\(.....\)\(.....\)\(.....\)\(.....\)/\1-\2-\3-\4/')
+    hash=$(printf '%s' "$pw" | openssl passwd -6 -stdin)
+    mkdir -p /run/ephemeris
+    printf '%s\n' "$pw" > /run/ephemeris/first-boot-password   # tmpfs: gone after reboot
+    echo "admin password generated; shown on the console"
+fi
+case "$hash" in '$6$'*|'$y$'*) ;; *) echo "invalid password hash" >&2; exit 1 ;; esac
+printf '%s\n' "$hash" > "$state/admin.hash"
+# Rewrite root's entry in place: the file is bind-mounted, keep its inode.
+awk -F: -v OFS=: -v h="$hash" '$1 == "root" { $2 = h } { print }' "$state/shadow" > "$state/shadow.new"
+cat "$state/shadow.new" > "$state/shadow"
+rm -f "$state/shadow.new"

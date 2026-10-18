@@ -1,0 +1,89 @@
+# Ephemeris router configuration (Phase 0).
+#
+# The router takes over the listed devices completely: once ephemerisd is
+# running, Linux no longer sees traffic on them. Keep a separate management
+# interface (e.g. ens18) that is NOT listed here, or you'll lock yourself out.
+
+[dataplane]
+# One worker thread per RX queue. Worker N serves queue N on every interface,
+# so set each NIC's queue count to match:  ethtool -L <dev> combined <workers>
+workers = 1
+# Where the XDP program runs: "native" (in the driver, fast), "generic"
+# (works everywhere, slow), or "auto" (try native first).
+xdp_mode = "auto"
+# AF_XDP buffer handling: "zerocopy", "copy", or "auto".
+bind_mode = "auto"
+ring_size = 2048
+# true = spin at 100% CPU even when idle, for lowest latency.
+busy_poll = false
+# Pin workers to CPUs (one entry per worker). Leave empty to let Linux decide.
+cpus = []
+stats_interval_secs = 10
+# Sessions listed with each stats report.
+show_sessions = 10
+
+[management]
+# REST API + web portal. ephemerisd serves plain HTTP on loopback only (ephctl on
+# the router uses it); on Ephemeris OS, nginx serves it to the network over
+# HTTPS: https://<router>:8443/
+enabled = true
+listen = "127.0.0.1:8080"
+# Bearer token for the API; generated on first start if missing.
+token_file = "/var/lib/ephemeris/api-token"
+# Host names the portal may be reached by, besides addresses, localhost and
+# the router's own name (anything else is refused: DNS rebinding).
+# hostnames = ["router.example.net"]
+
+[sessions]
+# Capacity per worker. Memory is reserved up front (~150 bytes per session).
+max_per_worker = 262144
+# true: only a TCP SYN may open a session. false: also pick up connections
+# already in progress (useful right after a router restart).
+tcp_strict = false
+# Idle timeouts.
+tcp_established_timeout_secs = 3600
+udp_timeout_secs = 30          # one-way UDP
+udp_stream_timeout_secs = 180  # UDP that has seen replies
+icmp_timeout_secs = 30
+
+# Interfaces. "inside" faces your networks (the default); "outside" faces
+# the internet: it only lets replies in, and traffic leaving through it is
+# source-NATed to its address (see [nat]).
+[[interface]]
+name = "lan"
+device = "ens19"
+address = "10.10.1.1/24"
+role = "inside"
+
+[[interface]]
+name = "wan"
+device = "ens20"
+address = "10.10.2.1/24"
+role = "outside"
+# allow_new_sessions = true   # override the role's default
+# TCP MSS adjust: SYNs through this interface announce at most this MSS,
+# so TCP segments fit a smaller link without fragmenting. 1452 suits PPPoE
+# (1492-byte MTU); 536-1460. Applies in both directions: outgoing SYNs and
+# the SYN-ACKs that come back in.
+# mss_adjust = 1452
+
+# Static routes. The gateway must sit on one of the subnets above.
+# [[route]]
+# prefix = "0.0.0.0/0"         # the internet
+# via = "10.10.2.254"           # your ISP's gateway
+
+[nat]
+# Inside -> outside traffic leaves with the outside interface's address
+# (PAT). Rules below take precedence.
+masquerade = true
+
+# [[nat.pool]]
+# name = "public"
+# addresses = ["203.0.113.10-203.0.113.20"]
+
+# [[nat.rule]]
+# name = "servers"
+# source = "10.10.1.128/25"
+# outbound = "wan"
+# translate = "pool"            # "interface", "pool" or "none"
+# pool = "public"

@@ -1,0 +1,1384 @@
+//! REST API (`/api/v1/...`, JSON, bearer token) and the web portal (`/`).
+//!
+//! | Method | Path                      | What                                        |
+//! |--------|---------------------------|---------------------------------------------|
+//! | POST   | /login {username,password}| web login: sets the session cookie (public) |
+//! | POST   | /logout                   | end the web session                         |
+//! | GET    | /whoami                   | who is logged in, and how                   |
+//! | POST   | /system/password          | change the admin password {current?, new}   |
+//! | GET    | /status                   | ports, counters, drops, session totals      |
+//! | GET    | /sessions?limit=N         | live sessions, busiest first                |
+//! | GET    | /neighbors                | ARP table                                   |
+//! | GET    | /routes                   | forwarding table                            |
+//! | POST   | /routes  {prefix, via}    | add/replace a static route (commits)        |
+//! | DELETE | /routes?prefix=P          | remove a static route (commits)             |
+//! | GET    | /config                   | running + candidate text, pending confirm   |
+//! | PUT    | /config/candidate (TOML)  | validate + stage, returns diff              |
+//! | GET    | /config/model             | working config as structured JSON (GUI)     |
+//! | PUT    | /config/model             | stage an edited structured config (GUI)     |
+//! | DELETE | /config/candidate         | discard staged changes                      |
+//! | POST   | /config/commit?confirm=S  | apply candidate (auto-rollback after S s)   |
+//! | POST   | /config/confirm           | keep a confirmed commit                     |
+//! | POST   | /config/rollback?to=N     | restore history entry N (default 1)         |
+//! | GET    | /config/history           | saved versions                              |
+//! | POST   | /restart                  | restart ephemerisd (systemd brings it back)   |
+//! | GET    | /overlay                  | SD-WAN tethers, health, path decisions      |
+//! | GET    | /system                   | build, update job state                     |
+//! | POST   | /system/update/check      | list installed + available versions         |
+//! | POST   | /system/update            | install newest version into inactive slot   |
+//! | POST   | /system/reboot            | reboot (into the newest installed version)  |
+//!
+//! ephemerisd serves plain HTTP on loopback only; nginx in front terminates
+//! HTTPS for the network (see image/) and passes the client's address in
+//! `X-Real-IP`, trusted only from loopback. Every request goes through
+//! [`front`]: a concurrency limit, a Host / Origin check (against DNS
+//! rebinding and cross-site requests) and security headers on the response.
+
+use super::configmgr::{Apply, Committed};
+use super::Shared;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::{Extension, Json, Router};
+use eph_dataplane::{Dir, NextHop};
+use eph_packet::eth;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+
+type St = State<Arc<Shared>>;
+
+/// Largest request body (a config is at most 256 KiB, see configmgr).
+const MAX_BODY: usize = 512 * 1024;
+/// Requests handled at once; more get 503 instead of piling up.
+static REQUESTS: Semaphore = Semaphore::const_new(64);
+/// Password checks at once (each one is deliberately slow).
+static PASSWORD_CHECKS: Semaphore = Semaphore::const_new(2);
+/// A handler that takes longer than this is cut off (updates included).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Longest `?confirm=` for a provisional commit.
+const MAX_CONFIRM_SECS: u64 = 3600;
+
+/// Errors become `{"error": "..."}` with a status code.
+pub struct ApiError(StatusCode, String);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        // `{:#}` includes the cause chain: "parsing ...: route X: gateway ..."
+        ApiError(StatusCode::BAD_REQUEST, format!("{e:#}"))
+    }
+}
+
+type ApiResult = Result<Json<Value>, ApiError>;
+
+/// Who sent a request: their address and whether it came over HTTPS, as the
+/// nginx in front reports them (believed only from loopback).
+#[derive(Clone, Copy, Debug)]
+pub struct Client {
+    pub ip: IpAddr,
+    pub https: bool,
+}
+
+pub fn router(shared: Arc<Shared>) -> Router {
+    let api = Router::new()
+        .route("/status", get(status))
+        .route("/sessions", get(sessions))
+        .route("/neighbors", get(neighbors))
+        .route("/routes", get(routes).post(add_route).delete(del_route))
+        .route("/config", get(config))
+        .route(
+            "/config/candidate",
+            put(put_candidate).delete(clear_candidate),
+        )
+        .route("/config/model", get(get_model).put(put_model))
+        .route("/config/commit", post(commit))
+        .route("/config/confirm", post(confirm))
+        .route("/config/rollback", post(rollback))
+        .route("/config/history", get(history))
+        .route("/restart", post(restart))
+        .route("/overlay", get(overlay))
+        .route("/system", get(system))
+        .route("/system/update/check", post(update_check))
+        .route("/system/update", post(update_start))
+        .route("/system/reboot", post(reboot))
+        .route("/system/password", post(change_password))
+        .route("/whoami", get(whoami))
+        .route("/logout", post(logout))
+        // Everything above needs a login (checked first), and every change
+        // is written to the audit log; the routes below don't.
+        .route_layer(middleware::from_fn(audit))
+        .route_layer(middleware::from_fn_with_state(shared.clone(), auth))
+        .route("/login", post(login));
+    Router::new()
+        .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .nest("/api/v1", api)
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn_with_state(shared.clone(), front))
+        .with_state(shared)
+}
+
+pub async fn serve(shared: Arc<Shared>, listen: SocketAddr) -> anyhow::Result<()> {
+    let stop = shared.stop;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    tracing::info!("management API on http://{listen}/");
+    axum::serve(
+        listener,
+        router(shared).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        while !stop.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+/// The portal never needs to be framed, or to load anything from elsewhere;
+/// its script is a file of its own so no inline script is allowed at all.
+const PORTAL_CSP: &str =
+    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+     connect-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; \
+     base-uri 'none'";
+
+async fn index() -> impl IntoResponse {
+    (
+        [(header::CONTENT_SECURITY_POLICY, PORTAL_CSP)],
+        Html(include_str!("web/index.html")),
+    )
+}
+
+async fn app_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("web/app.js"),
+    )
+}
+
+/// Runs for every request: limits, where it came from, Host and Origin
+/// checks, and security headers on the way out.
+async fn front(State(s): St, mut req: Request, next: Next) -> Response {
+    let Ok(_permit) = REQUESTS.try_acquire() else {
+        return ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy, try again".into()).into_response();
+    };
+    let client = client_of(&req);
+    let hostnames = s
+        .config
+        .lock()
+        .unwrap()
+        .running()
+        .management
+        .hostnames
+        .clone();
+    if !host_allowed(req.headers(), &hostnames) {
+        tracing::warn!("refused a request for an unknown Host from {}", client.ip);
+        return ApiError(
+            StatusCode::MISDIRECTED_REQUEST,
+            "unknown host name: use the router's address, or add the name to \
+             management.hostnames"
+                .into(),
+        )
+        .into_response();
+    }
+    if !origin_allowed(req.method(), req.headers()) {
+        return ApiError(StatusCode::FORBIDDEN, "cross-origin request refused".into())
+            .into_response();
+    }
+    req.extensions_mut().insert(client);
+    let mut resp = match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
+        Ok(r) => r,
+        Err(_) => {
+            ApiError(StatusCode::GATEWAY_TIMEOUT, "request took too long".into()).into_response()
+        }
+    };
+    let h = resp.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if client.https {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    resp
+}
+
+fn client_of(req: &Request) -> Client {
+    // No connection info: a request from inside this process (tests).
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |c| c.0.ip());
+    if !peer.is_loopback() {
+        return Client {
+            ip: peer,
+            https: false,
+        };
+    }
+    let h = req.headers();
+    let real = h
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok());
+    Client {
+        ip: real.unwrap_or(peer),
+        https: h
+            .get("x-forwarded-proto")
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"https")),
+    }
+}
+
+/// The host part of a Host header or an origin's authority: no port, IPv6
+/// brackets removed.
+fn host_part(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or("");
+    }
+    match authority.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    }
+}
+
+/// DNS rebinding defence: a browser sends the name it thinks it's talking
+/// to. Addresses, localhost, this router's own host name and the configured
+/// names are fine; any other name is someone else's domain pointing here.
+fn host_allowed(headers: &HeaderMap, extra: &[String]) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return true; // not a browser (HTTP/1.0 tools, tests)
+    };
+    let host = host_part(host.trim());
+    if host.parse::<IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let own = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let own = own.trim();
+    let local = format!("{own}.local");
+    (!own.is_empty() && (host.eq_ignore_ascii_case(own) || host.eq_ignore_ascii_case(&local)))
+        || extra.iter().any(|n| host.eq_ignore_ascii_case(n))
+}
+
+/// A browser marks where a state-changing request comes from: it has to be
+/// the portal itself (same host as the request is addressed to).
+fn origin_allowed(method: &Method, headers: &HeaderMap) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD) {
+        return true;
+    }
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true; // not a browser (ephctl, curl)
+    };
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let authority = origin.split_once("://").map_or("", |(_, a)| a);
+    !authority.is_empty() && authority.eq_ignore_ascii_case(host.trim())
+}
+
+/// Two ways in: `Authorization: Bearer <API token>` (ephctl, scripts) or the
+/// web session cookie (the portal). Cookie-authenticated requests that
+/// change something must also carry an `X-Ephemeris` header: a page on another
+/// site can make the browser send our cookie, but can't add custom headers
+/// without our permission (CORS), so this stops cross-site request forgery.
+/// How a request was authenticated. Only the API token (readable by root
+/// alone, on the router) may reset the password without knowing the old one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AuthVia {
+    Token,
+    Session,
+}
+
+impl AuthVia {
+    fn name(self) -> &'static str {
+        match self {
+            AuthVia::Token => "api-token",
+            AuthVia::Session => "session",
+        }
+    }
+}
+
+async fn auth(State(s): St, mut req: Request, next: Next) -> Response {
+    let bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if let Some(t) = bearer {
+        // An empty configured token must never match an empty header.
+        if !s.token.is_empty() && crate::mgmt::constant_time_eq(t.as_bytes(), s.token.as_bytes()) {
+            req.extensions_mut().insert(AuthVia::Token);
+            return next.run(req).await;
+        }
+    } else if let Some(sess) = session_cookie(&req) {
+        if s.auth.session_valid(&sess) {
+            let safe = matches!(*req.method(), Method::GET | Method::HEAD);
+            if safe || req.headers().contains_key("x-ephemeris") {
+                req.extensions_mut().insert(AuthVia::Session);
+                return next.run(req).await;
+            }
+            return ApiError(StatusCode::FORBIDDEN, "missing X-Ephemeris header".into())
+                .into_response();
+        }
+    }
+    ApiError(StatusCode::UNAUTHORIZED, "not logged in".into()).into_response()
+}
+
+/// Every change made through the API, with who made it and from where.
+async fn audit(req: Request, next: Next) -> Response {
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        return next.run(req).await;
+    }
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    let via = req.extensions().get::<AuthVia>().map_or("?", |v| v.name());
+    let ip = req
+        .extensions()
+        .get::<Client>()
+        .map_or("?".to_string(), |c| c.ip.to_string());
+    let resp = next.run(req).await;
+    tracing::info!(
+        target: "audit",
+        "admin {method} {path} via {via} from {ip}: {}",
+        resp.status().as_u16()
+    );
+    resp
+}
+
+fn session_cookie(req: &Request) -> Option<String> {
+    req.headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(k, _)| *k == super::auth::SESSION_COOKIE)
+        .map(|(_, v)| v.to_string())
+}
+
+/// The session cookie: HttpOnly, same-site only, and Secure over HTTPS.
+fn set_session_cookie(token: &str, max_age: u64, https: bool) -> String {
+    format!(
+        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{}",
+        super::auth::SESSION_COOKIE,
+        if https { "; Secure" } else { "" }
+    )
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    username: String,
+    password: String,
+}
+
+async fn login(
+    State(s): St,
+    Extension(client): Extension<Client>,
+    Json(r): Json<LoginReq>,
+) -> Response {
+    if let Err(wait) = s.auth.throttle.check(client.ip) {
+        tracing::warn!(
+            "web login from {} refused: too many wrong passwords",
+            client.ip
+        );
+        let secs = wait.as_secs().max(1);
+        return (
+            [(header::RETRY_AFTER, secs.to_string())],
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("too many wrong passwords: try again in {secs} s"),
+            ),
+        )
+            .into_response();
+    }
+    let ok = r.username == "admin" && {
+        let _permit = PASSWORD_CHECKS.acquire().await;
+        let s = s.clone();
+        let pw = r.password.clone();
+        tokio::task::spawn_blocking(move || s.auth.check_password(&pw))
+            .await
+            .unwrap_or(false)
+    };
+    if !ok {
+        let locked = s.auth.throttle.failed(client.ip);
+        // Slow down password guessing.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let user: String = r.username.chars().take(64).collect();
+        tracing::warn!(
+            "failed web login for {user:?} from {}{}",
+            client.ip,
+            if locked {
+                ": address locked out for 15 minutes"
+            } else {
+                ""
+            }
+        );
+        return ApiError(
+            StatusCode::UNAUTHORIZED,
+            "wrong username or password".into(),
+        )
+        .into_response();
+    }
+    s.auth.throttle.succeeded(client.ip);
+    let Ok(token) = s.auth.new_session() else {
+        return ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create a session".into(),
+        )
+        .into_response();
+    };
+    tracing::info!(target: "audit", "web login: admin from {}", client.ip);
+    let cookie = set_session_cookie(
+        &token,
+        super::auth::SESSION_LIFETIME.as_secs(),
+        client.https,
+    );
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({ "ok": true, "user": "admin" })),
+    )
+        .into_response()
+}
+
+async fn logout(State(s): St, Extension(client): Extension<Client>, req: Request) -> Response {
+    if let Some(t) = session_cookie(&req) {
+        s.auth.end_session(&t);
+    }
+    let clear = set_session_cookie("", 0, client.https);
+    ([(header::SET_COOKIE, clear)], Json(json!({ "ok": true }))).into_response()
+}
+
+async fn whoami(Extension(via): Extension<AuthVia>) -> Json<Value> {
+    Json(json!({ "user": "admin", "via": via.name() }))
+}
+
+#[derive(Deserialize)]
+struct PasswordReq {
+    /// Leave out to reset: only allowed with the API token (`ephctl` as root).
+    #[serde(default)]
+    current: Option<String>,
+    new: String,
+}
+
+async fn change_password(
+    State(s): St,
+    Extension(via): Extension<AuthVia>,
+    Extension(client): Extension<Client>,
+    Json(r): Json<PasswordReq>,
+) -> Result<Response, ApiError> {
+    let st = s.clone();
+    let reset = r.current.is_none();
+    let result = tokio::task::spawn_blocking(move || {
+        match &r.current {
+            Some(cur) if !st.auth.check_password(cur) => {
+                anyhow::bail!("the current password is wrong")
+            }
+            None if via != AuthVia::Token => {
+                anyhow::bail!("give the current password (only root on the router can reset it)")
+            }
+            _ => {}
+        }
+        st.auth.set_password(&r.new)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    result?;
+    // Logged either way, so an unexpected password change can be traced.
+    if reset {
+        tracing::warn!(target: "audit", "admin password reset with the API token (root on the router)");
+    } else {
+        tracing::info!(target: "audit", "admin password changed from {}", client.ip);
+    }
+    // Every session ended with the old password; whoever changed it from
+    // the portal gets a fresh one, so they stay logged in.
+    let body = Json(json!({ "ok": true }));
+    if via == AuthVia::Session {
+        if let Ok(token) = s.auth.new_session() {
+            let cookie = set_session_cookie(
+                &token,
+                super::auth::SESSION_LIFETIME.as_secs(),
+                client.https,
+            );
+            return Ok(([(header::SET_COOKIE, cookie)], body).into_response());
+        }
+    }
+    Ok(body.into_response())
+}
+
+// ------------------------------------------------------------------ reads
+
+async fn status(State(s): St) -> Json<Value> {
+    let sum = s.summary();
+    let ports = s.ports.read().unwrap().clone();
+    let ports: Vec<Value> = ports
+        .iter()
+        .zip(&s.runtime)
+        .map(|(p, rt)| {
+            json!({
+                "id": p.id, "name": p.name, "device": rt.device,
+                "mac": eth::fmt_mac(&p.mac),
+                "address": format!("{}/{}", p.addr, p.subnet.len()),
+                "allow_new_sessions": p.allow_new_sessions,
+                "mss_adjust": p.mss_adjust,
+                "role": if p.role == eph_dataplane::Role::Outside { "outside" } else { "inside" },
+                "xdp_mode": rt.xdp_mode, "zero_copy": rt.zero_copy,
+            })
+        })
+        .collect();
+    let cfg = s.config.lock().unwrap();
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": s.build,
+        "uptime_secs": s.started.elapsed().as_secs(),
+        "workers": s.workers,
+        "ports": ports,
+        "counters": {
+            "rx": sum.rx, "forwarded": sum.forwarded, "originated": sum.originated,
+            "kernel_drops": sum.kernel_drops, "fill_empty": sum.fill_empty,
+            "tcp_blind": sum.tcp_blind, "arp_conflicts": sum.arp_conflicts,
+        },
+        "drops": sum.drops,
+        "sessions": {
+            "active": sum.sessions_active, "created": sum.sessions_created,
+            "expired": sum.sessions_expired,
+        },
+        "routes": s.fib.read().unwrap().routes().len(),
+        "neighbors": sum.neighbors.len(),
+        "pending_confirm_secs": cfg.pending_confirm_secs(),
+        "candidate_staged": cfg.candidate_text().is_some(),
+        "dataplane_error": s.startup.dataplane_error,
+        "fallback": s.startup.fallback,
+    }))
+}
+
+#[derive(Deserialize)]
+struct Limit {
+    limit: Option<usize>,
+}
+
+async fn sessions(State(s): St, Query(q): Query<Limit>) -> Json<Value> {
+    let mut list = s.summary().sessions;
+    // Busiest first: what an operator usually wants to see.
+    list.sort_by_key(|v| std::cmp::Reverse(v.session.bytes[0] + v.session.bytes[1]));
+    let limit = q.limit.unwrap_or(200).min(10_000);
+    let (f, r) = (Dir::Forward as usize, Dir::Reverse as usize);
+    let out: Vec<Value> = list
+        .iter()
+        .take(limit)
+        .map(|v| {
+            let ((ia, ip), (ra, rp)) = v.session.endpoints();
+            json!({
+                "proto": v.proto_name(),
+                "initiator": format!("{ia}:{ip}"),
+                "responder": format!("{ra}:{rp}"),
+                "state": v.session.state.name(),
+                "nat": v.session.nat.map(|n| format!("{}:{}", n.addr, n.port)),
+                "packets": [v.session.packets[f], v.session.packets[r]],
+                "bytes": [v.session.bytes[f], v.session.bytes[r]],
+                "age_secs": v.age_secs(),
+                "idle_secs": v.idle_secs(),
+            })
+        })
+        .collect();
+    Json(Value::Array(out))
+}
+
+async fn neighbors(State(s): St) -> Json<Value> {
+    let ports = s.ports.read().unwrap().clone();
+    let out: Vec<Value> = s
+        .summary()
+        .neighbors
+        .iter()
+        .map(|n| {
+            json!({
+                "ip": n.ip.to_string(), "mac": eth::fmt_mac(&n.mac),
+                "port": ports[n.port as usize].name,
+            })
+        })
+        .collect();
+    Json(Value::Array(out))
+}
+
+async fn routes(State(s): St) -> Json<Value> {
+    let ports = s.ports.read().unwrap().clone();
+    let fib = s.fib.read().unwrap().clone();
+    let out: Vec<Value> = fib
+        .routes()
+        .iter()
+        .map(|(prefix, nh)| match *nh {
+            NextHop::Ip { port, gateway } => json!({
+                "prefix": prefix.to_string(),
+                "via": gateway.map(|g| g.to_string()),
+                "port": ports[port as usize].name,
+                "kind": if gateway.is_some() { "static" } else { "connected" },
+            }),
+            NextHop::Site(i) => json!({
+                "prefix": prefix.to_string(),
+                "via": format!("site {}", s.overlay.sites[i]),
+                "port": "overlay",
+                "kind": "overlay",
+            }),
+        })
+        .collect();
+    Json(Value::Array(out))
+}
+
+async fn overlay(State(s): St) -> Json<Value> {
+    let o = &s.overlay;
+    let sum = s.summary();
+    let health = s.health.read().unwrap().clone();
+    let paths = s.paths.read().unwrap().clone();
+    let ports = s.ports.read().unwrap().clone();
+    let tethers: Vec<Value> = o
+        .tethers
+        .iter()
+        .map(|t| {
+            let h = health.get(t.id as usize).copied().unwrap_or_default();
+            let st = sum.tethers.get(t.id as usize).copied().unwrap_or_default();
+            json!({
+                "name": t.name, "interface": ports[t.port as usize].name,
+                "remote": t.remote.to_string(), "site": t.peer_site,
+                "encrypted": t.key.is_some(),
+                "up": h.up,
+                "rtt_ms": h.rtt_ns as f64 / 1e6, "jitter_ms": h.jitter_ns as f64 / 1e6,
+                "loss_pct": h.loss_pct,
+                "tx_packets": st.tx_packets, "rx_packets": st.rx_packets,
+                "tx_bytes": st.tx_bytes, "rx_bytes": st.rx_bytes,
+                "probes_sent": st.probes_sent, "probe_replies": st.replies,
+            })
+        })
+        .collect();
+    let mut choices = Vec::new();
+    for (site_idx, site) in o.sites.iter().enumerate() {
+        for (class_idx, class) in o.classes.iter().enumerate() {
+            let t = paths.get(site_idx, class_idx as u8);
+            choices.push(json!({
+                "site": site, "class": class.name,
+                "tether": t.map(|t| o.tethers[t as usize].name.clone()),
+            }));
+        }
+    }
+    Json(json!({
+        "enabled": o.enabled(),
+        "site_id": o.site_id,
+        "mtu": o.mtu,
+        "path_generation": paths.gen,
+        "tethers": tethers,
+        "paths": choices,
+    }))
+}
+
+async fn config(State(s): St) -> Json<Value> {
+    let cfg = s.config.lock().unwrap();
+    Json(json!({
+        "running": cfg.running_text(),
+        "candidate": cfg.candidate_text(),
+        "pending_confirm_secs": cfg.pending_confirm_secs(),
+    }))
+}
+
+async fn history(State(s): St) -> ApiResult {
+    let h = s.config.lock().unwrap().history()?;
+    Ok(Json(serde_json::to_value(h).unwrap()))
+}
+
+// ----------------------------------------------------------------- writes
+
+/// The configuration the GUI edits: the candidate (if staged) or running
+/// one, as structured data, plus what the forms need to offer choices.
+async fn get_model(State(s): St) -> ApiResult {
+    let cfg = s.config.lock().unwrap();
+    let (_, working) = cfg.working();
+    let devices = super::nics::list();
+    Ok(Json(json!({
+        "config": serde_json::to_value(working).map_err(anyhow::Error::from)?,
+        "candidate_staged": cfg.candidate_text().is_some(),
+        "pending_confirm_secs": cfg.pending_confirm_secs(),
+        "devices": devices,
+    })))
+}
+
+/// Stage an edited structured configuration: it's turned into config-file
+/// text and goes through exactly the same validation and diff as a text edit.
+async fn put_model(State(s): St, Json(model): Json<crate::config::Config>) -> ApiResult {
+    let mut cfg = s.config.lock().unwrap();
+    let text = cfg.text_from_model(&model)?;
+    let preview = cfg.set_candidate(text)?;
+    Ok(Json(serde_json::to_value(preview).unwrap()))
+}
+
+async fn put_candidate(State(s): St, body: String) -> ApiResult {
+    let preview = s.config.lock().unwrap().set_candidate(body)?;
+    Ok(Json(serde_json::to_value(preview).unwrap()))
+}
+
+async fn clear_candidate(State(s): St) -> Json<Value> {
+    s.config.lock().unwrap().clear_candidate();
+    Json(json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct CommitQuery {
+    /// Roll back automatically after this many seconds unless confirmed.
+    confirm: Option<u64>,
+}
+
+async fn commit(State(s): St, Query(q): Query<CommitQuery>) -> ApiResult {
+    if q.confirm
+        .is_some_and(|c| !(1..=MAX_CONFIRM_SECS).contains(&c))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("confirm must be between 1 and {MAX_CONFIRM_SECS} seconds"),
+        ));
+    }
+    let c = s.config.lock().unwrap().commit(q.confirm)?;
+    finish_commit(&s, c, q.confirm)
+}
+
+/// Push a committed change into the data plane and describe the outcome.
+fn finish_commit(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>) -> ApiResult {
+    if c.apply == Apply::Live {
+        if s.startup.dataplane_error.is_some() {
+            // No data plane to update: it takes effect when it starts.
+            c.apply = Apply::RestartRequired;
+        } else {
+            s.apply_live(&c.config)?;
+            remember_good(s);
+        }
+    }
+    if let (Some(id), Some(secs)) = (c.confirm_id, confirm) {
+        let s = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            let expired = s.config.lock().unwrap().expire_pending(id);
+            match expired {
+                Some(Ok(back)) => {
+                    tracing::warn!("commit {id} not confirmed within {secs}s: rolled back");
+                    if back.apply == Apply::Live {
+                        match s.apply_live(&back.config) {
+                            Ok(()) => remember_good(&s),
+                            Err(e) => tracing::error!("applying rollback: {e:#}"),
+                        }
+                    }
+                }
+                Some(Err(e)) => tracing::error!("automatic rollback failed: {e:#}"),
+                None => {}
+            }
+        });
+    }
+    tracing::info!("config committed ({:?})", c.apply);
+    Ok(Json(json!({
+        "applied": c.apply,
+        "diff": c.diff,
+        "confirm_within_secs": c.confirm_id.and(confirm),
+    })))
+}
+
+/// The running data plane now uses the committed config: if it ever has to
+/// fall back at startup, this is the version to go back to.
+fn remember_good(s: &Shared) {
+    let cfg = s.config.lock().unwrap();
+    if let Err(e) = crate::startup::mark_good(cfg.path(), cfg.running_text()) {
+        tracing::warn!("could not save the last good config: {e:#}");
+    }
+}
+
+async fn confirm(State(s): St) -> ApiResult {
+    s.config.lock().unwrap().confirm()?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RollbackQuery {
+    to: Option<usize>,
+}
+
+async fn rollback(State(s): St, Query(q): Query<RollbackQuery>) -> ApiResult {
+    let c = s.config.lock().unwrap().rollback(q.to.unwrap_or(1))?;
+    finish_commit(&s, c, None)
+}
+
+#[derive(Deserialize)]
+struct RouteReq {
+    prefix: String,
+    via: String,
+}
+
+/// Convenience: edit the running config, then validate + commit it, all in
+/// one step. Discards any other staged candidate.
+async fn add_route(State(s): St, Json(r): Json<RouteReq>) -> ApiResult {
+    let c = {
+        let mut cfg = s.config.lock().unwrap();
+        let prefix = r
+            .prefix
+            .parse::<eph_fib::Prefix>()
+            .map_err(anyhow::Error::msg)?;
+        let text = cfg.with_route(&prefix.to_string(), &r.via)?;
+        cfg.set_candidate(text)?;
+        cfg.commit(None)?
+    };
+    finish_commit(&s, c, None)
+}
+
+#[derive(Deserialize)]
+struct PrefixQuery {
+    prefix: String,
+}
+
+async fn del_route(State(s): St, Query(q): Query<PrefixQuery>) -> ApiResult {
+    let c = {
+        let mut cfg = s.config.lock().unwrap();
+        let prefix = q
+            .prefix
+            .parse::<eph_fib::Prefix>()
+            .map_err(anyhow::Error::msg)?;
+        let text = cfg.without_route(&prefix.to_string())?;
+        cfg.set_candidate(text)?;
+        cfg.commit(None)?
+    };
+    finish_commit(&s, c, None)
+}
+
+async fn restart(State(s): St) -> Json<Value> {
+    tracing::warn!("restart requested via API");
+    s.stop.store(true, Ordering::Relaxed);
+    Json(json!({ "ok": true, "note": "ephemerisd is exiting; systemd restarts it in ~2 s" }))
+}
+
+// ------------------------------------------------------------ OS updates
+//
+// Updates are done by systemd-sysupdate (see image/). ephemerisd runs in a
+// sandbox with a read-only file system, so it never writes to disk itself: it
+// asks systemd to run things in their own, unsandboxed units.
+
+/// Run a command in a transient systemd unit and capture its output.
+async fn systemd_run(args: &'static [&'static str]) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let out = std::process::Command::new("systemd-run")
+            .args([
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect",
+                "--service-type=exec",
+            ])
+            .args(args)
+            .output()
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("systemd-run: {e}"),
+                )
+            })?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        if out.status.success() {
+            Ok(text)
+        } else {
+            Err(ApiError(StatusCode::BAD_GATEWAY, text.trim().to_string()))
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
+fn systemctl(args: &[&str]) -> Result<String, ApiError> {
+    let out = std::process::Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("systemctl: {e}")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+async fn system(State(s): St) -> Json<Value> {
+    // "ActiveState=activating\nResult=success\n" -> {"active_state": .., "result": ..}
+    let job = systemctl(&[
+        "show",
+        "-p",
+        "ActiveState,Result",
+        "ephemeris-update.service",
+    ])
+    .map(|out| {
+        let get = |k: &str| {
+            out.lines()
+                .find_map(|l| l.strip_prefix(k))
+                .unwrap_or("")
+                .to_string()
+        };
+        json!({ "state": get("ActiveState="), "result": get("Result=") })
+    })
+    .unwrap_or(Value::Null);
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": s.build,
+        "update_job": job,
+    }))
+}
+
+async fn update_check() -> ApiResult {
+    let list = systemd_run(&["/usr/lib/systemd/systemd-sysupdate", "list"]).await?;
+    let newest = systemd_run(&["/usr/lib/systemd/systemd-sysupdate", "check-new"])
+        .await
+        .map(|o| o.trim().to_string())
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "versions": list,
+        "available": (!newest.is_empty()).then_some(newest),
+    })))
+}
+
+async fn update_start() -> ApiResult {
+    systemctl(&["start", "--no-block", "ephemeris-update.service"])?;
+    Ok(Json(json!({
+        "ok": true,
+        "note": "installing into the inactive slot; watch GET /system, then reboot",
+    })))
+}
+
+async fn reboot() -> ApiResult {
+    tracing::warn!("reboot requested via API");
+    systemctl(&["reboot", "--no-block"])?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mgmt::configmgr::ConfigManager;
+    use crate::mgmt::PortRuntime;
+    use crate::report::{Control, Report};
+    use axum::body::Body;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Mutex, RwLock};
+    use tower::ServiceExt;
+
+    const CONFIG: &str = r#"
+[management]
+listen = "127.0.0.1:0"
+
+[[interface]]
+name = "lan-a"
+device = "eth1"
+address = "10.10.1.1/24"
+
+[[interface]]
+name = "lan-b"
+device = "eth2"
+address = "10.10.2.1/24"
+"#;
+
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    fn shared(tag: &str) -> (Arc<Shared>, mpsc::Receiver<Control>) {
+        let dir = std::env::temp_dir().join(format!("eph-api-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ephemeris.toml");
+        std::fs::write(&path, CONFIG).unwrap();
+        let mgr = ConfigManager::open(&path).unwrap();
+        let ports: Arc<[_]> = mgr
+            .running()
+            .ports(|_| Ok([2, 0, 0, 0, 0, 1]))
+            .unwrap()
+            .into();
+        let fib = Arc::new(mgr.running().fib(&ports).unwrap());
+        let (tx, rx) = mpsc::channel();
+        let s = Shared {
+            build: "test".into(),
+            started: std::time::Instant::now(),
+            runtime: ["eth1", "eth2"]
+                .map(|d| PortRuntime {
+                    device: d.into(),
+                    xdp_mode: "Native".into(),
+                    zero_copy: false,
+                })
+                .to_vec(),
+            workers: 1,
+            ports: RwLock::new(ports),
+            fib: RwLock::new(fib),
+            overlay: Arc::new(eph_dataplane::overlay::Overlay::disabled()),
+            paths: RwLock::new(Arc::new(eph_dataplane::overlay::PathTable {
+                gen: 0,
+                choice: vec![],
+            })),
+            health: RwLock::new(vec![]),
+            reports: vec![Arc::new(Mutex::new(Report::default()))],
+            control: Mutex::new(vec![tx]),
+            config: Mutex::new(mgr),
+            token: "secret".into(),
+            auth: crate::mgmt::auth::Auth::new(&dir),
+            startup: Default::default(),
+            stop: &STOP,
+        };
+        (Arc::new(s), rx)
+    }
+
+    async fn call(
+        s: &Arc<Shared>,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Body,
+        json: bool,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        if !token.is_empty() {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if json {
+            req = req.header(header::CONTENT_TYPE, "application/json");
+        }
+        let resp = router(s.clone())
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn api_requires_the_token() {
+        let (s, _) = shared("auth");
+        let (code, _) = call(&s, "GET", "/api/v1/status", "", Body::empty(), false).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = call(&s, "GET", "/api/v1/status", "wrong", Body::empty(), false).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, v) = call(&s, "GET", "/api/v1/status", "secret", Body::empty(), false).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["ports"][1]["address"], "10.10.2.1/24");
+        // The portal page itself is public (it asks for the token).
+        let resp = router(s.clone())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn only_the_api_token_can_reset_the_password() {
+        let (s, _) = shared("pwreset");
+        let body = || Body::from(r#"{"new":"a-brand-new-password"}"#);
+        // A portal session must know the current password.
+        let cookie = s.auth.new_session().unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/system/password")
+            .header(header::COOKIE, format!("eph_session={cookie}"))
+            .header("x-ephemeris", "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body())
+            .unwrap();
+        let resp = router(s.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("only root"));
+        // The token may (hashing needs Linux's crypt, so only check it there).
+        #[cfg(target_os = "linux")]
+        {
+            let (code, _) = call(
+                &s,
+                "POST",
+                "/api/v1/system/password",
+                "secret",
+                body(),
+                true,
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(s.auth.check_password("a-brand-new-password"));
+        }
+    }
+
+    async fn call_cookie(
+        s: &Arc<Shared>,
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        csrf: bool,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::COOKIE, format!("eph_session={cookie}"));
+        if csrf {
+            req = req.header("x-ephemeris", "1");
+        }
+        router(s.clone())
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn web_sessions_and_csrf_protection() {
+        let (s, _) = shared("session");
+        let sess = s.auth.new_session().unwrap();
+        assert_eq!(
+            call_cookie(&s, "GET", "/api/v1/status", &sess, false).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call_cookie(&s, "GET", "/api/v1/status", "forged", false).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Changing something with only a cookie: refused without the header.
+        assert_eq!(
+            call_cookie(&s, "POST", "/api/v1/config/confirm", &sess, false).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call_cookie(&s, "POST", "/api/v1/logout", &sess, true).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call_cookie(&s, "GET", "/api/v1/status", &sess, false).await,
+            StatusCode::UNAUTHORIZED,
+            "logged out"
+        );
+        // Wrong password: refused.
+        let body = Body::from(r#"{"username":"admin","password":"nope"}"#);
+        let (code, _) = call(&s, "POST", "/api/v1/login", "", body, true).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_token_never_authenticates() {
+        let (s, _) = shared("emptytoken");
+        let mut sh = Arc::try_unwrap(s).ok().unwrap();
+        sh.token = String::new();
+        let s = Arc::new(sh);
+        let req = Request::builder()
+            .uri("/api/v1/status")
+            .header(header::AUTHORIZATION, "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(s).oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_route_reaches_the_workers() {
+        let (s, rx) = shared("route");
+        let body = Body::from(r#"{"prefix":"192.168.50.0/24","via":"10.10.2.254"}"#);
+        let (code, v) = call(&s, "POST", "/api/v1/routes", "secret", body, true).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["applied"], "live");
+        // The worker channel received the new tables.
+        let msgs: Vec<Control> = rx.try_iter().collect();
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, Control::SetFib(f) if f.routes().len() == 3)));
+        let (_, v) = call(&s, "GET", "/api/v1/routes", "secret", Body::empty(), false).await;
+        assert!(v
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["via"] == "10.10.2.254"));
+        // And it can be removed again.
+        let (code, _) = call(
+            &s,
+            "DELETE",
+            "/api/v1/routes?prefix=192.168.50.0/24",
+            "secret",
+            Body::empty(),
+            false,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(s.fib.read().unwrap().routes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bad_config_is_rejected_with_a_reason() {
+        let (s, _) = shared("bad");
+        let body = Body::from(r#"{"prefix":"0.0.0.0/0","via":"172.16.0.1"}"#);
+        let (code, v) = call(&s, "POST", "/api/v1/routes", "secret", body, true).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("not on any connected subnet"),
+            "{v}"
+        );
+        let (code, v) = call(
+            &s,
+            "PUT",
+            "/api/v1/config/candidate",
+            "secret",
+            Body::from("not = [valid"),
+            false,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+    }
+
+    fn get(uri: &str, headers: &[(&str, &str)]) -> Request {
+        let mut r = Request::builder().uri(uri);
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        r.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_for_other_host_names_are_refused() {
+        let (s, _) = shared("host");
+        for ok in ["10.0.2.15:8443", "[::1]:8443", "localhost", "127.0.0.1"] {
+            let resp = router(s.clone()).oneshot(get("/", &[("host", ok)])).await;
+            assert_eq!(resp.unwrap().status(), StatusCode::OK, "{ok}");
+        }
+        // DNS rebinding: someone else's name pointing at the router.
+        let resp = router(s.clone())
+            .oneshot(get("/", &[("host", "attacker.example:8443")]))
+            .await;
+        assert_eq!(resp.unwrap().status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cross_origin_changes_are_refused() {
+        let (s, _) = shared("origin");
+        let post = |origin: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config/confirm")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .header(header::HOST, "10.0.2.15:8443")
+                .header(header::ORIGIN, origin)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router(s.clone())
+            .oneshot(post("https://evil.example"))
+            .await;
+        assert_eq!(resp.unwrap().status(), StatusCode::FORBIDDEN);
+        // Same origin: reaches the handler (which has nothing to confirm).
+        let resp = router(s.clone())
+            .oneshot(post("https://10.0.2.15:8443"))
+            .await;
+        assert_eq!(resp.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn responses_carry_security_headers() {
+        let (s, _) = shared("headers");
+        let resp = router(s.clone()).oneshot(get("/", &[])).await.unwrap();
+        let h = resp.headers();
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.contains("script-src 'self';"), "{csp}");
+        assert!(!csp.contains("script-src 'unsafe-inline'"));
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert!(
+            h.get(header::STRICT_TRANSPORT_SECURITY).is_none(),
+            "not over HTTPS"
+        );
+        // Through nginx over HTTPS: HSTS too.
+        let resp = router(s.clone())
+            .oneshot(get("/", &[("x-forwarded-proto", "https")]))
+            .await
+            .unwrap();
+        assert!(resp
+            .headers()
+            .get(header::STRICT_TRANSPORT_SECURITY)
+            .is_some());
+        // The portal's script is a file of its own.
+        let resp = router(s.clone())
+            .oneshot(get("/app.js", &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript"));
+    }
+
+    #[tokio::test]
+    async fn the_confirm_window_is_bounded() {
+        let (s, _) = shared("confirm");
+        let uri = "/api/v1/config/commit?confirm=18446744073709551615";
+        let (code, v) = call(&s, "POST", uri, "secret", Body::empty(), false).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"].as_str().unwrap().contains("between 1 and 3600"),
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_guessing_passwords_is_locked_out() {
+        let (s, _) = shared("lockout");
+        let guesser: std::net::IpAddr = "192.0.2.50".parse().unwrap();
+        for _ in 0..5 {
+            s.auth.throttle.failed(guesser);
+        }
+        let login = |ip: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/login")
+                .header("x-real-ip", ip)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"username":"admin","password":"guess"}"#))
+                .unwrap()
+        };
+        let resp = router(s.clone())
+            .oneshot(login("192.0.2.50"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+        // Someone else still gets to try (and fail).
+        let resp = router(s.clone())
+            .oneshot(login("192.0.2.51"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_refused() {
+        let (s, _) = shared("bigbody");
+        let body = Body::from(vec![b'#'; MAX_BODY + 1]);
+        let (code, _) = call(&s, "PUT", "/api/v1/config/candidate", "secret", body, false).await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}

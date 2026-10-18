@@ -1,0 +1,21 @@
+# Holds a console (and its login prompt) until the first-boot password has
+# been acknowledged. Only blocks that console: routing, SSH and the web
+# portal are already running.
+[Unit]
+Description=Show the first-boot password on %I
+ConditionPathExists=/run/ephemeris/first-boot-password
+After=ephemeris-firstboot.service systemd-networkd.service ephemeris-tls-cert.service
+Before=getty@%i.service serial-getty@%i.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/ephemeris/firstboot-banner
+StandardInput=tty-force
+StandardOutput=tty
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=getty.target

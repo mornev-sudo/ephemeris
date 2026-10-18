@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ephemeris</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677085;
+    --line: #e2e5eb; --accent: #b3203a; --ok: #1f8a4c; --warn: #b26a00; --bad: #c62828;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #12151b; --panel: #1a1e26; --text: #e6e9ef; --muted: #8f97a8;
+            --line: #2a303b; --accent: #e0526b; --ok: #4cc283; --warn: #e3a33b; --bad: #ef6b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  header h1 span { color: var(--accent); }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav button { background: none; border: 0; color: var(--muted); padding: 6px 10px;
+               border-radius: 6px; cursor: pointer; font: inherit; }
+  nav button.on { color: var(--text); background: var(--bg); font-weight: 600; }
+  #meta { margin-left: auto; color: var(--muted); font-size: 12px; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 4px; font-size: 12px; font-weight: 500; color: var(--muted); }
+  .card .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card .s { font-size: 12px; color: var(--muted); }
+  section { margin-top: 20px; }
+  section h2 { font-size: 14px; margin: 0 0 8px; }
+  .tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 12px; font-weight: 500; color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+  td.mono, .mono { font-family: var(--mono); font-size: 12.5px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; border: 1px solid var(--line); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  input, textarea, select { font: inherit; color: var(--text); background: var(--bg);
+                            border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  textarea { width: 100%; min-height: 360px; font-family: var(--mono); font-size: 12.5px; }
+  button.btn { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+               background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  pre.diff { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+             padding: 10px 12px; font: 12.5px/1.5 var(--mono); overflow-x: auto; margin: 8px 0; }
+  .add { color: var(--ok); } .del { color: var(--bad); }
+  #msg { min-height: 20px; margin: 6px 0; }
+  #login { max-width: 420px; margin: 12vh auto; }
+  .hidden { display: none !important; }
+  .cfgbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .warnbox { border-color: var(--warn); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .subnav { display: flex; gap: 4px; flex-wrap: wrap; margin: 12px 0; border-bottom: 1px solid var(--line); }
+  .subnav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 8px 10px; cursor: pointer; font: inherit; }
+  .subnav button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .cfgsec td input, .cfgsec td select { width: 100%; min-width: 7em; }
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 20px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field:has(input[type=checkbox]) { flex-direction: row-reverse; justify-content: flex-end; align-items: center; gap: 8px; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>●</span> Ephemeris</h1>
+  <nav id="tabs">
+    <button data-tab="dash" class="on">Dashboard</button>
+    <button data-tab="sessions">Sessions</button>
+    <button data-tab="routes">Routes</button>
+    <button data-tab="sdwan">SD-WAN</button>
+    <button data-tab="config">Configuration</button>
+    <button data-tab="system">System</button>
+  </nav>
+  <div id="meta"></div>
+  <button class="btn hidden" id="logout">Sign out</button>
+</header>
+
+<main>
+  <form id="login" class="card hidden" autocomplete="on">
+    <h2>Sign in</h2>
+    <p class="s">Use the admin password shown when the router was deployed.</p>
+    <div class="row"><input id="username" name="username" value="admin" autocomplete="username" style="flex:1" aria-label="Username"></div>
+    <div class="row"><input id="password" name="password" type="password" autocomplete="current-password" style="flex:1" placeholder="Password" aria-label="Password"></div>
+    <div class="row"><button class="btn primary" id="signin" type="submit">Sign in</button></div>
+    <div id="loginerr" class="bad"></div>
+  </form>
+
+  <div id="tab-dash">
+    <div class="card warnbox bad hidden" id="dashwarn" role="alert"></div>
+    <div class="grid" id="cards"></div>
+    <section><h2>Interfaces</h2><div class="tablewrap"><table id="ports"></table></div></section>
+    <section><h2>Drops by reason</h2><div class="tablewrap"><table id="drops"></table></div></section>
+    <section><h2>Neighbours (ARP)</h2><div class="tablewrap"><table id="neigh"></table></div></section>
+  </div>
+
+  <div id="tab-sessions" class="hidden">
+    <div class="row"><span class="s" id="sesscount"></span>
+      <input id="sessfilter" placeholder="filter (address, port, state…)" style="margin-left:auto;min-width:240px"></div>
+    <div class="tablewrap"><table id="sess"></table></div>
+  </div>
+
+  <div id="tab-routes" class="hidden">
+    <section><h2>Forwarding table</h2><div class="tablewrap"><table id="rt"></table></div></section>
+    <section><h2>Add a static route</h2>
+      <div class="row">
+        <input id="rprefix" placeholder="prefix, e.g. 192.168.50.0/24">
+        <input id="rvia" placeholder="via, e.g. 10.10.2.254">
+        <button class="btn primary" id="radd">Add route</button>
+      </div>
+      <p class="s">Adding or removing a route edits the configuration file, validates it and commits it.
+        The new forwarding table reaches the workers without dropping traffic.</p>
+    </section>
+  </div>
+
+  <div id="tab-sdwan" class="hidden">
+    <p class="s" id="sdwanmeta"></p>
+    <section><h2>Tethers (WAN paths), probed 5× a second</h2><div class="tablewrap"><table id="tun"></table></div></section>
+    <section><h2>Path decisions: which tether each application class uses</h2><div class="tablewrap"><table id="pathtab"></table></div></section>
+  </div>
+
+  <div id="tab-config" class="hidden">
+    <div class="card cfgbar">
+      <div><strong id="cfgstate">Running configuration</strong><div class="s" id="cfgstatesub">Edit below; nothing changes on the router until you review and commit.</div></div>
+      <div class="row" style="margin:0">
+        <button class="btn primary" id="cfgreview">Review &amp; commit…</button>
+        <button class="btn" id="cfgdiscard">Discard changes</button>
+      </div>
+    </div>
+    <div class="card warnbox hidden" id="cfgpending">
+      <span id="cfgpendingtext"></span>
+      <button class="btn primary" id="cfgconfirm">Keep this change (confirm)</button>
+    </div>
+
+    <div class="card hidden" id="cfgreviewbox">
+      <h2 style="margin-top:0">Review changes</h2>
+      <div id="msg"></div>
+      <pre class="diff hidden" id="cfgdiff"></pre>
+      <div class="row">
+        <button class="btn primary" id="cfgcommit">Commit</button>
+        <button class="btn" id="cfgcommitc">Commit confirmed</button>
+        <label class="s">roll back after <input id="cfgconfirmsecs" type="number" min="30" value="120" style="width:5em"> s unless confirmed</label>
+        <button class="btn" id="cfgreviewclose" style="margin-left:auto">Keep editing</button>
+      </div>
+      <div class="row hidden" id="cfgrestartrow"><span class="warn">Some changes take effect after a restart of the data plane (about 2 s of downtime).</span>
+        <button class="btn" id="cfgrestart">Restart now</button></div>
+    </div>
+
+    <nav class="subnav" id="cfgnav">
+      <button data-sec="ifaces" class="on">Interfaces</button>
+      <button data-sec="routing">Static routes</button>
+      <button data-sec="nat">NAT</button>
+      <button data-sec="sess">Sessions</button>
+      <button data-sec="dp">Data plane</button>
+      <button data-sec="mgmt">Management</button>
+      <button data-sec="hist">History</button>
+      <button data-sec="text">Advanced (text)</button>
+    </nav>
+
+    <section class="cfgsec" id="sec-ifaces">
+      <p class="s"><b>Inside</b> interfaces face your networks. <b>Outside</b> interfaces face the internet: by default they
+        only let replies in, and traffic leaving through them is source-NATed (see NAT).</p>
+      <div class="tablewrap" id="f-ifaces"></div>
+      <h3>Network cards not in use</h3>
+      <p class="s">Cards the router found that no interface uses yet. After adding or removing one, the data plane needs a restart.</p>
+      <div class="tablewrap" id="f-nics"></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-routing">
+      <p class="s">Connected subnets are routed automatically. Add a default route (0.0.0.0/0) via your ISP's gateway to reach the internet.</p>
+      <div class="tablewrap" id="f-routes"></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-nat">
+      <div class="card" style="margin-bottom:12px" id="f-natmain"></div>
+      <h2>Address pools</h2>
+      <p class="s">Public addresses to translate to instead of the interface address. Each inside host keeps the same pool address.</p>
+      <div class="tablewrap" id="f-pools"></div>
+      <h2 style="margin-top:16px">Rules</h2>
+      <p class="s">Checked top to bottom; the first match wins. Traffic no rule matches falls back to the default above.</p>
+      <div class="tablewrap" id="f-natrules"></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-sess"><div class="card" id="f-sess"></div></section>
+    <section class="cfgsec hidden" id="sec-dp"><p class="s">Changes here need a data-plane restart.</p><div class="card" id="f-dp"></div></section>
+    <section class="cfgsec hidden" id="sec-mgmt"><p class="s">Changes here need a restart. Careful: a wrong listen address locks you out of this page.</p><div class="card" id="f-mgmt"></div></section>
+    <section class="cfgsec hidden" id="sec-hist">
+      <p class="s">Every commit saves the previous version. Rolling back is itself a commit.</p>
+      <div class="row"><select id="histsel"></select><button class="btn" id="cfgrollback">Roll back to this version</button></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-text">
+      <p class="s">The configuration file itself, for things the forms don't cover (e.g. SD-WAN). Validate stages it for review.</p>
+      <textarea id="cfgtext" spellcheck="false"></textarea>
+      <div class="row"><button class="btn" id="cfgvalidate">Validate &amp; review</button></div>
+    </section>
+  </div>
+
+  <div id="tab-system" class="hidden">
+    <div class="grid" id="syscards"></div>
+    <section><h2>Software updates</h2>
+      <p class="s">The router runs a read-only OS image with two slots. An update is installed into the
+        idle slot while the router keeps forwarding; reboot to switch. If the new version doesn't come up
+        healthy within three tries, the router goes back to the current one by itself.</p>
+      <div class="row">
+        <button class="btn" id="syscheck">Check for updates</button>
+        <button class="btn primary" id="sysupdate">Install update</button>
+        <button class="btn" id="sysreboot">Reboot</button>
+      </div>
+      <div id="sysmsg"></div>
+      <pre class="diff hidden" id="sysout"></pre>
+    </section>
+    <section><h2>Admin password</h2>
+      <p class="s">Used for the web portal (user admin) and for root on the console and SSH.</p>
+      <form id="pwform" class="row" autocomplete="off">
+        <input id="pwcur" type="password" placeholder="Current password" autocomplete="current-password" aria-label="Current password">
+        <input id="pwnew" type="password" placeholder="New password (10+ characters)" autocomplete="new-password" aria-label="New password">
+        <input id="pwnew2" type="password" placeholder="Repeat new password" autocomplete="new-password" aria-label="Repeat new password">
+        <button class="btn primary" type="submit">Change password</button>
+      </form>
+      <div id="pwmsg"></div>
+    </section>
+  </div>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

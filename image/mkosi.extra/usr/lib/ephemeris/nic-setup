@@ -1,0 +1,17 @@
+#!/bin/sh
+# Prepare the data-plane NICs named in the router config, before ephemerisd.
+set -u
+CONFIG=/var/lib/ephemeris/ephemeris.toml
+udevadm settle --timeout=30 || true   # let udev finish naming NICs (ens19...)
+devices=$(sed -n 's/^[[:space:]]*device[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG")
+workers=$(sed -n 's/^[[:space:]]*workers[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$CONFIG" | head -n1)
+workers=${workers:-1}
+for dev in $devices; do
+    [ -e "/sys/class/net/$dev" ] || { echo "nic-setup: no such device $dev" >&2; continue; }
+    ip addr flush dev "$dev"                                   # the kernel must not own these links
+    sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"             # ...or chatter IPv6 out of them
+    ip link set dev "$dev" up
+    ethtool -L "$dev" combined "$workers" 2>/dev/null || true  # one RX queue per worker
+    ethtool -K "$dev" gro off lro off 2>/dev/null || true      # native XDP needs plain frames
+    ethtool -X "$dev" hfunc toeplitz symmetric-xor 2>/dev/null || true  # symmetric RSS
+done

@@ -1,0 +1,9 @@
+[Unit]
+Description=Generate this router's SSH host key
+ConditionPathExists=!/var/lib/ephemeris/ssh/ssh_host_ed25519_key
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -q -t ed25519 -N "" -C "" -f /var/lib/ephemeris/ssh/ssh_host_ed25519_key

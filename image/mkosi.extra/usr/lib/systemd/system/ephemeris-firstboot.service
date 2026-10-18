@@ -1,0 +1,16 @@
+[Unit]
+Description=Set the Ephemeris admin password on first boot
+ConditionPathExists=!/var/lib/ephemeris/admin.hash
+After=ephemeris-shadow.service systemd-tmpfiles-setup.service
+Requires=ephemeris-shadow.service
+Before=systemd-user-sessions.service ssh.service ephemerisd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ImportCredential=ephemeris.admin_password_hash
+ExecStart=/usr/lib/ephemeris/firstboot
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

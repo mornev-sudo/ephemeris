@@ -1,0 +1,11 @@
+#!/bin/sh
+# If the "ephemeris.update_url" credential is set, install copies of the
+# sysupdate transfer files that download from there instead of GitHub.
+# /run/sysupdate.d overrides /usr/lib/sysupdate.d file by file.
+url=$(cat "$CREDENTIALS_DIRECTORY/ephemeris.update_url" 2>/dev/null) || exit 0
+[ -n "$url" ] || exit 0
+mkdir -p /run/sysupdate.d
+for f in /usr/lib/sysupdate.d/*.transfer; do
+    sed "s|^Path=http.*|Path=$url|" "$f" > "/run/sysupdate.d/$(basename "$f")"
+done
+echo "updates will be fetched from $url"

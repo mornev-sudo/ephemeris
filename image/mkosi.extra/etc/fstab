@@ -1,0 +1,5 @@
+# Root is mounted read-only by the initrd through dm-verity; only /var is
+# writable. x-initrd.mount: the initrd mounts /var before the real system
+# starts, so even the earliest services (systemd-resolved, which needs
+# /var/tmp for its private /tmp) find it in place.
+PARTLABEL=var  /var  ext4  defaults,x-initrd.mount  0  2

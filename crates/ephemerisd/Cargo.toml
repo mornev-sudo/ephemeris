@@ -1,0 +1,28 @@
+[package]
+name = "ephemerisd"
+description = "Ephemeris router daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eph-packet.workspace = true
+eph-fib.workspace = true
+eph-dataplane.workspace = true
+serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml_edit.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eph-xdp.workspace = true
+libc.workspace = true

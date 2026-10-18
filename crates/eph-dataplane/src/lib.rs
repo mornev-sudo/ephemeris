@@ -1,0 +1,34 @@
+//! The forwarding pipeline.
+//!
+//! This crate holds the router's packet logic, and *only* the logic: it gets
+//! a mutable byte buffer and returns a [`Verdict`] saying what to do with it.
+//! It never touches a socket or a NIC. That separation means everything here
+//! can be unit-tested on any machine (including a Mac), and the same code can
+//! later sit behind AF_XDP, DPDK, or a pcap file without changing.
+//!
+//! One [`Pipeline`] exists per worker thread (per CPU core). Workers share
+//! nothing mutable, so no locks are needed on the fast path. The only state
+//! that must be shared, learned ARP neighbours, is passed between workers as
+//! messages (see [`Pipeline::learned`] / [`Pipeline::learn`]).
+
+mod config;
+mod filter;
+pub mod nat;
+pub mod overlay;
+mod pipeline;
+pub mod session;
+mod stats;
+
+pub use config::{build_fib, NextHop, OverlayRoute, Port, PortId, Role, StaticRoute};
+pub use pipeline::{Emit, Neighbor, Pipeline, Verdict};
+pub use session::{Dir, FlowKey, NatBinding, Session, SessionConfig, State, Timeouts};
+pub use stats::{DropReason, Stats};
+
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod tests_filter;
+#[cfg(test)]
+mod tests_nat;
+#[cfg(test)]
+mod tests_overlay;

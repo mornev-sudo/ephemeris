@@ -1,0 +1,24 @@
+#!/bin/sh
+# Decides whether this boot of a freshly installed version is good. Only
+# runs on boots with a boot counter (the first boots after an update). If it
+# fails, the router reboots; after 3 failed tries systemd-boot falls back to
+# the previous version.
+if [ ! -f /var/lib/ephemeris/ephemeris.toml ]; then
+    echo "no router config yet: base system is up, that's healthy"
+    exit 0
+fi
+# Healthy = ephemerisd started and has stayed up (no crash loop) for 15 s.
+for _ in $(seq 1 60); do
+    systemctl is-active -q ephemerisd.service && break
+    sleep 1
+done
+restarts=$(systemctl show -p NRestarts --value ephemerisd.service)
+sleep 15
+if systemctl is-active -q ephemerisd.service &&
+   [ "$(systemctl show -p NRestarts --value ephemerisd.service)" = "$restarts" ]; then
+    echo "ephemerisd is up and stable: healthy"
+    exit 0
+fi
+echo "ephemerisd is not healthy:"
+systemctl status ephemerisd.service --no-pager
+exit 1

@@ -1,0 +1,16 @@
+#!/bin/sh
+# /etc is read-only, but passwords must be changeable. Keep the real shadow
+# file in /var and bind-mount it over /etc/shadow, before anything that
+# checks passwords (getty, sshd) starts.
+set -e
+mkdir -p /var/lib/ephemeris
+chmod 0755 /var/lib/ephemeris
+# ephemerisd writes the file in place (it's bind-mounted) after saving a full
+# copy: if the power went during that write, put the copy back.
+if [ -s /var/lib/ephemeris/shadow.bak ] && ! grep -q '^root:' /var/lib/ephemeris/shadow 2>/dev/null; then
+    cat /var/lib/ephemeris/shadow.bak > /var/lib/ephemeris/shadow
+fi
+if [ ! -s /var/lib/ephemeris/shadow ]; then
+    install -m 0640 -o root -g shadow /etc/shadow /var/lib/ephemeris/shadow
+fi
+mountpoint -q /etc/shadow || mount --bind /var/lib/ephemeris/shadow /etc/shadow

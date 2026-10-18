@@ -1,0 +1,27 @@
+# systemd-sysupdate: how to install a newer Ephemeris version. Three pieces,
+# all from the GitHub release: the root verity hash tree, the root
+# filesystem, and the UKI (which carries the matching root hash).
+#
+# %M = image id (ephemeris), %a = architecture (x86-64), %A = running version.
+# @v = the version being installed, @u = partition UUID (derived from the
+# root hash, so the UKI can find "its" partitions).
+#
+# The source URL can be changed per router with the "ephemeris.update_url"
+# credential (see ephemeris-update-source.service).
+[Transfer]
+ProtectVersion=%A
+# Verify=yes (the default): SHA256SUMS must carry a valid signature
+# (SHA256SUMS.gpg) from the key in /etc/systemd/import-pubring.gpg.
+
+[Source]
+Type=url-file
+Path=https://github.com/mornev-sudo/ephemeris/releases/latest/download/
+MatchPattern=%M_@v_%a.root-%a-verity.@u.raw.xz
+
+[Target]
+Type=partition
+Path=auto
+MatchPattern=%M_@v_verity
+MatchPartitionType=root-verity
+PartitionFlags=0
+ReadOnly=1

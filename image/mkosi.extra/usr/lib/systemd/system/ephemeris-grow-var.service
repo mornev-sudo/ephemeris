@@ -1,0 +1,14 @@
+# /var is mounted in the initrd, before systemd-repart has grown its
+# partition into the free disk space, so grow the filesystem afterwards.
+# A no-op once it already fills the partition.
+[Unit]
+Description=Grow /var to fill its partition
+After=systemd-repart.service var.mount
+ConditionPathIsMountPoint=/var
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/systemd/systemd-growfs /var
+
+[Install]
+WantedBy=multi-user.target

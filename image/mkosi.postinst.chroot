@@ -1,0 +1,17 @@
+#!/bin/sh
+# Runs inside the image after packages are installed.
+set -e
+systemctl enable systemd-networkd.service systemd-resolved.service \
+    ephemeris-shadow.service ephemeris-firstboot.service \
+    ephemeris-firstboot-banner@tty1.service ephemeris-firstboot-banner@ttyS0.service \
+    ephemerisd.service ephemeris-grow-var.service \
+    ephemeris-update-source.service ephemeris-healthy.service nginx.service
+# nginx serves only the HTTPS portal (/etc/nginx/nginx.conf), no default site.
+rm -f /etc/nginx/sites-enabled/default
+# Debian enables automatic updates *and automatic reboots* by default. A
+# router must not reboot on its own schedule: updates are started by an
+# operator (ephctl system update / the portal), and so is the reboot.
+systemctl disable systemd-sysupdate.timer systemd-sysupdate-reboot.timer
+# Package install generated SSH host keys and a hostname on the build machine.
+# Every router must get its own, so remove them; see sshd_config.d/ephemeris.conf.
+rm -f /etc/ssh/ssh_host_* /etc/hostname
