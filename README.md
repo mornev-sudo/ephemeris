@@ -1,3 +1,8 @@
+# Disclaimer
+This project was originally designed to help me understand how highly performant systems are designed from a software point of view. The entire project is completely vide-coded, because the point is not to understand the coding process itself, but rather how networking functions are implemented in code, since handling networking traffic is probably the most time-sensitive type of processing that software does in general. 
+
+Since this is vide-coded, I cannot recommend that this software is deployed in any type of production environment. Even though I do my best to not write slot, it's destined to be limited in functionality, and my testing for general use and edge cases is extremely limited. I'm a network engineer with 12+ years of deep network design and operating knowledge, but I am definitely not a software engineer. Therefor I understand how networking products are meant to function, and what features are important for things to *work*, but the stability of the software will be dubious at best.
+
 # Ephemeris
 
 *An ephemeris is a table of where every celestial body is at any given
