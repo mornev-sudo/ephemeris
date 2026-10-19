@@ -73,10 +73,12 @@ pub enum DropReason {
     OverlayAuth,
     /// Overlay packet seen before (replayed), or too old.
     OverlayReplay,
+    /// DHCP packet handed to the control plane (server or client).
+    DhcpToControl,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 32] = [
+    pub const ALL: [DropReason; 33] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -109,6 +111,7 @@ impl DropReason {
         DropReason::NatUntranslatable,
         DropReason::OverlayAuth,
         DropReason::OverlayReplay,
+        DropReason::DhcpToControl,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -146,12 +149,13 @@ impl DropReason {
             DropReason::NatUntranslatable => "nat-untranslatable",
             DropReason::OverlayAuth => "overlay-auth",
             DropReason::OverlayReplay => "overlay-replay",
+            DropReason::DhcpToControl => "dhcp-to-control",
         }
     }
 }
 
 /// Per-worker counters. Plain integers: only the owning worker writes them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Stats {
     pub rx: u64,
     pub forwarded: u64,
@@ -167,6 +171,23 @@ pub struct Stats {
     /// believed).
     pub arp_conflicts: u64,
     pub drops: [u64; DropReason::COUNT],
+}
+
+// By hand: `Default` isn't derived for arrays longer than 32.
+impl Default for Stats {
+    fn default() -> Self {
+        Stats {
+            rx: 0,
+            forwarded: 0,
+            originated: 0,
+            sessions_active: 0,
+            sessions_created: 0,
+            sessions_expired: 0,
+            tcp_blind: 0,
+            arp_conflicts: 0,
+            drops: [0; DropReason::COUNT],
+        }
+    }
 }
 
 impl Stats {

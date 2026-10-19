@@ -58,6 +58,11 @@ pub struct Shared {
     /// Whether the data plane is running, and whether this start fell back
     /// to an earlier config.
     pub startup: crate::startup::StartupState,
+    /// DHCP: what the router's own clients were given, and the leases it
+    /// hands out (kept by the DHCP service, read by the API).
+    pub dhcp: Mutex<crate::dhcp::DhcpState>,
+    /// Where SD-WAN peers without a fixed address were last heard from.
+    pub endpoints: Arc<eph_dataplane::overlay::Endpoints>,
     /// Set to stop the daemon (systemd then starts it again).
     pub stop: &'static AtomicBool,
 }
@@ -66,6 +71,8 @@ impl Shared {
     /// Push a new configuration into the running data plane. Only valid for
     /// changes [`Config::live_applicable`] accepts (same interfaces).
     pub fn apply_live(&self, cfg: &Config) -> Result<()> {
+        // Interfaces on DHCP use whatever their lease currently says.
+        let cfg = &cfg.with_leases(&self.dhcp.lock().unwrap().client_leases());
         let old = self.ports.read().unwrap().clone();
         let ports: Arc<[Port]> = cfg
             .ports(|i| {

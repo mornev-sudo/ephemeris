@@ -88,6 +88,8 @@ pub fn run(config_path: &Path) -> Result<()> {
         links,
         epoch,
         replay,
+        punts,
+        endpoints,
     } = dp;
     let d = &cfg.dataplane;
 
@@ -122,6 +124,8 @@ pub fn run(config_path: &Path) -> Result<()> {
                 .unwrap_or(std::path::Path::new("/var/lib/ephemeris")),
         ),
         startup,
+        dhcp: Default::default(),
+        endpoints,
         stop: &STOP,
     });
     let mgmt = m.enabled.then(|| {
@@ -150,6 +154,17 @@ pub fn run(config_path: &Path) -> Result<()> {
                 }
             })
             .expect("spawning management thread")
+    });
+
+    // ---- DHCP server and client (only with a running data plane: they
+    // send and receive through it)
+    let dhcp = punts.map(|rx| {
+        let shared = shared.clone();
+        let dir = state_dir.clone();
+        std::thread::Builder::new()
+            .name("eph-dhcp".into())
+            .spawn(move || crate::dhcp::service::run(&shared, rx, &STOP, &dir))
+            .expect("spawning DHCP service")
     });
 
     // ---- SD-WAN control loop
@@ -185,6 +200,9 @@ pub fn run(config_path: &Path) -> Result<()> {
     }
     if let Some(p) = selector {
         let _ = p.join();
+    }
+    if let Some(h) = dhcp {
+        let _ = h.join();
     }
     print_stats(&shared, d.show_sessions);
     drop(links); // detaches XDP; the kernel would also do this when we exit
@@ -244,6 +262,10 @@ struct Dataplane {
     /// Received overlay counters, shared by the workers (persisted by the
     /// path loop).
     replay: Arc<ReplayGuard>,
+    /// DHCP packets the workers hand to the control plane.
+    punts: Option<mpsc::Receiver<eph_dataplane::Punt>>,
+    /// Learned addresses of SD-WAN peers without a fixed one.
+    endpoints: Arc<eph_dataplane::overlay::Endpoints>,
 }
 
 impl Dataplane {
@@ -255,6 +277,9 @@ impl Dataplane {
             workers: 0,
             fib: Arc::new(cfg.fib(&ports)?),
             replay: Arc::new(ReplayGuard::new(overlay.sites.len())),
+            endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(
+                overlay.tethers.len(),
+            )),
             overlay,
             runtime: cfg
                 .interfaces
@@ -269,6 +294,7 @@ impl Dataplane {
             reports: vec![],
             txs: vec![],
             handles: vec![],
+            punts: None,
             links: vec![],
             epoch: Instant::now(),
         })
@@ -361,6 +387,9 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         );
     }
     let replay = Arc::new(ReplayGuard::new(overlay.sites.len()));
+    let endpoints = Arc::new(eph_dataplane::overlay::Endpoints::new(
+        overlay.tethers.len(),
+    ));
     for (site, worker, seen) in overlay_state::load_peers(state_dir) {
         if let Some(idx) = overlay.sites.iter().position(|&s| s == site) {
             replay.restore(idx, worker, seen);
@@ -401,6 +430,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     // One control channel per worker: neighbour updates from siblings, and
     // FIB/port changes from the management plane.
     let (txs, rxs): (Vec<_>, Vec<_>) = (0..workers).map(|_| mpsc::channel()).unzip();
+    let (punt_tx, punt_rx) = mpsc::channel();
     let mut zero_copy = vec![false; ports.len()];
     let reports: Vec<Arc<Mutex<Report>>> = (0..workers).map(|_| Default::default()).collect();
     let mut pool = Vec::new();
@@ -449,6 +479,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         pipeline.set_worker(w as u16, workers as u16);
         pipeline.set_nat(nat.clone());
         pipeline.set_overlay_run(run, replay.clone());
+        pipeline.set_endpoints(endpoints.clone());
         pool.push(Worker {
             id: w,
             socks,
@@ -457,6 +488,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             control,
             siblings,
             report: reports[w].clone(),
+            punt: punt_tx.clone(),
             busy_poll: d.busy_poll,
             cpu: d.cpus.get(w).copied(),
         });
@@ -504,6 +536,8 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         links,
         epoch,
         replay,
+        punts: Some(punt_rx),
+        endpoints,
     })
 }
 

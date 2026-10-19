@@ -76,6 +76,7 @@ async function refreshSessions() {
 }
 
 async function refreshSdwan() {
+  await refreshSites();
   const v = await api("GET", "/overlay");
   if (!v.enabled) { $("sdwanmeta").textContent = "No SD-WAN overlay configured on this router."; table($("tun"), ["Tether"], []); table($("pathtab"), ["Class"], []); return; }
   $("sdwanmeta").textContent = `Site ${v.site_id} · overlay MTU ${v.mtu} · path generation ${v.path_generation}`;
@@ -84,6 +85,43 @@ async function refreshSdwan() {
       t.rtt_ms.toFixed(1) + " ms", t.jitter_ms.toFixed(1) + " ms", td(t.loss_pct.toFixed(1) + "%", t.loss_pct > 1 ? "warn" : ""),
       bytes(t.tx_bytes), bytes(t.rx_bytes)]));
   table($("pathtab"), ["Site", "Class", "Using"], v.paths.map(p => [String(p.site), p.class, td(p.tether || "no path", p.tether ? "" : "bad")]));
+}
+
+async function refreshSites() {
+  const v = await api("GET", "/overlay/sites");
+  table($("sitetab"), ["Site", "Id", "Role", "Connection", "Key", "Tethers", ""], v.sites.map(x => {
+    const b = el("button", "Copy entry for its router", "btn");
+    b.onclick = async () => {
+      try {
+        const e = await api("GET", "/overlay/entry?site=" + encodeURIComponent(x.name));
+        const note = e.dynamic ? "\n# This router has no fixed WAN address: the other router learns it. It must have one itself.\n" : "";
+        try { await navigator.clipboard.writeText(e.toml + note); b.textContent = "Copied"; } catch { prompt("Copy this into " + x.name + "'s configuration:", e.toml); }
+        setTimeout(() => b.textContent = "Copy entry for its router", 2000);
+      } catch (err) { alert(err.message); }
+    };
+    return [x.name, String(x.id), x.role, td(x.connected ? "direct" : "through a hub", x.connected ? "ok" : ""),
+      x.connected ? td(x.has_key ? "set" : "missing", x.has_key ? "ok" : "bad") : td("not needed", "s"),
+      td(x.tethers.join(", ") || "—", "mono"), b];
+  }));
+  $("sitemeta").textContent = v.this ? `This router: ${v.this.name} (site ${v.this.id}, ${v.this.role})` : "";
+}
+
+async function refreshDhcp() {
+  const v = await api("GET", "/dhcp");
+  table($("dhcpclients"), ["Interface", "State", "Address", "Gateway", "DNS", "Server", "Expires in"],
+    v.clients.map(c => [c.interface, td(c.state, c.state === "bound" ? "ok" : "warn"), td(c.address || "—", "mono"),
+      td(c.gateway || "—", "mono"), td((c.dns || []).join(", ") || "—", "mono"), td(c.server || "—", "mono"),
+      c.expires_in_secs == null ? "—" : dur(c.expires_in_secs)]));
+  const box = $("dhcpservers");
+  box.replaceChildren();
+  if (!v.servers.length) box.append(el("p", "No interface serves DHCP (Configuration → DHCP server).", "s"));
+  v.servers.forEach(srv => {
+    const t = document.createElement("table");
+    table(t, ["IP", "MAC", "Host name", "State", "Expires in"],
+      srv.leases.map(l => [td(l.ip, "mono"), td(l.mac, "mono"), l.hostname || "", l.state, dur(l.expires_in_secs)]));
+    const w = el("div", undefined, "tablewrap"); w.append(t);
+    box.append(el("h3", `${srv.interface}: ${srv.leases.length} lease(s)`), w);
+  });
 }
 
 async function refreshRoutes() {
@@ -171,6 +209,29 @@ function control(c, obj) {
   } else if (c.type === "check") {
     e = document.createElement("input"); e.type = "checkbox"; e.checked = !!v;
     e.onchange = () => { obj[c.key] = e.checked; dirty(); };
+  } else if (c.type === "key") {
+    // A pre-shared key: hidden unless asked, generated in the browser
+    // (crypto.getRandomValues), copyable for the other router.
+    e = el("div", undefined, "row");
+    const inp = document.createElement("input");
+    inp.type = "password"; inp.autocomplete = "off"; inp.spellcheck = false;
+    inp.value = v || ""; inp.placeholder = "none: tethers stay down";
+    inp.className = "mono"; inp.style.minWidth = "14em";
+    inp.oninput = () => { obj[c.key] = inp.value.trim() || null; dirty(); };
+    const show = el("button", "Show", "btn"); show.type = "button";
+    show.onclick = () => { const hidden = inp.type === "password"; inp.type = hidden ? "text" : "password"; show.textContent = hidden ? "Hide" : "Show"; };
+    const gen = el("button", "Generate", "btn"); gen.type = "button";
+    gen.onclick = () => {
+      if (inp.value && !confirm("Replace this key? The other router must then get the new one too.")) return;
+      const b = new Uint8Array(32); crypto.getRandomValues(b);
+      inp.value = Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
+      inp.type = "text"; show.textContent = "Hide"; inp.oninput();
+    };
+    const copy = el("button", "Copy", "btn"); copy.type = "button";
+    copy.onclick = async () => { if (!inp.value) return; try { await navigator.clipboard.writeText(inp.value); copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1500); } catch { inp.type = "text"; inp.select(); } };
+    e.append(inp, show, gen, copy);
+    e.dataset.field = c.key;
+    return e;
   } else {
     e = document.createElement("input");
     if (c.type === "number") { e.type = "number"; e.min = c.min ?? 0; }
@@ -249,19 +310,125 @@ function renderNics() {
   box.append(t);
 }
 
+/// SD-WAN: this router's place in the network, and the other sites.
+function renderSdwanCfg() {
+  const box = $("f-sdwan");
+  box.replaceChildren();
+  const on = document.createElement("input"); on.type = "checkbox"; on.checked = !!cfg.overlay; on.id = "sdwanon";
+  on.onchange = () => {
+    cfg.overlay = on.checked ? { site_id: 1, udp_port: 4800, mtu: 1440, allow_new_sessions: true, name: null, role: "mesh" } : null;
+    if (!on.checked) cfg.site = [];
+    dirty(); renderCfg();
+  };
+  const l = el("label", undefined, "field"); l.append(on, el("span", " This router is part of an SD-WAN"));
+  const top = el("div", undefined, "card"); top.style.marginBottom = "12px"; top.append(l);
+  box.append(top);
+  if (!cfg.overlay) return;
+  const f = el("div");
+  formFields(f, cfg.overlay, [
+    { key: "name", label: "This router's name", optional: true, placeholder: "e.g. jhb" },
+    { key: "site_id", label: "Site id (unique in the network)", type: "number", min: 1 },
+    { key: "role", label: "Role", type: "select", options: [["hub", "hub: connects to every site"], ["spoke", "spoke: connects only to hubs"], ["mesh", "mesh: connects to hubs and other meshes"]], empty: "mesh" },
+    { key: "udp_port", label: "UDP port", type: "number", min: 1 },
+    { key: "mtu", label: "Overlay MTU", type: "number", min: 576 },
+    { key: "allow_new_sessions", label: "Hosts at other sites may start sessions here", type: "check" },
+  ]);
+  top.append(f);
+  cfg.site = cfg.site || [];
+  box.append(el("h2", "Other sites"), el("p",
+    "Every other router in the network. Tethers are built to the sites this router's role connects to " +
+    "(one per outside interface and address); the rest are reached through a hub. " +
+    "Leave Addresses empty for a site without a fixed address: it's learned when that site gets in touch. " +
+    "The key must be the same on both routers: generate it here, then copy it into the other router's entry for this one " +
+    "(SD-WAN tab → Copy entry, after committing).", "s"));
+  const t = el("div", undefined, "tablewrap");
+  formTable(t, cfg.site, [
+    { key: "name", label: "Name", placeholder: "cpt" },
+    { key: "id", label: "Site id", type: "number", min: 1 },
+    { key: "role", label: "Role", type: "select", options: [["hub", "hub"], ["spoke", "spoke"], ["mesh", "mesh"]], empty: "mesh" },
+    { key: "addresses", label: "WAN addresses", type: "list", placeholder: "learned" },
+    { key: "prefixes", label: "Networks", type: "list", placeholder: "10.2.0.0/16" },
+    { key: "key", label: "Key", type: "key" },
+  ], () => ({ name: "", id: nextSiteId(), role: "spoke", addresses: [], prefixes: [], key: null }), "Add site");
+  box.append(t);
+}
+
+function nextSiteId() {
+  const used = new Set([cfg.overlay?.site_id, ...(cfg.site || []).map(s => s.id)]);
+  let i = 1; while (used.has(i)) i++; return i;
+}
+
+/// One card per interface: serve DHCP there or not, and how.
+function renderDhcpCfg() {
+  const box = $("f-dhcp");
+  box.replaceChildren();
+  cfg.interface.forEach(i => {
+    const c = el("div", undefined, "card");
+    c.style.marginBottom = "12px";
+    c.append(el("h3", `${i.name || "(unnamed)"} · ${i.address || "no address"}`));
+    if ((i.address || "").toLowerCase() === "dhcp") {
+      c.append(el("p", "Gets its own address by DHCP: can't serve it.", "s"));
+      box.append(c);
+      return;
+    }
+    const on = document.createElement("input"); on.type = "checkbox"; on.checked = !!i.dhcp;
+    on.dataset.dhcp = i.name;
+    on.onchange = () => {
+      i.dhcp = on.checked ? { range: suggestRange(i.address), lease_secs: 86400, dns: [], domain: null, reservation: [] } : null;
+      dirty(); renderCfg();
+    };
+    const l = el("label", undefined, "field"); l.append(on, el("span", " Serve DHCP on this interface"));
+    c.append(l);
+    if (i.dhcp) {
+      i.dhcp.dns = i.dhcp.dns || [];
+      i.dhcp.reservation = i.dhcp.reservation || [];
+      const f = el("div");
+      formFields(f, i.dhcp, [
+        { key: "range", label: "Address range", placeholder: "10.0.0.100-10.0.0.199" },
+        { key: "lease_secs", label: "Lease time (s)", type: "number", min: 120 },
+        { key: "dns", label: "DNS servers", type: "list", placeholder: "learned from the WAN" },
+        { key: "domain", label: "Domain", optional: true, placeholder: "home.arpa" },
+      ]);
+      const r = el("div", undefined, "tablewrap");
+      formTable(r, i.dhcp.reservation, [
+        { key: "mac", label: "MAC address", placeholder: "52:54:00:12:34:56" },
+        { key: "address", label: "Fixed address", placeholder: "10.0.0.10" },
+        { key: "name", label: "Name", optional: true, placeholder: "nas" },
+      ], () => ({ mac: "", address: "", name: null }), "Add reservation");
+      c.append(f, el("h3", "Reservations"), r);
+    }
+    box.append(c);
+  });
+}
+
+/// "10.0.0.1/24" → "10.0.0.100-10.0.0.199" (or the upper part of a small subnet).
+function suggestRange(addr) {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/.exec(addr || "");
+  if (!m) return "";
+  const ip = ((+m[1] << 24) >>> 0) + (+m[2] << 16) + (+m[3] << 8) + +m[4], len = +m[5];
+  const size = 2 ** (32 - len), net = ip - (ip % size);
+  const str = x => [x >>> 24, (x >>> 16) & 255, (x >>> 8) & 255, x & 255].join(".");
+  if (size >= 256) return `${str(net + 100)}-${str(net + 199)}`;
+  if (size < 8) return "";
+  return `${str(net + size / 2)}-${str(net + size - 2)}`;
+}
+
 function renderCfg() {
   if (!cfg) return;
   const ifaceNames = () => [["", "any"], ...cfg.interface.map(i => [i.name, i.name])];
   formTable($("f-ifaces"), cfg.interface, [
     { key: "name", label: "Name", placeholder: "lan" },
     { key: "device", label: "Device", type: "select", options: () => devices.filter(d => !d.kernel).map(d => [d.name, d.driver ? `${d.name} (${d.driver})` : d.name]) },
-    { key: "address", label: "Address / prefix", placeholder: "10.0.0.1/24" },
+    { key: "address", label: "Address / prefix", placeholder: "10.0.0.1/24 or dhcp" },
     { key: "role", label: "Role", type: "select", options: [["inside", "inside"], ["outside", "outside"]], empty: "inside" },
     { key: "allow_new_sessions", label: "New sessions", type: "select", bool: true,
       options: [["", "default for role"], ["true", "allowed"], ["false", "replies only"]] },
     { key: "mss_adjust", label: "MSS adjust", type: "number", min: 536, optional: true, placeholder: "off" },
-  ], () => ({ name: "", device: unusedNics()[0]?.name || "", address: "", role: "inside", allow_new_sessions: null, mss_adjust: null }), "Add interface");
+    { key: "gateway", label: "Gateway", optional: true, placeholder: "ISP router (static WAN)" },
+  ], () => ({ name: "", device: unusedNics()[0]?.name || "", address: "", role: "inside", allow_new_sessions: null, mss_adjust: null, gateway: null, dhcp: null }), "Add interface");
   renderNics();
+  renderDhcpCfg();
+  renderSdwanCfg();
 
   formTable($("f-routes"), cfg.route, [
     { key: "prefix", label: "Destination prefix", placeholder: "0.0.0.0/0" },
@@ -373,7 +540,7 @@ $("sessfilter").oninput = () => refreshSessions().catch(() => {});
 function show(tab) {
   current = tab;
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
-  ["dash", "sessions", "routes", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.toggle("hidden", t !== tab));
+  ["dash", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.toggle("hidden", t !== tab));
   tick(true);
 }
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => show(b.dataset.tab));
@@ -388,6 +555,7 @@ async function tick(first) {
     else if (tab === "sessions") await refreshSessions();
     else if (tab === "routes") await refreshRoutes();
     else if (tab === "sdwan") await refreshSdwan();
+    else if (tab === "dhcp") await refreshDhcp();
     else if (tab === "config" && first && !cfgDirty) await loadConfig(); // never throw away unsaved edits
     else if (tab === "system") await refreshSystem();
   } catch (e) { if (e.message !== "unauthorised") console.warn(e); }
@@ -398,7 +566,7 @@ function showLogin(err) {
   signedIn = false; clearTimeout(timer);
   $("login").classList.remove("hidden"); $("loginerr").textContent = err || "";
   $("tabs").classList.add("hidden"); $("logout").classList.add("hidden"); $("meta").textContent = "";
-  ["dash", "sessions", "routes", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.add("hidden"));
+  ["dash", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.add("hidden"));
   $("password").focus();
 }
 function signedInUi() {

@@ -19,8 +19,8 @@ mod pipeline;
 pub mod session;
 mod stats;
 
-pub use config::{build_fib, NextHop, OverlayRoute, Port, PortId, Role, StaticRoute};
-pub use pipeline::{Emit, Neighbor, Pipeline, Verdict};
+pub use config::{build_fib, Dhcp, NextHop, OverlayRoute, Port, PortId, Role, StaticRoute};
+pub use pipeline::{Emit, Neighbor, Pipeline, Punt, Verdict};
 pub use session::{Dir, FlowKey, NatBinding, Session, SessionConfig, State, Timeouts};
 pub use stats::{DropReason, Stats};
 

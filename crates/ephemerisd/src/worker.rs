@@ -6,7 +6,7 @@
 //! which arrive as messages.
 
 use crate::report::{Control, KernelStats, Report, SessionView};
-use eph_dataplane::{DropReason, Pipeline, PortId, Verdict};
+use eph_dataplane::{DropReason, Pipeline, PortId, Punt, Verdict};
 use eph_xdp::{Umem, XdpDesc, Xsk};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -36,6 +36,8 @@ pub struct Worker {
     /// Sibling workers' control channels, for sharing learned neighbours.
     pub siblings: Vec<Sender<Control>>,
     pub report: Arc<Mutex<Report>>,
+    /// Where DHCP packets for the control plane go.
+    pub punt: Sender<Punt>,
     pub busy_poll: bool,
     pub cpu: Option<usize>,
 }
@@ -64,6 +66,8 @@ impl Worker {
             })
             .collect();
         let mut batch = [XdpDesc::default(); BATCH];
+        // Frames the control plane asked us to send.
+        let mut outbox: Vec<(PortId, Vec<u8>)> = Vec::new();
 
         while !stop.load(Ordering::Relaxed) {
             let now_ns = epoch.elapsed().as_nanos() as u64;
@@ -76,6 +80,7 @@ impl Worker {
                     Control::SetPorts(ports) => self.pipeline.set_ports(ports),
                     Control::SetPaths(paths) => self.pipeline.set_paths(paths),
                     Control::SetNat(nat) => self.pipeline.set_nat(nat),
+                    Control::Transmit { port, frame } => outbox.push((port, frame)),
                 }
             }
             let mut work = 0usize;
@@ -167,6 +172,31 @@ impl Worker {
                 } else {
                     free.push(addr);
                 }
+            }
+
+            // ...and frames from the control plane (DHCP).
+            for (port, frame) in outbox.drain(..) {
+                let Some(addr) = free.pop() else { break };
+                let buf = unsafe { self.umem.frame_mut(addr) };
+                if frame.len() > buf.len() || port as usize >= nports {
+                    free.push(addr);
+                    continue;
+                }
+                buf[..frame.len()].copy_from_slice(&frame);
+                if self.socks[port as usize].tx.push(XdpDesc {
+                    addr,
+                    len: frame.len() as u32,
+                    options: 0,
+                }) {
+                    tx_pending[port as usize] = true;
+                    self.pipeline.stats.originated += 1;
+                } else {
+                    free.push(addr);
+                }
+            }
+            // ...and packets for the control plane go to it.
+            for p in self.pipeline.punts.drain(..) {
+                let _ = self.punt.send(p);
             }
 
             // 5. Tell sibling workers about neighbours we learned.

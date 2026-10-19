@@ -23,6 +23,23 @@ pub struct Port {
     /// TCP MSS adjust: SYNs leaving or entering through this port announce
     /// at most this MSS, e.g. 1452 behind PPPoE. `None`: leave MSS alone.
     pub mss_adjust: Option<u16>,
+    /// DHCP on this link: the router serves leases here, or gets its own
+    /// address here. DHCP packets on such a port go to the control plane.
+    pub dhcp: Dhcp,
+    /// The next hop towards everything beyond this link (an ISP's router),
+    /// if known: used for SD-WAN tethers leaving through this port.
+    pub gateway: Option<Ipv4Addr>,
+}
+
+/// The router's DHCP role on a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dhcp {
+    #[default]
+    Off,
+    /// Lease addresses to hosts on this link.
+    Server,
+    /// Get this port's own address (and gateway) from a server on the link.
+    Client,
 }
 
 /// Which side of the network an interface faces.

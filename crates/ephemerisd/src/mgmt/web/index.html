@@ -74,6 +74,7 @@
     <button data-tab="dash" class="on">Dashboard</button>
     <button data-tab="sessions">Sessions</button>
     <button data-tab="routes">Routes</button>
+    <button data-tab="dhcp">DHCP</button>
     <button data-tab="sdwan">SD-WAN</button>
     <button data-tab="config">Configuration</button>
     <button data-tab="system">System</button>
@@ -119,8 +120,14 @@
     </section>
   </div>
 
+  <div id="tab-dhcp" class="hidden">
+    <section><h2>Addresses the router got (DHCP client)</h2><div class="tablewrap"><table id="dhcpclients"></table></div></section>
+    <section><h2>Addresses handed out (DHCP server)</h2><div id="dhcpservers"></div></section>
+  </div>
+
   <div id="tab-sdwan" class="hidden">
     <p class="s" id="sdwanmeta"></p>
+    <section><h2>Sites</h2><p class="s" id="sitemeta"></p><div class="tablewrap"><table id="sitetab"></table></div></section>
     <section><h2>Tethers (WAN paths), probed 5× a second</h2><div class="tablewrap"><table id="tun"></table></div></section>
     <section><h2>Path decisions: which tether each application class uses</h2><div class="tablewrap"><table id="pathtab"></table></div></section>
   </div>
@@ -154,7 +161,9 @@
 
     <nav class="subnav" id="cfgnav">
       <button data-sec="ifaces" class="on">Interfaces</button>
+      <button data-sec="dhcp">DHCP server</button>
       <button data-sec="routing">Static routes</button>
+      <button data-sec="sdwan">SD-WAN</button>
       <button data-sec="nat">NAT</button>
       <button data-sec="sess">Sessions</button>
       <button data-sec="dp">Data plane</button>
@@ -170,6 +179,15 @@
       <h3>Network cards not in use</h3>
       <p class="s">Cards the router found that no interface uses yet. After adding or removing one, the data plane needs a restart.</p>
       <div class="tablewrap" id="f-nics"></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-dhcp">
+      <p class="s">Lease addresses to devices on an interface. Interfaces whose own address comes from DHCP can't serve it.
+        DNS left empty: the router hands out the DNS servers it got from its own DHCP lease on an outside interface.</p>
+      <div id="f-dhcp"></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-sdwan">
+      <p class="s">Changes here need a data-plane restart (the review says so).</p>
+      <div id="f-sdwan"></div>
     </section>
     <section class="cfgsec hidden" id="sec-routing">
       <p class="s">Connected subnets are routed automatically. Add a default route (0.0.0.0/0) via your ISP's gateway to reach the internet.</p>
@@ -192,7 +210,7 @@
       <div class="row"><select id="histsel"></select><button class="btn" id="cfgrollback">Roll back to this version</button></div>
     </section>
     <section class="cfgsec hidden" id="sec-text">
-      <p class="s">The configuration file itself, for things the forms don't cover (e.g. SD-WAN). Validate stages it for review.</p>
+      <p class="s">The configuration file itself, for things the forms don't cover (hand-written tethers, application classes). Validate stages it for review.</p>
       <textarea id="cfgtext" spellcheck="false"></textarea>
       <div class="row"><button class="btn" id="cfgvalidate">Validate &amp; review</button></div>
     </section>

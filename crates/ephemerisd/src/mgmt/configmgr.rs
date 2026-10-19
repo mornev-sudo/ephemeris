@@ -395,6 +395,7 @@ impl ConfigManager {
         put(&mut doc, c, "route", &base.routes, &new.routes)?;
         put(&mut doc, c, "nat", &base.nat, &new.nat)?;
         put(&mut doc, c, "overlay", &base.overlay, &new.overlay)?;
+        put(&mut doc, c, "site", &base.sites, &new.sites)?;
         put(&mut doc, c, "tether", &base.tethers, &new.tethers)?;
         put(
             &mut doc,
@@ -409,7 +410,7 @@ impl ConfigManager {
         // were, new ones right after the section that canonically precedes
         // them. Then number every table in that order, so sub-tables (e.g.
         // [[nat.pool]]) sit right under their parent.
-        const CANONICAL: [&str; 10] = [
+        const CANONICAL: [&str; 11] = [
             "dataplane",
             "management",
             "sessions",
@@ -417,6 +418,7 @@ impl ConfigManager {
             "route",
             "nat",
             "overlay",
+            "site",
             "tether",
             "overlay_route",
             "class",
@@ -776,6 +778,8 @@ address = "10.10.2.1/24"
                 role: Default::default(),
                 allow_new_sessions: None,
                 mss_adjust: None,
+                gateway: None,
+                dhcp: None,
             });
             m.text_from_model(&cfg).unwrap()
         };

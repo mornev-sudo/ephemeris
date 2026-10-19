@@ -30,6 +30,11 @@ pub struct Config {
     /// SD-WAN overlay (absent = plain router).
     #[serde(default)]
     pub overlay: Option<OverlayCfg>,
+    /// The other routers in the SD-WAN, and how to reach them. Tethers to
+    /// them are created automatically, following the sites' roles.
+    #[serde(default, rename = "site")]
+    pub sites: Vec<SiteCfg>,
+    /// Hand-written tethers (advanced; `[[site]]` covers most setups).
     #[serde(default, rename = "tether")]
     pub tethers: Vec<TetherCfg>,
     #[serde(default, rename = "overlay_route")]
@@ -52,6 +57,55 @@ pub struct OverlayCfg {
     /// May hosts at other sites start sessions to this site?
     #[serde(default = "default_true")]
     pub allow_new_sessions: bool,
+    /// This router's name in the SD-WAN (what other routers call it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// This router's role: which other sites it builds tethers to.
+    #[serde(default)]
+    pub role: SiteRole,
+}
+
+/// Who builds tethers to whom. Hubs connect to every site; spokes only to
+/// hubs; meshes to hubs and other meshes. Sites that don't connect directly
+/// reach each other through a hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteRole {
+    Hub,
+    Spoke,
+    #[default]
+    Mesh,
+}
+
+impl SiteRole {
+    /// Do sites with these roles build tethers to each other?
+    pub fn peers_with(self, other: SiteRole) -> bool {
+        use SiteRole::*;
+        matches!((self, other), (Hub, _) | (_, Hub) | (Mesh, Mesh))
+    }
+}
+
+/// Another router in the SD-WAN.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteCfg {
+    pub name: String,
+    /// Its `[overlay] site_id`.
+    pub id: u16,
+    #[serde(default)]
+    pub role: SiteRole,
+    /// Its WAN addresses. Empty: it has none fixed (e.g. DHCP from its ISP);
+    /// its address is learned when it gets in touch, so it must be the one
+    /// that knows ours.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    /// The networks behind it, e.g. ["10.2.0.0/16"].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefixes: Vec<String>,
+    /// The key this router and that site share: 64 hex characters, the same
+    /// on both. Without one, no tether to it comes up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 fn default_overlay_port() -> u16 {
@@ -148,7 +202,9 @@ pub struct InterfaceCfg {
     pub name: String,
     /// Linux network device, e.g. "ens19".
     pub device: String,
-    /// The router's address and prefix length on this link, e.g. "10.10.1.1/24".
+    /// The router's address and prefix length on this link, e.g.
+    /// "10.10.1.1/24", or "dhcp" to get it (and a default route) from a DHCP
+    /// server on the link, as most ISP connections do.
     pub address: String,
     /// "inside" (your networks, the default) or "outside" (the internet).
     #[serde(default)]
@@ -161,6 +217,129 @@ pub struct InterfaceCfg {
     /// announce to at most this value (e.g. 1452 for PPPoE). Unset: no change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mss_adjust: Option<u16>,
+    /// The next router on this link towards everything else (an ISP's
+    /// gateway), for a statically addressed outside interface. SD-WAN
+    /// tethers leaving here use it. With `address = "dhcp"` it comes from
+    /// the lease instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// Serve DHCP on this interface (inside interfaces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dhcp: Option<DhcpServerCfg>,
+}
+
+/// DHCP server settings for one interface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhcpServerCfg {
+    /// Addresses to lease: "10.10.1.100-10.10.1.199".
+    pub range: String,
+    /// Lease time in seconds (default one day).
+    #[serde(default = "default_lease_secs")]
+    pub lease_secs: u32,
+    /// DNS servers to hand out. Empty: the ones the router got with its own
+    /// DHCP lease on an outside interface, if any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
+    /// Domain name for the hosts, e.g. "home.arpa".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Fixed addresses for known devices.
+    #[serde(default, rename = "reservation", skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<ReservationCfg>,
+}
+
+fn default_lease_secs() -> u32 {
+    86400
+}
+
+/// A DHCP server section, checked and turned into addresses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DhcpServerResolved {
+    pub range: (Ipv4Addr, Ipv4Addr),
+    pub dns: Vec<Ipv4Addr>,
+    pub reservations: Vec<(Mac, Ipv4Addr)>,
+}
+
+impl DhcpServerCfg {
+    /// Check it against the interface's address and subnet.
+    pub fn resolve(&self, iface: &str, addr: Ipv4Addr, net: Prefix) -> Result<DhcpServerResolved> {
+        let ctx = |what: String| format!("interface {iface} dhcp: {what}");
+        let (lo, hi) = self.range.split_once('-').with_context(|| {
+            ctx(format!(
+                "range {:?} must look like 10.0.0.100-10.0.0.199",
+                self.range
+            ))
+        })?;
+        let lo: Ipv4Addr = lo
+            .trim()
+            .parse()
+            .with_context(|| ctx(format!("range start {lo:?}")))?;
+        let hi: Ipv4Addr = hi
+            .trim()
+            .parse()
+            .with_context(|| ctx(format!("range end {hi:?}")))?;
+        if u32::from(lo) > u32::from(hi) {
+            bail!(ctx(format!("range {lo}-{hi} goes backwards")));
+        }
+        for ip in [lo, hi] {
+            if !net.contains(ip) || ip == net.addr() || ip == broadcast(net) {
+                bail!(ctx(format!("{ip} isn't a host address on {net}")));
+            }
+        }
+        if self.lease_secs < 120 {
+            bail!(ctx("lease_secs must be at least 120".into()));
+        }
+        let dns = self
+            .dns
+            .iter()
+            .map(|d| d.parse().with_context(|| ctx(format!("dns server {d:?}"))))
+            .collect::<Result<Vec<Ipv4Addr>>>()?;
+        if let Some(d) = &self.domain {
+            if d.is_empty()
+                || d.len() > 253
+                || !d.split('.').all(|l| {
+                    !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            {
+                bail!(ctx(format!("domain {d:?} isn't a domain name")));
+            }
+        }
+        let mut reservations: Vec<(Mac, Ipv4Addr)> = Vec::new();
+        for r in &self.reservations {
+            let mac = eph_packet::eth::parse_mac(&r.mac)
+                .with_context(|| ctx(format!("reservation MAC {:?}", r.mac)))?;
+            let ip: Ipv4Addr = r
+                .address
+                .parse()
+                .with_context(|| ctx(format!("reservation address {:?}", r.address)))?;
+            if !net.contains(ip) || ip == addr || ip == net.addr() || ip == broadcast(net) {
+                bail!(ctx(format!(
+                    "reserved address {ip} isn't a free host address on {net}"
+                )));
+            }
+            if reservations.iter().any(|&(m, i)| m == mac || i == ip) {
+                bail!(ctx(format!("{} / {ip} is reserved twice", r.mac)));
+            }
+            reservations.push((mac, ip));
+        }
+        Ok(DhcpServerResolved {
+            range: (lo, hi),
+            dns,
+            reservations,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReservationCfg {
+    /// The device's MAC address, e.g. "52:54:00:12:34:56".
+    pub mac: String,
+    pub address: String,
+    /// What it is (for people; not sent to the device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -172,6 +351,10 @@ pub enum RoleCfg {
 }
 
 impl InterfaceCfg {
+    /// Does this interface get its address by DHCP?
+    pub fn is_dhcp_client(&self) -> bool {
+        self.address.eq_ignore_ascii_case("dhcp")
+    }
     pub fn role(&self) -> Role {
         match self.role {
             RoleCfg::Inside => Role::Inside,
@@ -380,6 +563,7 @@ impl Config {
             && self.sessions == new.sessions
             && self.management == new.management
             && self.overlay == new.overlay
+            && self.sites == new.sites
             && self.tethers == new.tethers
             && self.classes == new.classes
             && self.interfaces.len() == new.interfaces.len()
@@ -465,7 +649,36 @@ impl Config {
                     bail!("two interfaces are named {}", a.name);
                 }
             }
+            if a.is_dhcp_client() {
+                if a.dhcp.is_some() {
+                    bail!(
+                        "interface {}: can't both get its address by DHCP and serve DHCP",
+                        a.name
+                    );
+                }
+                if a.gateway.is_some() {
+                    bail!(
+                        "interface {}: the gateway comes from DHCP; remove `gateway`",
+                        a.name
+                    );
+                }
+                continue; // no address to check until a lease arrives
+            }
             let (ip, net) = addrs[i];
+            if let Some(g) = &a.gateway {
+                let g: Ipv4Addr = g
+                    .parse()
+                    .with_context(|| format!("interface {}: gateway {g:?}", a.name))?;
+                if !net.contains(g) || g == ip {
+                    bail!(
+                        "interface {}: gateway {g} isn't another address on {net}",
+                        a.name
+                    );
+                }
+            }
+            if let Some(d) = &a.dhcp {
+                d.resolve(&a.name, ip, net)?;
+            }
             if net.len() < 31 && (ip == net.addr() || ip == broadcast(net)) {
                 bail!(
                     "interface {}: {ip} is the network or broadcast address of {net}",
@@ -473,6 +686,9 @@ impl Config {
                 );
             }
             for (j, &(_, other)) in addrs.iter().enumerate().skip(i + 1) {
+                if self.interfaces[j].is_dhcp_client() {
+                    continue;
+                }
                 if net.contains(other.addr()) || other.contains(net.addr()) {
                     bail!(
                         "interfaces {} and {} have overlapping subnets",
@@ -488,12 +704,55 @@ impl Config {
         Ok(())
     }
 
+    /// This config as it applies right now: interfaces with `address =
+    /// "dhcp"` get the address and gateway their lease gave them, and the
+    /// first such lease with a gateway supplies the default route (unless a
+    /// static one is configured). Without a lease they stay unaddressed.
+    pub fn with_leases(
+        &self,
+        leases: &std::collections::HashMap<String, crate::dhcp::client::ClientLease>,
+    ) -> Config {
+        let mut c = self.clone();
+        let static_default = self
+            .routes
+            .iter()
+            .any(|r| r.prefix.parse::<Prefix>().is_ok_and(|p| p.len() == 0));
+        let mut default_set = static_default;
+        for i in &mut c.interfaces {
+            let Some(l) = i.is_dhcp_client().then(|| leases.get(&i.name)).flatten() else {
+                continue;
+            };
+            i.address = format!("{}/{}", l.addr, l.prefix_len);
+            if let Some(r) = l.router {
+                i.gateway = Some(r.to_string());
+                if !default_set {
+                    c.routes.push(RouteCfg {
+                        prefix: "0.0.0.0/0".into(),
+                        via: r.to_string(),
+                    });
+                    default_set = true;
+                }
+            }
+        }
+        c
+    }
+
     pub fn interface_addrs(&self) -> Result<Vec<(Ipv4Addr, Prefix)>> {
         self.interfaces
             .iter()
             .map(|i| {
+                if i.is_dhcp_client() {
+                    // No address until a lease arrives (see `with_leases`).
+                    return Ok((
+                        Ipv4Addr::UNSPECIFIED,
+                        Prefix::new(Ipv4Addr::UNSPECIFIED, 32).unwrap(),
+                    ));
+                }
                 let (ip, len) = i.address.split_once('/').with_context(|| {
-                    format!("interface {}: address must look like 10.0.0.1/24", i.name)
+                    format!(
+                        "interface {}: address must look like 10.0.0.1/24 (or be \"dhcp\")",
+                        i.name
+                    )
                 })?;
                 let ip: Ipv4Addr = ip
                     .parse()
@@ -540,6 +799,14 @@ impl Config {
                     allow_new_sessions: i.allows_new_sessions(),
                     role: i.role(),
                     mss_adjust: i.mss_adjust,
+                    dhcp: if i.is_dhcp_client() {
+                        eph_dataplane::Dhcp::Client
+                    } else if i.dhcp.is_some() {
+                        eph_dataplane::Dhcp::Server
+                    } else {
+                        eph_dataplane::Dhcp::Off
+                    },
+                    gateway: i.gateway.as_deref().and_then(|g| g.parse().ok()),
                 })
             })
             .collect()
@@ -547,7 +814,7 @@ impl Config {
 
     pub fn fib(&self, ports: &[Port]) -> Result<Fib<NextHop>> {
         let overlay = self.overlay()?;
-        let routes = self
+        let mut routes = self
             .overlay_routes
             .iter()
             .map(|r| {
@@ -562,6 +829,26 @@ impl Config {
                 Ok(OverlayRoute { prefix, site_idx })
             })
             .collect::<Result<Vec<_>>>()?;
+        // Each site's networks: directly to it if we have tethers to it,
+        // otherwise through the first hub we have tethers to.
+        let me = self.overlay.as_ref().map(|o| o.role).unwrap_or_default();
+        let hub = self
+            .sites
+            .iter()
+            .find(|s| s.role == SiteRole::Hub && me.peers_with(s.role))
+            .and_then(|h| overlay.sites.iter().position(|&x| x == h.id));
+        for s in &self.sites {
+            let direct = overlay.sites.iter().position(|&x| x == s.id);
+            let Some(site_idx) = direct.filter(|_| me.peers_with(s.role)).or(hub) else {
+                continue; // unreachable from here: no tethers to it or a hub
+            };
+            for p in &s.prefixes {
+                let prefix = p
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("site {}: prefix {p:?}: {e}", s.name))?;
+                routes.push(OverlayRoute { prefix, site_idx });
+            }
+        }
         build_fib(ports, &self.static_routes()?, &routes).map_err(anyhow::Error::msg)
     }
 
@@ -647,8 +934,9 @@ impl Config {
     pub fn overlay(&self) -> Result<Overlay> {
         let mut o = Overlay::disabled();
         let Some(oc) = &self.overlay else {
-            if !self.tethers.is_empty() || !self.overlay_routes.is_empty() {
-                bail!("[[tether]] and [[overlay_route]] need an [overlay] section");
+            if !self.tethers.is_empty() || !self.overlay_routes.is_empty() || !self.sites.is_empty()
+            {
+                bail!("[[site]], [[tether]] and [[overlay_route]] need an [overlay] section");
             }
             return Ok(o);
         };
@@ -660,7 +948,13 @@ impl Config {
             bail!("overlay.mtu must be between 576 and 9000");
         }
         let addrs = self.interface_addrs()?;
-        for (i, t) in self.tethers.iter().enumerate() {
+        // Hand-written tethers first, then one per (outside interface, peer
+        // address) for every site this router's role connects it to.
+        let mut all: Vec<(TetherCfg, bool)> =
+            self.tethers.iter().map(|t| (t.clone(), false)).collect();
+        all.extend(self.site_tethers()?.into_iter().map(|t| (t, true)));
+        for (i, (t, generated)) in all.iter().enumerate() {
+            let t = &t.clone();
             let port = self
                 .interfaces
                 .iter()
@@ -670,6 +964,9 @@ impl Config {
                 })?;
             let subnet = addrs[port].1;
             match t.gateway {
+                // Generated tethers use the interface's gateway (configured
+                // or from DHCP) for peers off the link.
+                _ if *generated => {}
                 None if !subnet.contains(t.remote) => bail!(
                     "tether {}: remote {} is not on {}'s subnet {subnet}; set `gateway`",
                     t.name,
@@ -688,7 +985,7 @@ impl Config {
             if t.site == oc.site_id {
                 bail!("tether {}: site {} is this site", t.name, t.site);
             }
-            if self.tethers[..i].iter().any(|x| x.name == t.name) {
+            if all[..i].iter().any(|(x, _)| x.name == t.name) {
                 bail!("two tethers are named {}", t.name);
             }
             let site_idx = match o.sites.iter().position(|&s| s == t.site) {
@@ -771,6 +1068,78 @@ impl Config {
             });
         }
         Ok(o)
+    }
+
+    /// The tethers `[[site]]` entries imply, named "<site>-<interface>" (and
+    /// "-2", "-3"... for further addresses of the same site).
+    pub fn site_tethers(&self) -> Result<Vec<TetherCfg>> {
+        let Some(oc) = &self.overlay else {
+            return Ok(vec![]);
+        };
+        let mut out = vec![];
+        for (i, s) in self.sites.iter().enumerate() {
+            if !valid_name(&s.name) {
+                bail!(
+                    "site {:?}: needs a name (letters, digits, '-', '_' or '.')",
+                    s.name
+                );
+            }
+            if s.id == oc.site_id {
+                bail!("site {}: id {} is this router's own site_id", s.name, s.id);
+            }
+            if let Some(o) = self.sites[..i]
+                .iter()
+                .find(|o| o.id == s.id || o.name == s.name)
+            {
+                bail!("sites {} and {} have the same name or id", o.name, s.name);
+            }
+            if let Some(k) = &s.key {
+                parse_key(k).map_err(|e| anyhow::anyhow!("site {}: key {e:#}", s.name))?;
+            }
+            let remotes: Vec<Ipv4Addr> = s
+                .addresses
+                .iter()
+                .map(|a| {
+                    a.parse()
+                        .with_context(|| format!("site {}: address {a:?}", s.name))
+                })
+                .collect::<Result<_>>()?;
+            for p in &s.prefixes {
+                p.parse::<Prefix>()
+                    .map_err(|e| anyhow::anyhow!("site {}: prefix {p:?}: {e}", s.name))?;
+            }
+            if !oc.role.peers_with(s.role) {
+                continue;
+            }
+            // No fixed address: learn it (one tether per WAN interface).
+            let remotes = if remotes.is_empty() {
+                vec![Ipv4Addr::UNSPECIFIED]
+            } else {
+                remotes
+            };
+            for wan in self
+                .interfaces
+                .iter()
+                .filter(|x| x.role == RoleCfg::Outside)
+            {
+                for (n, &remote) in remotes.iter().enumerate() {
+                    let name = if n == 0 {
+                        format!("{}-{}", s.name, wan.name)
+                    } else {
+                        format!("{}-{}-{}", s.name, wan.name, n + 1)
+                    };
+                    out.push(TetherCfg {
+                        name,
+                        interface: wan.name.clone(),
+                        remote,
+                        gateway: None,
+                        site: s.id,
+                        key: s.key.clone(),
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -951,6 +1320,215 @@ mod tests {
         let c = parse(text).unwrap();
         let ports = c.ports(|_| Ok([0; 6])).unwrap();
         c.fib(&ports).unwrap();
+    }
+
+    const DHCP_CFG: &str = r#"
+[[interface]]
+name = "lan"
+device = "ens19"
+address = "10.10.1.1/24"
+
+[interface.dhcp]
+range = "10.10.1.100-10.10.1.199"
+lease_secs = 3600
+domain = "home.arpa"
+
+[[interface.dhcp.reservation]]
+mac = "52:54:00:12:34:56"
+address = "10.10.1.10"
+name = "nas"
+
+[[interface]]
+name = "wan"
+device = "ens20"
+address = "dhcp"
+role = "outside"
+"#;
+
+    #[test]
+    fn dhcp_server_and_client_config() {
+        let c = parse(DHCP_CFG).unwrap();
+        let lan = &c.interfaces[0];
+        let d = lan.dhcp.as_ref().unwrap();
+        assert_eq!(d.reservations[0].name.as_deref(), Some("nas"));
+        let r = d
+            .resolve(
+                "lan",
+                "10.10.1.1".parse().unwrap(),
+                "10.10.1.0/24".parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(r.range.1, "10.10.1.199".parse::<Ipv4Addr>().unwrap());
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!(ports[0].dhcp, eph_dataplane::Dhcp::Server);
+        assert_eq!(ports[1].dhcp, eph_dataplane::Dhcp::Client);
+        assert!(ports[1].addr.is_unspecified(), "no address before a lease");
+        // Round trip through the GUI's serializer keeps the nested tables.
+        let text = toml::to_string(&c).unwrap();
+        assert_eq!(parse(&text).unwrap(), c, "{text}");
+    }
+
+    #[test]
+    fn bad_dhcp_settings_are_refused() {
+        let err =
+            |from: &str, to: &str| parse(&DHCP_CFG.replace(from, to)).unwrap_err().to_string();
+        assert!(err("10.10.1.100-10.10.1.199", "10.10.1.199-10.10.1.100").contains("backwards"));
+        assert!(err("10.10.1.100-10.10.1.199", "10.10.1.100-10.10.2.5")
+            .contains("isn't a host address"));
+        assert!(err("address = \"10.10.1.10\"", "address = \"10.10.1.1\"")
+            .contains("isn't a free host"));
+        assert!(err("mac = \"52:54:00:12:34:56\"", "mac = \"nope\"").contains("MAC"));
+        assert!(err("domain = \"home.arpa\"", "domain = \"bad domain\"").contains("domain"));
+        // A DHCP-client interface can't serve DHCP or set a gateway.
+        let both = DHCP_CFG.replace("address = \"10.10.1.1/24\"", "address = \"dhcp\"");
+        assert!(parse(&both).unwrap_err().to_string().contains("both"));
+    }
+
+    #[test]
+    fn a_lease_becomes_the_address_and_default_route() {
+        use crate::dhcp::client::ClientLease;
+        let c = parse(DHCP_CFG).unwrap();
+        let mut leases = std::collections::HashMap::new();
+        leases.insert(
+            "wan".to_string(),
+            ClientLease {
+                addr: "203.0.113.50".parse().unwrap(),
+                prefix_len: 24,
+                router: Some("203.0.113.1".parse().unwrap()),
+                dns: vec![],
+                server: "203.0.113.1".parse().unwrap(),
+                server_mac: [0; 6],
+                obtained_unix: 0,
+                lease_secs: 3600,
+                t1_secs: 1800,
+                t2_secs: 3150,
+            },
+        );
+        let e = c.with_leases(&leases);
+        assert_eq!(e.interfaces[1].address, "203.0.113.50/24");
+        assert_eq!(e.routes[0].via, "203.0.113.1");
+        let ports = e.ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!(ports[1].gateway, Some("203.0.113.1".parse().unwrap()));
+        let fib = e.fib(&ports).unwrap();
+        assert!(
+            fib.lookup("8.8.8.8".parse().unwrap()).is_some(),
+            "default route installed"
+        );
+        // A static default route wins over the lease's gateway.
+        let mut c2 = c.clone();
+        c2.routes.push(RouteCfg {
+            prefix: "0.0.0.0/0".into(),
+            via: "10.10.1.254".into(),
+        });
+        assert_eq!(c2.with_leases(&leases).routes.len(), 1);
+    }
+
+    /// A spoke ("cpt") with one WAN, in a network with two hubs, another
+    /// spoke and a mesh site.
+    const SITES_CFG: &str = r#"
+[[interface]]
+name = "lan"
+device = "ens19"
+address = "10.1.0.1/24"
+
+[[interface]]
+name = "wan"
+device = "ens20"
+address = "198.51.100.2/24"
+role = "outside"
+gateway = "198.51.100.1"
+
+[overlay]
+site_id = 1
+name = "cpt"
+role = "spoke"
+
+[[site]]
+name = "jhb"
+id = 2
+role = "hub"
+addresses = ["203.0.113.2", "192.0.2.2"]
+prefixes = ["10.2.0.0/16"]
+key = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[site]]
+name = "dbn"
+id = 3
+role = "spoke"
+prefixes = ["10.3.0.0/16"]
+
+[[site]]
+name = "pta"
+id = 4
+role = "mesh"
+addresses = ["203.0.113.4"]
+prefixes = ["10.4.0.0/16"]
+key = "2222222222222222222222222222222222222222222222222222222222222222"
+"#;
+
+    #[test]
+    fn site_roles_decide_who_connects() {
+        use SiteRole::*;
+        let peers = |a: SiteRole, b: SiteRole| a.peers_with(b);
+        assert!(peers(Hub, Hub) && peers(Hub, Spoke) && peers(Hub, Mesh));
+        assert!(peers(Spoke, Hub) && !peers(Spoke, Spoke) && !peers(Spoke, Mesh));
+        assert!(peers(Mesh, Hub) && !peers(Mesh, Spoke) && peers(Mesh, Mesh));
+    }
+
+    #[test]
+    fn sites_become_tethers_and_routes() {
+        let c = parse(SITES_CFG).unwrap();
+        let o = c.overlay().unwrap();
+        // A spoke only connects to the hub: one tether per hub address.
+        let names: Vec<&str> = o.tethers.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["jhb-wan", "jhb-wan-2"]);
+        assert_eq!(o.sites, [2]);
+        assert!(o.tethers.iter().all(|t| t.key.is_some()));
+        // Every other site's networks are reachable through the hub.
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        let fib = c.fib(&ports).unwrap();
+        for dst in ["10.2.1.1", "10.3.1.1", "10.4.1.1"] {
+            assert_eq!(
+                fib.lookup(dst.parse().unwrap()),
+                Some(&NextHop::Site(0)),
+                "{dst} via the hub"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hub_learns_peers_without_addresses() {
+        // The same network seen from the hub.
+        let hub = SITES_CFG
+            .replace(
+                "site_id = 1\nname = \"cpt\"\nrole = \"spoke\"",
+                "site_id = 2\nname = \"jhb\"\nrole = \"hub\"",
+            )
+            .replace(
+                "name = \"jhb\"\nid = 2\nrole = \"hub\"",
+                "name = \"cpt\"\nid = 1\nrole = \"spoke\"",
+            );
+        let c = parse(&hub).unwrap();
+        let o = c.overlay().unwrap();
+        let t = |n: &str| o.tethers.iter().find(|t| t.name == n).unwrap();
+        // dbn has no address: learned. It also has no key, so it stays down.
+        assert!(t("dbn-wan").remote.is_unspecified() && t("dbn-wan").key.is_none());
+        assert_eq!(
+            t("pta-wan").remote,
+            "203.0.113.4".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(o.sites.len(), 3, "a hub connects to everyone");
+    }
+
+    #[test]
+    fn bad_sites_are_refused() {
+        let err =
+            |from: &str, to: &str| parse(&SITES_CFG.replace(from, to)).unwrap_err().to_string();
+        assert!(err("id = 3", "id = 1").contains("own site_id"));
+        assert!(err("id = 3", "id = 2").contains("same name or id"));
+        assert!(err("\"10.3.0.0/16\"", "\"10.3.0.0/33\"").contains("prefix"));
+        assert!(err("key = \"1111", "key = \"zz11").contains("key"));
+        assert!(err("addresses = [\"203.0.113.4\"]", "addresses = [\"nope\"]").contains("address"));
     }
 
     #[test]

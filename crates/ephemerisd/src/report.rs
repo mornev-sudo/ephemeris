@@ -3,7 +3,7 @@
 
 use eph_dataplane::nat::NatConfig;
 use eph_dataplane::overlay::{PathTable, TetherStats};
-use eph_dataplane::{Dir, Neighbor, NextHop, Port, Session, Stats};
+use eph_dataplane::{Dir, Neighbor, NextHop, Port, PortId, Session, Stats};
 use eph_fib::Fib;
 use std::fmt;
 use std::sync::Arc;
@@ -22,6 +22,8 @@ pub enum Control {
     SetPaths(Arc<PathTable>),
     /// New source-NAT rules (existing sessions keep their translation).
     SetNat(Arc<NatConfig>),
+    /// Send this frame out of `port` (DHCP replies and requests).
+    Transmit { port: PortId, frame: Vec<u8> },
 }
 
 /// AF_XDP socket counters kept by the kernel.

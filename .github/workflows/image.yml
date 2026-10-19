@@ -90,7 +90,7 @@ jobs:
       # production image: see ci/e2e.sh.
       - name: Test tools
         run: |
-          sudo apt-get install -y -qq iperf3 sshpass >/dev/null
+          sudo apt-get install -y -qq iperf3 sshpass dnsmasq-base busybox >/dev/null
           cd ci && npm install --no-save --silent playwright@1.48.2 && npx playwright install --with-deps chromium >/dev/null
 
       - name: End-to-end test

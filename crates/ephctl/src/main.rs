@@ -34,10 +34,17 @@ enum Cmd {
     },
     /// The ARP table.
     Neighbors,
+    /// DHCP: the addresses the router got, and the leases it handed out.
+    Dhcp,
     /// The forwarding table.
     Routes,
     /// SD-WAN: tethers, their measured health, and which path each class uses.
     Overlay,
+    /// SD-WAN sites and their shared keys.
+    Sdwan {
+        #[command(subcommand)]
+        cmd: SdwanCmd,
+    },
     /// Add or remove static routes (validated and committed immediately).
     Route {
         #[command(subcommand)]
@@ -74,6 +81,26 @@ enum SystemCmd {
         #[arg(long)]
         reset: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SdwanCmd {
+    /// This router and the other sites: role, direct or through a hub, key.
+    Sites,
+    /// Show the key shared with a site; --generate or --set replaces it
+    /// (committed; takes effect after `ephctl restart`).
+    Key {
+        site: String,
+        /// Replace it with a new random key.
+        #[arg(long, conflicts_with = "set")]
+        generate: bool,
+        /// Replace it with this one (64 hex characters, from the other router).
+        #[arg(long)]
+        set: Option<String>,
+    },
+    /// Print a [[site]] entry describing this router, with the key it shares
+    /// with SITE: paste it into SITE's configuration (`ephctl config edit`).
+    Entry { site: String },
 }
 
 #[derive(Subcommand)]
@@ -284,6 +311,71 @@ fn run(cli: Cli) -> Result<()> {
                 rows(&v, |x| vec![str(&x["ip"]), str(&x["mac"]), str(&x["port"])]),
             );
         }
+        Cmd::Dhcp => {
+            let v = c.get("/dhcp")?;
+            if json {
+                print(&v);
+                return Ok(());
+            }
+            let secs = |x: &Value| x.as_u64().map_or("-".into(), dur);
+            let o = |x: &Value| if x.is_null() { "-".into() } else { str(x) };
+            let clients = v["clients"].as_array().cloned().unwrap_or_default();
+            if !clients.is_empty() {
+                println!("Addresses the router got:");
+                table(
+                    &[
+                        "INTERFACE",
+                        "STATE",
+                        "ADDRESS",
+                        "GATEWAY",
+                        "DNS",
+                        "EXPIRES IN",
+                    ],
+                    clients
+                        .iter()
+                        .map(|x| {
+                            let dns: Vec<String> = x["dns"]
+                                .as_array()
+                                .map(|a| a.iter().map(str).collect())
+                                .unwrap_or_default();
+                            vec![
+                                str(&x["interface"]),
+                                str(&x["state"]),
+                                o(&x["address"]),
+                                o(&x["gateway"]),
+                                if dns.is_empty() {
+                                    "-".into()
+                                } else {
+                                    dns.join(",")
+                                },
+                                secs(&x["expires_in_secs"]),
+                            ]
+                        })
+                        .collect(),
+                );
+                println!();
+            }
+            let servers = v["servers"].as_array().cloned().unwrap_or_default();
+            if servers.is_empty() && clients.is_empty() {
+                println!("DHCP isn't used on any interface.");
+            }
+            for srv in servers {
+                println!("Leases on {}:", str(&srv["interface"]));
+                table(
+                    &["IP", "MAC", "HOST NAME", "STATE", "EXPIRES IN"],
+                    rows(&srv["leases"], |x| {
+                        vec![
+                            str(&x["ip"]),
+                            str(&x["mac"]),
+                            o(&x["hostname"]),
+                            str(&x["state"]),
+                            secs(&x["expires_in_secs"]),
+                        ]
+                    }),
+                );
+                println!();
+            }
+        }
         Cmd::Routes => {
             let v = c.get("/routes")?;
             if json {
@@ -352,6 +444,109 @@ fn run(cli: Cli) -> Result<()> {
                 }),
             );
         }
+        Cmd::Sdwan { cmd } => match cmd {
+            SdwanCmd::Sites => {
+                let v = c.get("/overlay/sites")?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                if let Some(me) = v["this"].as_object() {
+                    println!(
+                        "This router: {} (site {}, {})\n",
+                        str(&me["name"]),
+                        str(&me["id"]),
+                        str(&me["role"])
+                    );
+                }
+                table(
+                    &[
+                        "SITE",
+                        "ID",
+                        "ROLE",
+                        "CONNECTION",
+                        "KEY",
+                        "ADDRESSES",
+                        "TETHERS",
+                    ],
+                    rows(&v["sites"], |x| {
+                        let list = |k: &str| {
+                            x[k].as_array()
+                                .map(|a| a.iter().map(str).collect::<Vec<_>>().join(","))
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "-".into())
+                        };
+                        vec![
+                            str(&x["name"]),
+                            str(&x["id"]),
+                            str(&x["role"]),
+                            if x["connected"] == true {
+                                "direct"
+                            } else {
+                                "via hub"
+                            }
+                            .into(),
+                            match (x["connected"] == true, x["has_key"] == true) {
+                                (false, _) => "not needed",
+                                (true, true) => "set",
+                                (true, false) => "MISSING",
+                            }
+                            .into(),
+                            if x["addresses"].as_array().is_some_and(|a| a.is_empty()) {
+                                "learned".into()
+                            } else {
+                                list("addresses")
+                            },
+                            list("tethers"),
+                        ]
+                    }),
+                );
+            }
+            SdwanCmd::Key {
+                site,
+                generate,
+                set,
+            } => {
+                if !generate && set.is_none() {
+                    let v = c.get(&format!("/overlay/key?site={}", encode(&site)))?;
+                    match v["key"].as_str() {
+                        Some(k) => println!("{k}"),
+                        None => {
+                            bail!("site {site} has no key yet: ephctl sdwan key {site} --generate")
+                        }
+                    }
+                    return Ok(());
+                }
+                let mut body = serde_json::json!({ "site": site });
+                if let Some(k) = set {
+                    body["key"] = k.into();
+                }
+                let v = c.call(
+                    "POST",
+                    "/overlay/key",
+                    Some(("application/json", &body.to_string())),
+                )?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                println!("Key shared with {site}:\n{}\n", str(&v["key"]));
+                println!("Committed: {}.", describe(&v["applied"]));
+                println!("{site} needs the same key in its entry for this router: `ephctl sdwan entry {site}` prints that entry.");
+            }
+            SdwanCmd::Entry { site } => {
+                let v = c.get(&format!("/overlay/entry?site={}", encode(&site)))?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                println!("# Paste into {site}'s configuration (ephctl config edit on {site}):");
+                print!("{}", str(&v["toml"]));
+                if v["dynamic"] == true {
+                    println!("# This router has no fixed WAN address: {site} learns it, so {site} needs a fixed one.");
+                }
+            }
+        },
         Cmd::Route { cmd } => {
             let v = match cmd {
                 RouteCmd::Add { prefix, via } => {

@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 # The release version: the one place it is set. CI builds images named
 # <this>.<build number>, and a release tag must be v<this> (release.yml).
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
@@ -18,7 +18,7 @@ eph-xdp = { path = "crates/eph-xdp" }
 libc = "0.2"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = { version = "0.8", features = ["preserve_order"] }  # keep struct field order when the GUI rewrites a section
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

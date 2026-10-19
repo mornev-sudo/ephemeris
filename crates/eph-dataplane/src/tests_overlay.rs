@@ -33,6 +33,12 @@ fn router(site: u8) -> Pipeline {
 
 /// Router for `site` whose tethers use `key`.
 fn router_with_key(site: u8, key: Option<TetherKey>) -> Pipeline {
+    router_opts(site, key, false)
+}
+
+/// `dynamic`: this router doesn't know the other's WAN addresses; it learns
+/// them from the other's packets.
+fn router_opts(site: u8, key: Option<TetherKey>, dynamic: bool) -> Pipeline {
     let other = 3 - site;
     let lan = format!("10.{site}.0.1/24");
     let ports: Arc<[Port]> = Arc::new([
@@ -48,7 +54,11 @@ fn router_with_key(site: u8, key: Option<TetherKey>) -> Pipeline {
             id: 0,
             name: "fibre".into(),
             port: 1,
-            remote: ip(&format!("192.0.2.{other}")),
+            remote: if dynamic {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                ip(&format!("192.0.2.{other}"))
+            },
             gateway: None,
             peer_site: other as u16,
             site_idx: 0,
@@ -58,7 +68,11 @@ fn router_with_key(site: u8, key: Option<TetherKey>) -> Pipeline {
             id: 1,
             name: "lte".into(),
             port: 2,
-            remote: ip(&format!("198.51.100.{other}")),
+            remote: if dynamic {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                ip(&format!("198.51.100.{other}"))
+            },
             gateway: None,
             peer_site: other as u16,
             site_idx: 0,
@@ -117,6 +131,8 @@ fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
         allow_new_sessions: true,
         role: Role::Inside,
         mss_adjust: None,
+        dhcp: crate::config::Dhcp::Off,
+        gateway: None,
     }
 }
 
@@ -601,5 +617,54 @@ fn a_tether_inside_a_tether_is_rejected() {
     assert_eq!(
         drop_reason(r2.process(1, &mut f, OFF, len)),
         DropReason::BadOverlay
+    );
+}
+
+#[test]
+fn a_peer_without_a_fixed_address_is_learned_from_its_packets() {
+    // R2 (a hub) doesn't know R1's (a spoke's) WAN addresses.
+    let (mut r1, mut r2) = (router(1), router_opts(2, Some(KEY), true));
+    // Before R1 says anything, R2 has nowhere to send.
+    let (mut f, n) = packet(mac(2, 0), HOST_B, "10.2.0.10", "10.1.0.10", None, 8, true);
+    assert_eq!(
+        r2.process(0, &mut f, OFF, n),
+        Verdict::Drop(DropReason::NoPath)
+    );
+
+    // R1 sends over the fibre (from a NAT-like source port: R1 picks it).
+    let (mut f, n) = packet(mac(1, 0), HOST_A, "10.1.0.10", "10.2.0.10", None, 8, true);
+    let (_, off, len) = tx(r1.process(0, &mut f, OFF, n));
+    let sport = u16::from_be_bytes([f[off + 34], f[off + 35]]);
+    tx(r2.process(1, &mut f, off, len));
+
+    // Now R2 replies to exactly that address and port.
+    let (mut f, n) = packet(mac(2, 0), HOST_B, "10.2.0.10", "10.1.0.10", None, 8, true);
+    f[OFF + 34] = icmp::ECHO_REPLY;
+    let (port, off, len) = tx(r2.process(0, &mut f, OFF, n));
+    assert_eq!(port, 1);
+    let outer = ipv4::parse(&f[off + 14..off + len]).unwrap();
+    assert_eq!(outer.dst, ip("192.0.2.1"));
+    assert_eq!(u16::from_be_bytes([f[off + 36], f[off + 37]]), sport);
+    tx(r1.process(1, &mut f, off, len));
+
+    // Someone without the key can't redirect it: a forged packet claiming
+    // site 1 from another address is refused and changes nothing.
+    let (mut f, n) = packet(mac(1, 0), HOST_A, "10.1.0.10", "10.2.0.10", None, 8, true);
+    let (_, off, len) = tx(router_with_key(1, Some(TetherKey([9; 32]))).process(0, &mut f, OFF, n));
+    f[off + 14 + 12..off + 14 + 16].copy_from_slice(&[192, 0, 2, 99]);
+    let c = {
+        f[off + 14 + 10..off + 14 + 12].fill(0);
+        checksum::checksum(&f[off + 14..off + 34])
+    };
+    f[off + 14 + 10..off + 14 + 12].copy_from_slice(&c.to_be_bytes());
+    assert_eq!(
+        r2.process(1, &mut f, off, len),
+        Verdict::Drop(DropReason::OverlayAuth)
+    );
+    let (mut f, n) = packet(mac(2, 0), HOST_B, "10.2.0.10", "10.1.0.10", None, 8, true);
+    let (_, off, len) = tx(r2.process(0, &mut f, OFF, n));
+    assert_eq!(
+        ipv4::parse(&f[off + 14..off + len]).unwrap().dst,
+        ip("192.0.2.1")
     );
 }

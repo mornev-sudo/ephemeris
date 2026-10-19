@@ -65,6 +65,44 @@ pub const MAX_SENDER_WORKERS: usize = 256;
 pub const PROBE_INTERVAL_NS: u64 = 200_000_000;
 pub const DOWN_AFTER_NS: u64 = 1_000_000_000;
 
+/// Where tethers to peers without a fixed address send: learned from the
+/// peer's authenticated packets (its address and UDP port, so a peer behind
+/// NAT works too). One slot per tether, shared by all workers.
+pub struct Endpoints {
+    slots: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Endpoints {
+    const KNOWN: u64 = 1 << 48;
+
+    pub fn new(tethers: usize) -> Self {
+        Endpoints {
+            slots: (0..tethers)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    pub fn get(&self, tether: TetherId) -> Option<(Ipv4Addr, u16)> {
+        let v = self
+            .slots
+            .get(tether as usize)?
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (v & Self::KNOWN != 0).then(|| (Ipv4Addr::from((v >> 16) as u32), v as u16))
+    }
+
+    /// Remember where the peer was last heard from. Only ever called after
+    /// the packet was authenticated.
+    pub fn learn(&self, tether: TetherId, ip: Ipv4Addr, port: u16) {
+        if let Some(s) = self.slots.get(tether as usize) {
+            let v = Self::KNOWN | (u32::from(ip) as u64) << 16 | port as u64;
+            if s.load(std::sync::atomic::Ordering::Relaxed) != v {
+                s.store(v, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// One overlay path: a WAN interface plus the far router's WAN address.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tether {
@@ -72,7 +110,8 @@ pub struct Tether {
     pub name: String,
     /// The local WAN port it leaves from.
     pub port: PortId,
-    /// The far router's WAN address.
+    /// The far router's WAN address. Unspecified (0.0.0.0): the peer has no
+    /// fixed address; it's learned from the peer's packets ([`Endpoints`]).
     pub remote: Ipv4Addr,
     /// Underlay next hop, if the far end isn't on the same link.
     pub gateway: Option<Ipv4Addr>,

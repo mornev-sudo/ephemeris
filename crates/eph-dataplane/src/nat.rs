@@ -340,6 +340,8 @@ mod tests {
             allow_new_sessions: role == Role::Inside,
             role,
             mss_adjust: None,
+            dhcp: crate::config::Dhcp::Off,
+            gateway: None,
         }
     }
 

@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "eph-dataplane"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chacha20poly1305",
  "eph-fib",
@@ -276,22 +276,22 @@ dependencies = [
 
 [[package]]
 name = "eph-fib"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "eph-packet"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "eph-xdp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ephctl"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "ephemerisd"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -977,6 +977,7 @@ version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
+ "indexmap",
  "serde",
  "serde_spanned",
  "toml_datetime 0.6.11",

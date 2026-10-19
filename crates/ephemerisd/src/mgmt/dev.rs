@@ -44,6 +44,8 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         token: "dev".into(),
         auth,
         startup: Default::default(),
+        dhcp: Default::default(),
+        endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
         stop: &STOP,
     });
     println!("dev portal: http://127.0.0.1:8080/  (admin / dev)");

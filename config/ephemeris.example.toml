@@ -55,11 +55,24 @@ device = "ens19"
 address = "10.10.1.1/24"
 role = "inside"
 
+# Lease addresses to devices on this interface (see docs/learn/15-dhcp.md).
+# [interface.dhcp]
+# range = "10.10.1.100-10.10.1.199"
+# lease_secs = 86400            # one day
+# dns = ["1.1.1.1"]             # default: the DNS servers the WAN lease brings
+# domain = "home.arpa"
+#
+# [[interface.dhcp.reservation]]
+# mac = "52:54:00:12:34:56"
+# address = "10.10.1.10"
+# name = "nas"
+
 [[interface]]
 name = "wan"
 device = "ens20"
-address = "10.10.2.1/24"
+address = "10.10.2.1/24"       # or "dhcp": address, gateway and default route from the ISP
 role = "outside"
+# gateway = "10.10.2.254"      # the ISP's router (static address): SD-WAN tethers use it
 # allow_new_sessions = true   # override the role's default
 # TCP MSS adjust: SYNs through this interface announce at most this MSS,
 # so TCP segments fit a smaller link without fragmenting. 1452 suits PPPoE
@@ -87,3 +100,19 @@ masquerade = true
 # outbound = "wan"
 # translate = "pool"            # "interface", "pool" or "none"
 # pool = "public"
+
+# SD-WAN (see docs/learn/12-sdwan.md): this router's place in the network,
+# and every other router. Roles decide who builds tethers to whom: hubs
+# connect to everyone, spokes only to hubs, meshes to hubs and meshes.
+# [overlay]
+# site_id = 1
+# name = "cpt"
+# role = "spoke"
+#
+# [[site]]
+# name = "jhb"
+# id = 2
+# role = "hub"
+# addresses = ["203.0.113.2"]   # empty: learned from its packets (no fixed address)
+# prefixes = ["10.2.0.0/16"]
+# key = "<64 hex characters, the same on jhb: ephctl sdwan key jhb --generate>"

@@ -34,6 +34,8 @@ fn router(nat: NatConfig) -> Pipeline {
             allow_new_sessions: true,
             role: Role::Inside,
             mss_adjust: None,
+            dhcp: crate::config::Dhcp::Off,
+            gateway: None,
         },
         Port {
             id: 1,
@@ -44,6 +46,8 @@ fn router(nat: NatConfig) -> Pipeline {
             allow_new_sessions: false,
             role: Role::Outside,
             mss_adjust: None,
+            dhcp: crate::config::Dhcp::Off,
+            gateway: None,
         },
     ]);
     let routes = [StaticRoute {

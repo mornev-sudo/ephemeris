@@ -81,6 +81,9 @@ protocol. The **source port** is derived from a hash of the inner flow. That
 way, NICs with multiple queues (RSS) and routers along the path (ECMP) spread
 different flows across their queues and links, instead of seeing one giant
 flow. The hash is symmetric, so both directions of a flow use the same port.
+The exception: towards a peer whose address is *learned* (see
+Configuration), the source port is always the overlay port, because that
+peer may be behind a NAT that only lets replies in from the port it sent to.
 
 ## Measuring paths: probes
 
@@ -146,32 +149,96 @@ packet no longer fits in a 1500-byte WAN packet. Two mechanisms handle it:
   again). Both ends then never send segments that are too big, with no ICMP
   needed. Every SD-WAN box does this, because ICMP *is* often blocked.
 
-## Configuration
+## Configuration: sites and roles
+
+Each router describes its own place in the network (`[overlay]`) and lists
+every *other* router as a `[[site]]`. The admin gives each router a
+**role**, and the roles decide who builds tethers to whom:
+
+| | Hub | Spoke | Mesh |
+|---|---|---|---|
+| **Hub** | ✔ | ✔ | ✔ |
+| **Spoke** | ✔ | ✘ | ✘ |
+| **Mesh** | ✔ | ✘ | ✔ |
+
+- A **hub** connects to every site. Typically a head office or data centre
+  with a fixed address.
+- A **spoke** only connects to hubs. Typically a branch.
+- A **mesh** site connects to hubs and to other mesh sites, for sites that
+  talk to each other a lot and shouldn't detour through a hub.
+
+Two sites that don't connect directly still reach each other: their
+networks are routed **through the first hub**. Spoke A to spoke B goes
+A → hub → B, and the hub simply routes between its tethers.
+
+For every site this router connects to, a tether is created per outside
+interface and per address of that site, named `<site>-<interface>`:
 
 ```toml
+# On "cpt", a branch.
 [overlay]
 site_id = 1
+name = "cpt"
+role = "spoke"
 
-[[tether]]
-name = "fibre"
-interface = "wan1"
-remote = "192.0.2.2"      # the other router's address on that link
-site = 2
-# The same 64 hex characters on both routers, and on every tether to site 2.
-# Generate one with: openssl rand -hex 32. A tether without a key stays down.
-key = "<64 hex characters>"
+[[site]]
+name = "jhb"
+id = 2
+role = "hub"
+addresses = ["203.0.113.2", "192.0.2.2"]   # its WAN addresses: two tethers
+prefixes = ["10.2.0.0/16"]                 # the networks behind it
+key = "<64 hex characters>"                # shared by cpt and jhb only
 
-[[tether]]
-name = "lte"
-interface = "wan2"
-remote = "198.51.100.2"
-site = 2
-key = "<the same key>"
+[[site]]
+name = "dbn"                               # another branch: through jhb
+id = 3
+role = "spoke"
+prefixes = ["10.3.0.0/16"]
+```
 
-[[overlay_route]]
-prefix = "10.2.0.0/24"    # site 2's LAN
-site = 2
+### Keys
 
+Each pair of routers that builds tethers shares **its own** key (32 random
+bytes, 64 hex characters). A leaked key exposes one pair, not the network.
+Sites reached through a hub need no key: the hub's tethers carry them.
+
+- **Portal:** Configuration → SD-WAN. The key field has *Generate* (made in
+  your browser from the system's secure random source), *Show* and *Copy*.
+- **CLI:** `ephctl sdwan key jhb` shows it. `--generate` or `--set <hex>`
+  replaces it and commits.
+
+The other router needs the same key in its entry for *this* router. The
+SD-WAN tab's **Copy entry for its router** button, or
+`ephctl sdwan entry jhb`, prints a ready-made `[[site]]` block describing
+this router, with the shared key filled in. Paste it on the other side.
+Like any change to sites, it applies after a data-plane restart.
+
+### Peers without a fixed address
+
+A branch on a home or LTE connection usually gets its WAN address by DHCP
+(chapter 15), and it may change. Leave such a site's `addresses` empty.
+The hub then creates a tether that **learns** where the site is: when an
+authenticated packet arrives from that site, the hub remembers the source
+address *and port*, and sends there.
+
+- **Behind NAT:** because the port is learned, this works even when the
+  branch is behind NAT (a home router, carrier-grade NAT). The hub always
+  replies *from* its overlay port, and the branch accepts traffic from its
+  hub's overlay port, so the NAT lets the replies in.
+- **Keepalives:** the branch's probes, five a second, keep the NAT's
+  mapping alive.
+- **Security:** a packet that doesn't authenticate never moves the
+  endpoint, so without the key nobody can redirect a tether.
+- **The limit:** one side of each pair needs a fixed address. Two sites
+  that both learn would wait for each other forever.
+
+### Hand-written tethers and application classes
+
+`[[tether]]` and `[[overlay_route]]` still exist, for a tether that
+doesn't follow the roles or that needs an explicit underlay `gateway`.
+Application classes refer to tethers by name, generated or hand-written:
+
+```toml
 [[class]]
 name = "voice"
 protocol = "udp"
@@ -183,16 +250,19 @@ max_loss_pct = 1.0
 name = "bulk"
 protocol = "tcp"
 ports = "5201"
-prefer = ["lte", "fibre"] # keep the fibre free for interactive traffic
+prefer = ["jhb-wan2", "jhb-wan1"]   # keep the first link free
 ```
 
 Watch it:
 
 ```bash
+ephctl sdwan sites
 ephctl overlay
 ```
 
-The portal's **SD-WAN** tab shows the same information live.
+The portal's **SD-WAN** tab shows the same information live: sites and how
+they're reached, tethers with their measured health (and, for learned
+peers, where they were last heard from), and the path each class uses.
 
 ## How it's tested
 
@@ -217,10 +287,13 @@ The portal's **SD-WAN** tab shows the same information live.
   rotation. Also, right after a router restarts, a packet captured during
   the peer's *current* run can be replayed once if it's within the window
   of the first fresh packet. Older runs are always refused.
-- **Static configuration.** Tethers and remote prefixes are written by hand
-  on both routers. Next (4c): a central controller that hands out the site
-  topology and policies (the "SD" in SD-WAN), and FRR/BGP to learn routes
-  from the LAN side.
+- **Each router holds its own site list.** Roles and keys keep it short,
+  but every router is still configured on its own (with "Copy entry" to
+  help). Next (4c): a central controller that hands out the site topology
+  and policies (the "SD" in SD-WAN), and FRR/BGP to learn routes from the
+  LAN side.
+- **Site changes need a data-plane restart.** Adding a site or changing a
+  key rebuilds the tethers, which a restart does (a few seconds).
 - **No fragmentation.** Oversized packets without DF are dropped.
 - **One prober thread.** Probes always come from worker 0, which is fine
   until thousands of tethers.

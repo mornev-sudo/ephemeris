@@ -37,6 +37,8 @@ fn port(id: u16, addr: &str, subnet: &str, mss_adjust: Option<u16>) -> Port {
         allow_new_sessions: true,
         role: Role::Inside,
         mss_adjust,
+        dhcp: crate::config::Dhcp::Off,
+        gateway: None,
     }
 }
 

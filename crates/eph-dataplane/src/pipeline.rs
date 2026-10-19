@@ -1,8 +1,8 @@
-use crate::config::{NextHop, Port, PortId, Role};
+use crate::config::{Dhcp, NextHop, Port, PortId, Role};
 use crate::filter;
 use crate::nat::{self, NatConfig};
 use crate::overlay::{
-    self, Overlay, PathTable, ReplayGuard, TetherId, TetherStats, OUTER_LEN, TAG_LEN,
+    self, Endpoints, Overlay, PathTable, ReplayGuard, TetherId, TetherStats, OUTER_LEN, TAG_LEN,
 };
 use crate::session::{
     Dir, FlowKey, NatBinding, SessionConfig, SessionTable, TcpSegment, Track, OVERLAY_INGRESS,
@@ -43,6 +43,15 @@ pub struct Emit {
     pub frame: [u8; EMIT_MAX],
 }
 
+/// A packet for the control plane (DHCP), copied out of the frame. Rare, so
+/// it may allocate.
+#[derive(Debug, Clone)]
+pub struct Punt {
+    pub port: PortId,
+    /// The whole Ethernet frame.
+    pub frame: Vec<u8>,
+}
+
 /// A learned IP → MAC binding on a port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Neighbor {
@@ -74,6 +83,9 @@ const ICMP_TOKEN_NS: u64 = 1_000_000_000 / ICMP_RATE_PER_SEC;
 const LOCAL_TTL: u8 = 64;
 
 const ETH: usize = eth::HDR_LEN;
+/// Control-plane packets queued per batch at most (a DHCP flood can't eat
+/// memory; the worker drains them every loop).
+const PUNT_MAX: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 struct NeighborEntry {
@@ -111,6 +123,8 @@ pub struct Pipeline {
     tx_counter: u64,
     /// Received counters, shared by all workers.
     replay: Arc<ReplayGuard>,
+    /// Learned addresses of peers without a fixed one, shared by all workers.
+    endpoints: Arc<Endpoints>,
     next_probe_ns: u64,
     probe_seq: u32,
     sessions: SessionTable,
@@ -130,6 +144,8 @@ pub struct Pipeline {
     /// Neighbours learned during `process` calls; the worker broadcasts these
     /// to its siblings, which feed them to [`Pipeline::learn`].
     pub learned: Vec<Neighbor>,
+    /// Packets for the control plane (DHCP); the worker forwards these.
+    pub punts: Vec<Punt>,
 }
 
 impl Pipeline {
@@ -140,6 +156,7 @@ impl Pipeline {
         overlay: Arc<Overlay>,
     ) -> Self {
         let replay = Arc::new(ReplayGuard::new(overlay.sites.len()));
+        let endpoints = Arc::new(Endpoints::new(overlay.tethers.len()));
         Pipeline {
             ports,
             fib,
@@ -154,6 +171,7 @@ impl Pipeline {
             overlay_run: 0,
             tx_counter: 0,
             replay,
+            endpoints,
             next_probe_ns: 0,
             probe_seq: 0,
             sessions: SessionTable::new(sessions),
@@ -169,6 +187,7 @@ impl Pipeline {
             stats: Stats::default(),
             emits: Vec::with_capacity(64),
             learned: Vec::with_capacity(16),
+            punts: Vec::new(),
         }
     }
 
@@ -206,6 +225,10 @@ impl Pipeline {
 
     /// Swap in a new port table (addresses, session policy). The ports must be
     /// the same interfaces in the same order; neighbours and sessions stay.
+    pub fn ports(&self) -> &Arc<[Port]> {
+        &self.ports
+    }
+
     pub fn set_ports(&mut self, ports: Arc<[Port]>) {
         debug_assert_eq!(ports.len(), self.ports.len());
         self.ports = ports;
@@ -232,6 +255,11 @@ impl Pipeline {
         self.overlay_run = run;
         self.tx_counter = 0;
         self.replay = replay;
+    }
+
+    /// Share one learned-endpoints table between all workers.
+    pub fn set_endpoints(&mut self, endpoints: Arc<Endpoints>) {
+        self.endpoints = endpoints;
     }
 
     pub fn set_worker(&mut self, id: u16, count: u16) {
@@ -354,6 +382,20 @@ impl Pipeline {
             eth::TYPE_VLAN => Verdict::Drop(DropReason::Vlan),
             _ => Verdict::Drop(DropReason::UnsupportedEthertype),
         }
+    }
+
+    /// UDP to the DHCP server port on a serving port, or to the client port
+    /// on a port that gets its address by DHCP.
+    fn is_dhcp(&self, ingress: PortId, ip: &[u8], h: &ipv4::Header) -> bool {
+        let want = match self.ports[ingress as usize].dhcp {
+            Dhcp::Off => return false,
+            Dhcp::Server => eph_packet::dhcp::SERVER_PORT,
+            Dhcp::Client => eph_packet::dhcp::CLIENT_PORT,
+        };
+        h.proto == ipv4::PROTO_UDP
+            && !ipv4::is_fragment(ip)
+            && ip.len() >= h.hdr_len + 4
+            && u16::from_be_bytes([ip[h.hdr_len + 2], ip[h.hdr_len + 3]]) == want
     }
 
     // ---------------------------------------------------------------- ARP
@@ -488,6 +530,18 @@ impl Pipeline {
         };
         // Trim Ethernet padding: from here on the frame is exactly the packet.
         let len = ETH + h.total_len;
+        // DHCP on a port where the router serves or requests leases goes to
+        // the control plane, before any checks: a client asking for an
+        // address has none yet (source 0.0.0.0, destination broadcast).
+        if via.is_none() && self.is_dhcp(ingress, &frame[off + ETH..off + len], &h) {
+            if self.punts.len() < PUNT_MAX {
+                self.punts.push(Punt {
+                    port: ingress,
+                    frame: frame[off..off + len].to_vec(),
+                });
+            }
+            return Verdict::Drop(DropReason::DhcpToControl);
+        }
         if let Err(r) = filter::check(&frame[off + ETH..off + len], &h, &self.ports, &self.nat) {
             return Verdict::Drop(r);
         }
@@ -898,6 +952,25 @@ impl Pipeline {
             .min()
     }
 
+    /// Is this UDP datagram tether traffic? Either to our overlay port, or
+    /// from a peer's overlay port: a peer that learned our address (we have
+    /// no fixed one, e.g. behind NAT) replies to whichever port we sent
+    /// from, and from its overlay port, so a NAT along the way lets it in.
+    fn is_overlay(&self, ingress: PortId, src: Ipv4Addr, udp: &[u8]) -> bool {
+        let (sport, dport) = (
+            u16::from_be_bytes([udp[0], udp[1]]),
+            u16::from_be_bytes([udp[2], udp[3]]),
+        );
+        let port = self.overlay.udp_port;
+        dport == port
+            || (sport == port
+                && self
+                    .overlay
+                    .tethers
+                    .iter()
+                    .any(|t| t.port == ingress && t.remote == src))
+    }
+
     /// Packets addressed to the router: ping, and overlay tether traffic.
     /// Everything else will later be punted to the control plane.
     fn local(
@@ -913,7 +986,7 @@ impl Pipeline {
         if h.proto == ipv4::PROTO_UDP
             && self.overlay.enabled()
             && len >= ETH + h.hdr_len + l4::UDP_HDR_LEN
-            && u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]]) == self.overlay.udp_port
+            && self.is_overlay(ingress, h.src, &frame[l4..l4 + 4])
         {
             // A tether packet inside a tether packet is never legitimate.
             if via.is_some() {
@@ -1133,9 +1206,9 @@ impl Pipeline {
         if new_off + OUTER_LEN + inner + TAG_LEN > frame.len() {
             return Verdict::Drop(DropReason::TooBig);
         }
-        let t = &self.overlay.tethers[tether as usize];
-        let (port, remote) = (t.port, t.remote);
-        let neighbor_ip = t.gateway.unwrap_or(remote);
+        let Some((port, remote, dport, neighbor_ip)) = self.tether_dest(tether) else {
+            return Verdict::Drop(DropReason::NoPath); // peer not heard from yet
+        };
         let Some(mac) = self.neighbor(port, neighbor_ip) else {
             self.resolve(port, neighbor_ip);
             return Verdict::Drop(DropReason::NeighborMiss);
@@ -1143,9 +1216,18 @@ impl Pipeline {
         // Vary the outer source port by flow, so multi-queue NICs and ECMP
         // routers along the path spread tethers traffic like normal traffic.
         // The hash is symmetric: both directions of a flow get the same port.
-        let sport = 49152
-            | (flow_hash(&frame[new_off + OUTER_LEN..new_off + OUTER_LEN + inner]) & 0x3fff) as u16;
-        let dport = self.overlay.udp_port;
+        // ...except towards a peer whose address we learned: it may be behind
+        // NAT, which only lets replies in from the port it sent to.
+        let sport = if self.overlay.tethers[tether as usize]
+            .remote
+            .is_unspecified()
+        {
+            self.overlay.udp_port
+        } else {
+            49152
+                | (flow_hash(&frame[new_off + OUTER_LEN..new_off + OUTER_LEN + inner]) & 0x3fff)
+                    as u16
+        };
         let Some(total) = self.write_outer(
             &mut frame[new_off..],
             port,
@@ -1167,6 +1249,26 @@ impl Pipeline {
             off: new_off,
             len: total,
         }
+    }
+
+    /// Where a tether's packets go: (port, remote address, remote UDP port,
+    /// next hop to ARP for). `None` for a peer without a fixed address that
+    /// hasn't been heard from yet.
+    fn tether_dest(&self, tether: TetherId) -> Option<(PortId, Ipv4Addr, u16, Ipv4Addr)> {
+        let t = &self.overlay.tethers[tether as usize];
+        let (remote, dport) = if t.remote.is_unspecified() {
+            self.endpoints.get(tether)?
+        } else {
+            (t.remote, self.overlay.udp_port)
+        };
+        let p = &self.ports[t.port as usize];
+        // Explicit gateway; else the peer itself if it's on this link; else
+        // the link's gateway (configured, or from DHCP).
+        let next_hop = t
+            .gateway
+            .or_else(|| (!p.subnet.contains(remote)).then_some(p.gateway).flatten())
+            .unwrap_or(remote);
+        Some((t.port, remote, dport, next_hop))
     }
 
     /// Write Ethernet + IPv4 + UDP + Ephemeris headers at the start of `buf`,
@@ -1239,14 +1341,26 @@ impl Pipeline {
         if h.hdr_len != ipv4::MIN_HDR_LEN || len < OUTER_LEN + TAG_LEN {
             return Verdict::Drop(DropReason::BadOverlay);
         }
-        let Some(tether) = self
-            .overlay
-            .tethers
+        // Which tether: the one to this sender's address, or else the one
+        // to a peer without a fixed address whose site id the header claims
+        // (the claim is checked when the packet is authenticated below).
+        let claimed = u16::from_be_bytes([
+            frame[off + OUTER_LEN - overlay::HDR_LEN + 2],
+            frame[off + OUTER_LEN - overlay::HDR_LEN + 3],
+        ]);
+        let tethers = &self.overlay.tethers;
+        let Some(tether) = tethers
             .iter()
             .position(|t| t.port == ingress && t.remote == h.src)
+            .or_else(|| {
+                tethers.iter().position(|t| {
+                    t.port == ingress && t.remote.is_unspecified() && t.peer_site == claimed
+                })
+            })
         else {
             return Verdict::Drop(DropReason::UnknownTether);
         };
+        let dynamic = tethers[tether].remote.is_unspecified();
         let t = &self.overlay.tethers[tether];
         let (peer_site, site_idx) = (t.peer_site, t.site_idx);
         let Some(key) = t.key else {
@@ -1270,6 +1384,12 @@ impl Pipeline {
             return Verdict::Drop(DropReason::OverlayReplay);
         }
         let tid = tether as TetherId;
+        if dynamic {
+            // Authentic and fresh: the peer is (now) at this address/port.
+            let u = off + ETH + ipv4::MIN_HDR_LEN;
+            let sport = u16::from_be_bytes([frame[u], frame[u + 1]]);
+            self.endpoints.learn(tid, h.src, sport);
+        }
         let inner = body.len();
         match typ {
             overlay::TYPE_DATA => {
@@ -1328,8 +1448,9 @@ impl Pipeline {
             if t.key.is_none() {
                 continue; // no key: the tether stays down
             }
-            let (port, remote) = (t.port, t.remote);
-            let neighbor_ip = t.gateway.unwrap_or(remote);
+            let Some((port, remote, dport, neighbor_ip)) = self.tether_dest(i as TetherId) else {
+                continue; // peer not heard from yet: it will probe us
+            };
             let Some(mac) = self.neighbor(port, neighbor_ip) else {
                 self.resolve(port, neighbor_ip);
                 continue;
@@ -1347,7 +1468,7 @@ impl Pipeline {
                 port,
                 remote,
                 mac,
-                (udp, udp),
+                (udp, dport),
                 overlay::TYPE_PROBE,
                 0,
                 i as TetherId,

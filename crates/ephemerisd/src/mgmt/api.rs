@@ -9,6 +9,7 @@
 //! | GET    | /status                   | ports, counters, drops, session totals      |
 //! | GET    | /sessions?limit=N         | live sessions, busiest first                |
 //! | GET    | /neighbors                | ARP table                                   |
+//! | GET    | /dhcp                     | DHCP: the router's own leases, leases given |
 //! | GET    | /routes                   | forwarding table                            |
 //! | POST   | /routes  {prefix, via}    | add/replace a static route (commits)        |
 //! | DELETE | /routes?prefix=P          | remove a static route (commits)             |
@@ -23,6 +24,10 @@
 //! | GET    | /config/history           | saved versions                              |
 //! | POST   | /restart                  | restart ephemerisd (systemd brings it back)   |
 //! | GET    | /overlay                  | SD-WAN tethers, health, path decisions      |
+//! | GET    | /overlay/sites            | this router and its configured peer sites   |
+//! | GET    | /overlay/key?site=S       | the key shared with site S                  |
+//! | POST   | /overlay/key {site, key?} | set (or, without key, generate) it; commits |
+//! | GET    | /overlay/entry?site=S     | [[site]] entry describing this router, for S|
 //! | GET    | /system                   | build, update job state                     |
 //! | POST   | /system/update/check      | list installed + available versions         |
 //! | POST   | /system/update            | install newest version into inactive slot   |
@@ -96,6 +101,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/status", get(status))
         .route("/sessions", get(sessions))
         .route("/neighbors", get(neighbors))
+        .route("/dhcp", get(dhcp_status))
         .route("/routes", get(routes).post(add_route).delete(del_route))
         .route("/config", get(config))
         .route(
@@ -109,6 +115,9 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/config/history", get(history))
         .route("/restart", post(restart))
         .route("/overlay", get(overlay))
+        .route("/overlay/sites", get(overlay_sites))
+        .route("/overlay/key", get(site_key).post(set_site_key))
+        .route("/overlay/entry", get(site_entry))
         .route("/system", get(system))
         .route("/system/update/check", post(update_check))
         .route("/system/update", post(update_start))
@@ -617,6 +626,75 @@ async fn neighbors(State(s): St) -> Json<Value> {
     Json(Value::Array(out))
 }
 
+/// DHCP: what each DHCP-client interface holds, and what each served LAN
+/// has handed out. Times are seconds from now.
+async fn dhcp_status(State(s): St) -> Json<Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut st = s.dhcp.lock().unwrap().clone();
+    // Interfaces the configuration puts on DHCP, even before the service
+    // has anything to report (or when the data plane isn't running).
+    let cfg = s.config.lock().unwrap().running().clone();
+    for i in &cfg.interfaces {
+        if i.is_dhcp_client() {
+            st.clients
+                .entry(i.name.clone())
+                .or_insert(crate::dhcp::ClientStatus {
+                    phase: crate::dhcp::client::Phase::Init,
+                    lease: None,
+                });
+        } else if i.dhcp.is_some() {
+            st.leases.entry(i.name.clone()).or_default();
+        }
+    }
+    let mut clients: Vec<Value> = st
+        .clients
+        .iter()
+        .map(|(name, c)| {
+            let l = c.lease.as_ref();
+            json!({
+                "interface": name,
+                "state": c.phase,
+                "address": l.map(|l| format!("{}/{}", l.addr, l.prefix_len)),
+                "gateway": l.and_then(|l| l.router).map(|r| r.to_string()),
+                "dns": l.map(|l| l.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
+                "server": l.map(|l| l.server.to_string()),
+                "expires_in_secs": l.map(|l| l.expires_unix().saturating_sub(now)),
+            })
+        })
+        .collect();
+    clients.sort_by(|a, b| a["interface"].as_str().cmp(&b["interface"].as_str()));
+    let mut servers: Vec<Value> = st
+        .leases
+        .iter()
+        .map(|(name, leases)| {
+            let mut ls: Vec<Value> = leases
+                .iter()
+                .map(|l| {
+                    json!({
+                        "mac": eth::fmt_mac(&l.mac), "ip": l.ip.to_string(),
+                        "hostname": l.hostname, "state": l.state,
+                        "expires_in_secs": l.expires_unix.saturating_sub(now),
+                    })
+                })
+                .collect();
+            ls.sort_by_key(|l| {
+                l["ip"]
+                    .as_str()
+                    .unwrap_or("")
+                    .parse::<std::net::Ipv4Addr>()
+                    .map(u32::from)
+                    .unwrap_or(0)
+            });
+            json!({ "interface": name, "leases": ls })
+        })
+        .collect();
+    servers.sort_by(|a, b| a["interface"].as_str().cmp(&b["interface"].as_str()));
+    Json(json!({ "clients": clients, "servers": servers }))
+}
+
 async fn routes(State(s): St) -> Json<Value> {
     let ports = s.ports.read().unwrap().clone();
     let fib = s.fib.read().unwrap().clone();
@@ -655,7 +733,15 @@ async fn overlay(State(s): St) -> Json<Value> {
             let st = sum.tethers.get(t.id as usize).copied().unwrap_or_default();
             json!({
                 "name": t.name, "interface": ports[t.port as usize].name,
-                "remote": t.remote.to_string(), "site": t.peer_site,
+                // A peer without a fixed address: where it was last heard
+                // from, if it has been.
+                "remote": if t.remote.is_unspecified() {
+                    s.endpoints.get(t.id).map(|(ip, port)| format!("{ip}:{port} (learned)"))
+                        .unwrap_or_else(|| "waiting to hear from it".into())
+                } else {
+                    t.remote.to_string()
+                },
+                "site": t.peer_site,
                 "encrypted": t.key.is_some(),
                 "up": h.up,
                 "rtt_ms": h.rtt_ns as f64 / 1e6, "jitter_ms": h.jitter_ns as f64 / 1e6,
@@ -684,6 +770,141 @@ async fn overlay(State(s): St) -> Json<Value> {
         "tethers": tethers,
         "paths": choices,
     }))
+}
+
+/// This router as other sites should know it: its name, id and role, its
+/// fixed WAN addresses (DHCP ones are left out: peers learn those) and the
+/// networks behind it.
+fn this_site(s: &Shared, cfg: &crate::config::Config) -> Option<crate::config::SiteCfg> {
+    let o = cfg.overlay.as_ref()?;
+    let ports = s.ports.read().unwrap().clone();
+    let mut addresses = vec![];
+    let mut prefixes = vec![];
+    for (i, p) in cfg.interfaces.iter().zip(ports.iter()) {
+        match i.role {
+            crate::config::RoleCfg::Outside if !i.is_dhcp_client() => {
+                addresses.push(p.addr.to_string())
+            }
+            crate::config::RoleCfg::Inside => prefixes.push(p.subnet.to_string()),
+            _ => {}
+        }
+    }
+    let name = o.name.clone().unwrap_or_else(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .map(|h| h.trim().to_string())
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| format!("site{}", o.site_id))
+    });
+    Some(crate::config::SiteCfg {
+        name,
+        id: o.site_id,
+        role: o.role,
+        addresses,
+        prefixes,
+        key: None,
+    })
+}
+
+/// The configured sites, with whether this router connects to each.
+async fn overlay_sites(State(s): St) -> ApiResult {
+    let cfg = s.config.lock().unwrap().running().clone();
+    let tethers = cfg.site_tethers()?;
+    let me = this_site(&s, &cfg);
+    let role = cfg.overlay.as_ref().map(|o| o.role).unwrap_or_default();
+    let sites: Vec<Value> = cfg
+        .sites
+        .iter()
+        .map(|x| {
+            json!({
+                "name": x.name, "id": x.id, "role": x.role,
+                "addresses": x.addresses, "prefixes": x.prefixes,
+                "has_key": x.key.is_some(),
+                "connected": role.peers_with(x.role),
+                "tethers": tethers.iter().filter(|t| t.site == x.id).map(|t| t.name.clone()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "this": me, "sites": sites })))
+}
+
+#[derive(Deserialize)]
+struct SiteQuery {
+    site: String,
+}
+
+async fn site_key(State(s): St, Query(q): Query<SiteQuery>) -> ApiResult {
+    let cfg = s.config.lock().unwrap();
+    let site = cfg
+        .running()
+        .sites
+        .iter()
+        .find(|x| x.name == q.site)
+        .ok_or_else(|| anyhow::anyhow!("no site named {:?}", q.site))?;
+    Ok(Json(json!({ "site": site.name, "key": site.key })))
+}
+
+#[derive(Deserialize)]
+struct SetKeyReq {
+    site: String,
+    /// 64 hex characters; omitted: generate a new random key.
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// Set or generate the key shared with a site, and commit. The other
+/// router needs the same key (see /overlay/entry).
+async fn set_site_key(State(s): St, Json(r): Json<SetKeyReq>) -> ApiResult {
+    let key = match r.key {
+        Some(k) => k.trim().to_ascii_lowercase(),
+        None => super::auth::random_hex(32)?,
+    };
+    let c = {
+        let mut cfg = s.config.lock().unwrap();
+        if cfg.candidate_text().is_some() {
+            return Err(
+                anyhow::anyhow!("there are staged changes: commit or discard them first").into(),
+            );
+        }
+        let mut model = cfg.running().clone();
+        let site = model
+            .sites
+            .iter_mut()
+            .find(|x| x.name == r.site)
+            .ok_or_else(|| anyhow::anyhow!("no site named {:?}", r.site))?;
+        site.key = Some(key.clone());
+        let text = cfg.text_from_model(&model)?;
+        cfg.set_candidate(text)?;
+        cfg.commit(None)?
+    };
+    let mut out = finish_commit(&s, c, None)?;
+    out.0["key"] = json!(key);
+    Ok(out)
+}
+
+/// A `[[site]]` entry describing this router, with the key shared with
+/// `site`: paste it into that router's configuration.
+async fn site_entry(State(s): St, Query(q): Query<SiteQuery>) -> ApiResult {
+    let cfg = s.config.lock().unwrap().running().clone();
+    let peer = cfg
+        .sites
+        .iter()
+        .find(|x| x.name == q.site)
+        .ok_or_else(|| anyhow::anyhow!("no site named {:?}", q.site))?;
+    let mut me = this_site(&s, &cfg)
+        .ok_or_else(|| anyhow::anyhow!("SD-WAN isn't configured ([overlay])"))?;
+    me.key = peer.key.clone();
+    #[derive(serde::Serialize)]
+    struct Entry {
+        site: Vec<crate::config::SiteCfg>,
+    }
+    let text = toml::to_string(&Entry {
+        site: vec![me.clone()],
+    })
+    .map_err(anyhow::Error::from)?;
+    Ok(Json(
+        json!({ "toml": text, "entry": me, "dynamic": me.addresses.is_empty() }),
+    ))
 }
 
 async fn config(State(s): St) -> Json<Value> {
@@ -1034,6 +1255,8 @@ address = "10.10.2.1/24"
             token: "secret".into(),
             auth: crate::mgmt::auth::Auth::new(&dir),
             startup: Default::default(),
+            dhcp: Default::default(),
+            endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
             stop: &STOP,
         };
         (Arc::new(s), rx)

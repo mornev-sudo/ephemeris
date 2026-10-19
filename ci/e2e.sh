@@ -10,6 +10,9 @@
 #                                                             ├─ router VM ─ enp0s18 (QEMU user net: SSH 2222, HTTPS 8443)
 #   [netns ci-hb] 10.10.2.10 ─ veth ─ bridge ─ tap ─ enp0s20 ┘
 #
+# lan-a serves DHCP; lan-b gets its own address by DHCP from a dnsmasq in
+# ci-hb (always 10.10.2.1, reserved for its MAC; no gateway, one DNS server).
+#
 # usage: sudo ci/e2e.sh <image.qcow2> <expected-version> [<update-dir> <update-version>]
 set -euo pipefail
 
@@ -21,11 +24,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=$(mktemp -d)
 LOGS=${LOGS:-$PWD/e2e-logs}
 mkdir -p "$LOGS"
-QEMU_PID= HTTP_PID=
+QEMU_PID= HTTP_PID= DNSMASQ_PID=
 
 cleanup() {
     [[ -n $QEMU_PID ]] && kill "$QEMU_PID" 2>/dev/null || true
     [[ -n $HTTP_PID ]] && kill "$HTTP_PID" 2>/dev/null || true
+    [[ -n $DNSMASQ_PID ]] && kill "$DNSMASQ_PID" 2>/dev/null || true
     ip netns del ci-ha 2>/dev/null || true
     ip netns del ci-hb 2>/dev/null || true
     for l in ephtap-a ephtap-b ephbr-a ephbr-b; do ip link del "$l" 2>/dev/null || true; done
@@ -49,12 +53,16 @@ name = "lan-a"
 device = "enp0s19"
 address = "10.10.1.1/24"
 
+# No DNS servers here: hand out the ones lan-b's lease brings.
+[interface.dhcp]
+range = "10.10.1.100-10.10.1.110"
+
 # lan-b plays the internet: outside role, so it only lets replies in and
-# traffic towards it is source-NATed to 10.10.2.1.
+# traffic towards it is source-NATed to its address, which comes from DHCP.
 [[interface]]
 name = "lan-b"
 device = "enp0s20"
-address = "10.10.2.1/24"
+address = "dhcp"
 role = "outside"
 CFG
 # QEMU puts the NICs on the root PCI bus, so they're named enp0s18..20
@@ -78,7 +86,7 @@ qemu-system-x86_64 \
     -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8443-:8443 \
     -device virtio-net-pci,netdev=mgmt,addr=0x12 \
     -netdev tap,id=lana,ifname=ephtap-a,script=no,downscript=no -device virtio-net-pci,netdev=lana,addr=0x13 \
-    -netdev tap,id=lanb,ifname=ephtap-b,script=no,downscript=no -device virtio-net-pci,netdev=lanb,addr=0x14 \
+    -netdev tap,id=lanb,ifname=ephtap-b,script=no,downscript=no -device virtio-net-pci,netdev=lanb,addr=0x14,mac=52:54:00:12:34:58 \
     -smbios type=11,value=io.systemd.credential:system.hostname=ci-router \
     -smbios type=11,value=io.systemd.credential.binary:ephemeris.admin_password_hash=$(b64 "$WORK/hash") \
     -smbios type=11,value=io.systemd.credential.binary:ssh.authorized_keys.root=$(b64 "$WORK/key.pub") \
@@ -107,6 +115,15 @@ host() { # ns tap bridge address gateway
 }
 host ci-ha ephtap-a ephbr-a 10.10.1.10/24 10.10.1.1
 host ci-hb ephtap-b ephbr-b 10.10.2.10/24 10.10.2.1
+
+# The "ISP" DHCP server for lan-b: the router always gets 10.10.2.1, no
+# default gateway (the forwarding tests expect none), DNS 10.10.2.53.
+ip netns exec ci-hb dnsmasq --keep-in-foreground --no-resolv --port=0 --user=root \
+    --interface=eth0 --bind-interfaces --dhcp-authoritative \
+    --dhcp-range=10.10.2.100,10.10.2.200,255.255.255.0,1h \
+    --dhcp-host=52:54:00:12:34:58,10.10.2.1 --dhcp-option=3 --dhcp-option=6,10.10.2.53 \
+    --dhcp-leasefile="$WORK/dnsmasq.leases" --log-dhcp --log-facility="$LOGS/dnsmasq.log" &
+DNSMASQ_PID=$!
 
 if [[ -n $UPDATE_DIR ]]; then
     (cd "$UPDATE_DIR" && exec python3 -m http.server 8000 --bind 0.0.0.0 > "$LOGS/http.log" 2>&1) &
@@ -164,6 +181,19 @@ check "config file is private"             sh -c "[ \"\$(${SSH[*]} stat -c %a /v
 check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="$PASSWORD" SHOTS="$LOGS" node "$HERE/portal-test.mjs"
 
 # ------------------------------------------------------------ forwarding
+echo "DHCP:"
+check "lan-b gets its address by DHCP"     wait_for 90 "a lease on lan-b" on_router "ephctl dhcp | grep 'lan-b' | grep 'bound' | grep -q '10.10.2.1/24'"
+check "DNS server learned from the lease"  sh -c "${SSH[*]} ephctl --json dhcp | grep -q 10.10.2.53"
+# A LAN host asks for an address; the script only records what it was told
+# (ci-ha keeps its static address for the tests below).
+printf '#!/bin/sh\n[ "$1" = bound ] && echo "$ip $router $dns" > %s/lease\nexit 0\n' "$WORK" > "$WORK/udhcpc.sh"
+chmod +x "$WORK/udhcpc.sh"
+MAC_A=$(ip netns exec ci-ha cat /sys/class/net/eth0/address)
+check "a LAN host gets a lease"            ip netns exec ci-ha busybox udhcpc -i eth0 -n -q -t 5 -T 2 -s "$WORK/udhcpc.sh"
+check "from the range, via the router, with learned DNS" \
+                                           grep -qE '^10\.10\.1\.1(0[0-9]|10) 10\.10\.1\.1 10\.10\.2\.53$' "$WORK/lease"
+check "the lease is listed on the router"  sh -c "${SSH[*]} ephctl dhcp | grep -qi '$MAC_A'"
+
 echo "Forwarding:"
 ip netns exec ci-ha ping -c1 -W1 10.10.2.10 >/dev/null 2>&1 || true   # first packet resolves ARP
 check "ping the router"                    ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.1.1
@@ -195,7 +225,8 @@ check "live route delete"                  sh -c "${SSH[*]} ephctl route del 0.0
 on_router 'cp /var/lib/ephemeris/ephemeris.toml /run/good.toml && sed -i s/enp0s20/enp0s99/ /var/lib/ephemeris/ephemeris.toml && systemctl restart ephemerisd' || true
 check "bad config falls back by itself"    wait_for 60 "the fallback" on_router "ephctl status | grep -q 'newer config failed'"
 check "last good config restored"          on_router "cmp -s /var/lib/ephemeris/ephemeris.toml /run/good.toml && ls /var/lib/ephemeris/ephemeris.toml.failed-*"
-check "forwarding again after the fallback" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+# (The restart means lan-b asks for its lease again: allow it a moment.)
+check "forwarding again after the fallback" wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
 
 # ------------------------------------------------------------ updates
 if [[ -n $UPDATE_DIR ]]; then
@@ -212,7 +243,7 @@ if [[ -n $UPDATE_DIR ]]; then
     check "runs $UPDATE_VERSION"           wait_for 30 "new version" sh -c "[ \"\$(${SSH[*]} cat /usr/lib/ephemeris/version)\" = '$UPDATE_VERSION' ]"
     check "new version blessed"            wait_for 120 "boot counter removed" sh -c "${SSH[*]} 'ls \$(bootctl --print-esp-path)/EFI/Linux' | grep -q '_${UPDATE_VERSION}_x86-64.efi\$'"
     check "config and password survive"    sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 grep -q lan-b /var/lib/ephemeris/ephemeris.toml
-    check "still forwarding"               ip netns exec ci-ha ping -c3 -i0.2 -W2 10.10.2.10
+    check "still forwarding"               wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W2 10.10.2.10
 fi
 
 on_router journalctl -b --no-pager > "$LOGS/journal.log" 2>&1 || true

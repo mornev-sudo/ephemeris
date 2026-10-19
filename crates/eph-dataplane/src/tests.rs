@@ -37,6 +37,8 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             allow_new_sessions: true,
             role: Role::Inside,
             mss_adjust: None,
+            dhcp: crate::config::Dhcp::Off,
+            gateway: None,
         },
         Port {
             id: 1,
@@ -47,6 +49,8 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             allow_new_sessions: b_open,
             role: Role::Inside,
             mss_adjust: None,
+            dhcp: crate::config::Dhcp::Off,
+            gateway: None,
         },
     ]);
     let statics = [StaticRoute {
@@ -361,6 +365,8 @@ fn static_route_gateway_must_be_connected() {
         allow_new_sessions: true,
         role: Role::Inside,
         mss_adjust: None,
+        dhcp: crate::config::Dhcp::Off,
+        gateway: None,
     }];
     let bad = [StaticRoute {
         prefix: "0.0.0.0/0".parse().unwrap(),
@@ -932,4 +938,51 @@ fn the_neighbor_table_is_bounded() {
     r.set_time(10_000_000_000 + 1_201_000_000_000);
     learn(&mut r, 1, HOST_B, "10.10.2.10");
     assert!(r.neighbors().any(|n| n.mac == HOST_B));
+}
+
+// ---------------------------------------------------------------- DHCP
+
+/// A DHCP DISCOVER as a client sends it: no address yet, to everyone.
+fn dhcp_discover(src_mac: Mac) -> (Vec<u8>, usize) {
+    use eph_packet::dhcp;
+    let mut m = dhcp::Message::new(dhcp::OP_REQUEST, 7, src_mac);
+    m.set(dhcp::OPT_MSG_TYPE, vec![dhcp::DISCOVER]);
+    let f = dhcp::build_frame(
+        src_mac,
+        eth::BROADCAST,
+        (Ipv4Addr::UNSPECIFIED, dhcp::CLIENT_PORT),
+        (Ipv4Addr::BROADCAST, dhcp::SERVER_PORT),
+        &m.encode(),
+    );
+    let n = f.len();
+    (f, n)
+}
+
+#[test]
+fn dhcp_goes_to_the_control_plane_only_where_enabled() {
+    let mut r = router();
+    // Not enabled: an ordinary (dropped) broadcast, nothing handed over.
+    let (mut f, n) = dhcp_discover(HOST_A);
+    assert_ne!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Drop(DropReason::DhcpToControl)
+    );
+    assert!(r.punts.is_empty());
+
+    // Serving DHCP on lan-a: the DISCOVER is handed over, whole.
+    let mut ports = r.ports().to_vec();
+    ports[0].dhcp = Dhcp::Server;
+    r.set_ports(ports.into());
+    let (mut f, n) = dhcp_discover(HOST_A);
+    assert_eq!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Drop(DropReason::DhcpToControl)
+    );
+    assert_eq!(r.punts.len(), 1);
+    assert_eq!(r.punts[0].port, 0);
+    assert_eq!(r.punts[0].frame, f[..n]);
+    // ...but not on the other port.
+    let (mut f, n) = dhcp_discover(HOST_B);
+    r.process(1, &mut f, 0, n);
+    assert_eq!(r.punts.len(), 1);
 }

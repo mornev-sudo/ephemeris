@@ -8,6 +8,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 mod config;
+mod dhcp;
 mod files;
 mod mgmt;
 mod overlay_state;

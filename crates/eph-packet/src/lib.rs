@@ -10,6 +10,7 @@
 
 pub mod arp;
 pub mod checksum;
+pub mod dhcp;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
