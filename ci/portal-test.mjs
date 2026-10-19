@@ -48,8 +48,17 @@ try {
   });
   await step("dashboard shows ports and counters", async () => {
     await page.waitForSelector("#ports td:has-text('lan-b')");
-    await page.waitForSelector("#cards .card:has-text('Forwarding')");
+    for (const c of ["Open sessions", "Packets per second", "Throughput", "Dropped packets"]) {
+      await page.waitForSelector(`#cards .card:has-text('${c}')`);
+    }
+    await page.waitForSelector("#wantab td:has-text('lan-b')");
     await page.screenshot({ path: `${shots}/portal-dashboard.png`, fullPage: true });
+  });
+  await step("reporting tab draws its four graphs", async () => {
+    await page.click("button[data-tab=reports]");
+    await page.waitForFunction(() => document.querySelectorAll("#charts svg").length === 4);
+    await page.waitForSelector("#ifrates td:has-text('lan-a')");
+    await page.screenshot({ path: `${shots}/portal-reporting.png`, fullPage: true });
   });
   await step("sessions tab", async () => {
     await page.click("button[data-tab=sessions]");
