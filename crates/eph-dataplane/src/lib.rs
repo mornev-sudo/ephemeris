@@ -21,7 +21,10 @@ mod stats;
 
 pub use config::{build_fib, Dhcp, NextHop, OverlayRoute, Port, PortId, Pppoe, Role, StaticRoute};
 pub use pipeline::{Emit, Neighbor, Pipeline, Punt, Verdict, NEIGHBOR_MAX};
-pub use session::{Dir, FlowKey, NatBinding, Session, SessionConfig, State, Timeouts};
+pub use session::{
+    Dir, FlowKey, NatBinding, Session, SessionConfig, State, Timeouts, MAX_CLOSING_SECS,
+    MAX_IDLE_SECS,
+};
 pub use stats::{DropReason, PortCounters, Stats};
 
 #[cfg(test)]

@@ -128,6 +128,20 @@ the real expiry time:
 Busy sessions get "touched" by the wheel about once per timeout period, no
 matter how many packets they carry. That's how Linux kernel timers work too.
 
+One exception to "lazy": when a session's timeout gets *shorter* (an
+established connection sees its FIN or RST), it is refiled straight away.
+Otherwise a closed connection would sit in the table until its old,
+hour-long slot came round.
+
+**Nothing is kept forever.** Every timeout is capped at an hour: a
+`*_timeout_secs` above 3600 is applied as 3600 (with a warning in the log),
+so no idle session outlives an hour, and a closing or closed one goes within 10 minutes at most
+(`MAX_IDLE_SECS`, `MAX_CLOSING_SECS` in
+[`session.rs`](../../crates/eph-dataplane/src/session.rs)). A session that
+keeps carrying traffic stays as long as it's in use, as it should: cutting
+a live SSH session or video call after an hour would be a bug, not a
+safeguard.
+
 There's one more subtlety: a freed slab slot can be reused by a new session
 while the wheel still holds a stale entry for the old one. Every slot carries
 a **generation number** that is bumped on free, and stale wheel entries carry

@@ -5,11 +5,13 @@
 //! [`BATCH`]. Nothing is shared with other workers except neighbour updates,
 //! which arrive as messages.
 
-use crate::report::{Control, KernelStats, Report, SessionView};
+use crate::report::{
+    unix_ms, Control, DetailWanted, KernelStats, Report, SessionView, SESSION_DETAIL,
+};
 use eph_dataplane::{DropReason, Pipeline, PortId, Punt, Verdict};
 use eph_xdp::{Umem, XdpDesc, Xsk};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,8 +24,8 @@ const IDLE_POLL_MS: i32 = 10;
 // Often enough that SD-WAN failover (which reads tether probe results from
 // these reports) reacts within about a second.
 const REPORT_EVERY: Duration = Duration::from_millis(250);
-/// Sessions sampled per worker per report (for the API and logs).
-const SESSION_SAMPLE: usize = 1024;
+/// Session and neighbour lists, while someone looks: at most once a second.
+const DETAIL_EVERY: Duration = Duration::from_secs(1);
 
 pub struct Worker {
     pub id: usize,
@@ -36,8 +38,11 @@ pub struct Worker {
     /// Sibling workers' control channels, for sharing learned neighbours.
     pub siblings: Vec<Sender<Control>>,
     pub report: Arc<Mutex<Report>>,
-    /// Where DHCP packets for the control plane go.
-    pub punt: Sender<Punt>,
+    /// Where DHCP / PPPoE packets for the control plane go (bounded: a
+    /// flood is dropped here, not queued without end).
+    pub punt: SyncSender<Punt>,
+    /// Until when (Unix ms) someone wants the session and neighbour lists.
+    pub detail: DetailWanted,
     pub busy_poll: bool,
     pub cpu: Option<usize>,
 }
@@ -61,6 +66,9 @@ impl Worker {
         let mut busy_ns = 0u64;
         let mut round_start = 0u64;
         let mut round_busy = false;
+        let mut last_detail = Instant::now()
+            .checked_sub(DETAIL_EVERY)
+            .unwrap_or_else(Instant::now);
         let mut pollfds: Vec<libc::pollfd> = self
             .socks
             .iter()
@@ -208,7 +216,11 @@ impl Worker {
             }
             // ...and packets for the control plane go to it.
             for p in self.pipeline.punts.drain(..) {
-                let _ = self.punt.send(p);
+                // Full (the control plane is behind, e.g. a DHCP flood):
+                // drop it here rather than queue without end.
+                if self.punt.try_send(p).is_err() {
+                    self.pipeline.stats.drop(DropReason::ControlQueueFull);
+                }
             }
 
             // 5. Tell sibling workers about neighbours we learned.
@@ -234,7 +246,12 @@ impl Worker {
             round_busy = work > 0;
             if last_report.elapsed() >= REPORT_EVERY {
                 last_report = Instant::now();
-                self.publish(now_ns, busy_ns);
+                let wanted = unix_ms() < self.detail.load(Ordering::Relaxed);
+                let detail = wanted && last_detail.elapsed() >= DETAIL_EVERY;
+                if detail {
+                    last_detail = Instant::now();
+                }
+                self.publish(now_ns, busy_ns, detail, wanted);
             }
 
             // 7. Nothing to do? Spin a little (cheap, lowest latency), then
@@ -255,17 +272,20 @@ impl Worker {
                 idle = 0;
             }
         }
-        self.publish(epoch.elapsed().as_nanos() as u64, busy_ns);
+        self.publish(epoch.elapsed().as_nanos() as u64, busy_ns, false, false);
     }
 
-    fn publish(&self, now_ns: u64, busy_ns: u64) {
+    /// Publish counters (always) and, when `detail`, the newest sessions and
+    /// the neighbour list. When nobody wants them (`!wanted`) those lists are
+    /// dropped, so a busy worker never spends time copying them for no one.
+    fn publish(&self, now_ns: u64, busy_ns: u64, detail: bool, wanted: bool) {
         // try_lock: a worker never waits on the stats reader.
         if let Ok(mut r) = self.report.try_lock() {
             r.stats = self.pipeline.stats.clone();
             r.busy_ns = busy_ns;
             r.sessions_max = self.pipeline.sessions().capacity() as u64;
             r.nat_active = self.pipeline.sessions().nat_active;
-            r.neighbors = self.pipeline.neighbors().collect();
+            r.neighbor_count = self.pipeline.neighbor_count() as u64;
             let mut k = KernelStats::default();
             for s in &self.socks {
                 let x = s.statistics().unwrap_or_default();
@@ -275,19 +295,44 @@ impl Worker {
             r.kernel = k;
             r.tethers.clear();
             r.tethers.extend_from_slice(self.pipeline.tether_stats());
-            r.sessions.clear();
-            r.sessions.extend(
-                self.pipeline
-                    .sessions()
-                    .iter()
-                    .take(SESSION_SAMPLE)
-                    .map(|s| SessionView {
-                        session: s.clone(),
-                        now_ns,
-                    }),
-            );
+            if detail {
+                r.neighbors = self.pipeline.neighbors().collect();
+                r.sessions = newest_sessions(&self.pipeline, now_ns);
+                r.detail_ms = unix_ms();
+            } else if !wanted && r.detail_ms != 0 {
+                r.neighbors = Vec::new(); // free the memory, not just the contents
+                r.sessions = Vec::new();
+                r.detail_ms = 0;
+            }
         }
     }
+}
+
+/// The [`SESSION_DETAIL`] most recently created sessions, newest first:
+/// one pass with a small heap, copying only the ones kept.
+fn newest_sessions(p: &Pipeline, now_ns: u64) -> Vec<SessionView> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::with_capacity(SESSION_DETAIL + 1);
+    for (i, s) in p.sessions().iter().enumerate() {
+        heap.push(Reverse((s.created_ns, i)));
+        if heap.len() > SESSION_DETAIL {
+            heap.pop(); // drop the oldest
+        }
+    }
+    let keep: std::collections::HashSet<usize> = heap.iter().map(|Reverse((_, i))| *i).collect();
+    let mut out: Vec<SessionView> = p
+        .sessions()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, s)| SessionView {
+            session: s.clone(),
+            now_ns,
+        })
+        .collect();
+    out.sort_by_key(|v| Reverse(v.session.created_ns));
+    out
 }
 
 fn pin_to_cpu(cpu: usize) {

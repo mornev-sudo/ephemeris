@@ -179,6 +179,12 @@ impl State {
     }
 }
 
+/// No session lingers idle for longer than this: an hour (configured
+/// timeouts above it are refused).
+pub const MAX_IDLE_SECS: u64 = 3600;
+/// Closing and closed TCP sessions are gone within ten minutes.
+pub const MAX_CLOSING_SECS: u64 = 600;
+
 /// Idle timeouts in seconds. A session expires this long after its last packet.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
@@ -480,6 +486,7 @@ impl SessionTable {
         bytes: u64,
         now_ns: u64,
     ) -> Track {
+        let before = self.timeout_secs(&self.slab[idx as usize]);
         let s = &mut self.slab[idx as usize];
         if s.key.proto == eph_packet::ipv4::PROTO_TCP {
             match tcp_transition(s.state, dir, tcp_flags, &mut s.fin_seen) {
@@ -500,6 +507,14 @@ impl SessionTable {
         s.packets[dir as usize] += 1;
         s.bytes[dir as usize] += bytes;
         s.last_seen_ns = now_ns;
+        // Moved to a shorter timeout (closing, closed): its wheel slot is
+        // still the old, later one, so file it again at the new expiry.
+        // Otherwise a reset connection could sit in the table until the old
+        // slot came round (up to one wheel turn, ~17 minutes).
+        if self.timeout_secs(&self.slab[idx as usize]) < before {
+            let at = self.expiry_ns(idx);
+            self.schedule(idx, at, now_ns);
+        }
         Track::Ok { idx, dir }
     }
 
@@ -727,6 +742,46 @@ mod tests {
         assert_eq!(step(&mut t, rev, TCP_FIN | TCP_ACK), State::TimeWait);
         assert_eq!(step(&mut t, fwd, TCP_SYN), State::SynSent, "port reuse");
         assert_eq!(step(&mut t, rev, TCP_RST), State::Closed);
+    }
+
+    #[test]
+    fn nothing_lingers_idle_past_its_limits() {
+        // The defaults keep within the caps the config also enforces.
+        let t = Timeouts::default();
+        for v in [
+            t.tcp_handshake,
+            t.tcp_established,
+            t.udp,
+            t.udp_stream,
+            t.icmp,
+            t.other,
+        ] {
+            assert!(v <= MAX_IDLE_SECS);
+        }
+        assert!(t.tcp_closing <= MAX_CLOSING_SECS && t.tcp_closed <= MAX_CLOSING_SECS);
+
+        // An established TCP session idle for an hour is gone; a closed one
+        // within seconds; one still passing traffic stays.
+        let mut tb = table();
+        let s = 1_000_000_000u64;
+        let (k, fwd) = FlowKey::new(ip("10.0.1.10"), 40000, ip("10.0.2.10"), 80, PROTO_TCP);
+        let idle = tb.create(k, fwd, TCP_ACK, 60, 0).unwrap(); // picked up: established
+        let (k2, f2) = FlowKey::new(ip("10.0.1.10"), 40001, ip("10.0.2.10"), 80, PROTO_TCP);
+        let busy = tb.create(k2, f2, TCP_ACK, 60, 0).unwrap();
+        let (k3, f3) = FlowKey::new(ip("10.0.1.10"), 40002, ip("10.0.2.10"), 80, PROTO_TCP);
+        let closed = tb.create(k3, f3, TCP_ACK, 60, 0).unwrap();
+        tb.update(closed, !f3, TCP_RST, 60, s);
+        assert_eq!(tb.get(closed).state, State::Closed);
+        tb.expire(30 * s);
+        assert_eq!(tb.len(), 2, "closed: gone within its 10 s");
+        for t in (60..3600).step_by(60) {
+            tb.update(busy, f2, TCP_ACK, 60, t * s);
+            tb.expire(t * s);
+        }
+        tb.expire(3601 * s);
+        assert!(tb.lookup(&k).is_none(), "idle an hour: gone");
+        assert!(tb.lookup(&k2).is_some(), "still in use: kept");
+        let _ = idle;
     }
 
     #[test]

@@ -186,6 +186,25 @@ and `statvfs` ([`sysinfo.rs`](../../crates/ephemerisd/src/mgmt/sysinfo.rs)):
   There's no separate RIB yet: connected, static, DHCP/PPPoE and SD-WAN
   routes go straight into the FIB, so its figures are the real ones.
 
+### Keeping the router's own memory and disk bounded
+
+A router runs for months. Anything that grows a little with every packet,
+request or day will eventually exhaust it, so every store has a limit, and
+the data plane comes first when there's contention:
+
+| What | Limit |
+|---|---|
+| Sessions, neighbours, NAT, FIB | fixed tables reserved at start (above); full means *refused and counted*, never more memory |
+| Session lists | gathered by the workers **only while someone views them** (`/sessions`, `/neighbors`, the portal's tables), at most once a second, and only the **newest 1000** per worker. The API returns the newest 1000 in all. When nobody's looking, the lists are freed |
+| Packets for the control plane (DHCP, PPPoE) | a queue of 1024; when the DHCP or PPPoE thread falls behind (a DHCP flood), more are dropped and counted as `control-queue-full`, and the workers never wait |
+| Traffic history | one hour (720 samples), then the oldest go |
+| Statistics log | off by default (`dataplane.stats_interval_secs = 0`); the portal and `ephctl status` show the same figures without writing to disk. When on, one line per interval |
+| The journal (logs and audit trail) | 256 MiB, and always 512 MiB free on `/var` |
+| Config history | the last 20 commits |
+| Configs that failed to start | the newest 5 |
+| Login sessions | expire when idle; at most a fixed number, the least recently used go first |
+| Portal and API threads | run at a lower CPU priority (nice 10; DHCP and PPPoE nice 5), so a busy router forwards first and draws graphs second |
+
 ## When a config won't start
 
 Validation catches most mistakes before a commit. Some only show up when

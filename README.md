@@ -116,6 +116,7 @@ Plain-language explanations of everything in here, in reading order:
 - [x] **PPPoE:** outside interfaces dial their ISP (RFC 2516 discovery, LCP with keepalives, PAP / CHAP-MD5, IPCP with DNS), 1492 MTU and MSS handled, applied live
 - [x] **Reporting:** open sessions, packets/s, throughput and drops sampled every 5 s; live graphs in the portal (last hour), the same numbers on the dashboard and in `ephctl status`
 - [x] **Resources and capacity:** CPU (per core, per thread), memory and huge pages, disk, worker busy %, and every table's usage against its limit (FIB, sessions, neighbours, NAT, DHCP pools, tethers)
+- [x] **Bounded resources:** every session expires (idle limit of an hour, closed within 10 minutes), session views show the newest 1000 and are gathered only while viewed, a bounded control-plane queue, a capped journal and history, management at lower CPU priority
 - [ ] **Next for the edge:** destination NAT / port forwarding, VLANs (802.1Q), `ephsh` router CLI
 - [ ] **Phase 4: SD-WAN.**
   - [x] 4a: UDP overlay tethers over multiple WANs, in-place encapsulation, probing (latency/jitter/loss), app-aware path selection with SLAs and hysteresis, failover, MSS clamping, path MTU

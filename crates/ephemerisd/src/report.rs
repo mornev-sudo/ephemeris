@@ -51,6 +51,24 @@ pub struct Report {
     pub busy_ns: u64,
     pub sessions_max: u64,
     pub nat_active: u64,
+    pub neighbor_count: u64,
+    /// When `sessions` and `neighbors` were last filled in (Unix ms; 0 =
+    /// never). They're only gathered while someone is looking at them.
+    pub detail_ms: u64,
+}
+
+/// Session and neighbour lists are only gathered while someone looks:
+/// the API sets this (Unix ms) a few seconds ahead, workers check it.
+pub type DetailWanted = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+/// The newest sessions a view shows, per worker and in total.
+pub const SESSION_DETAIL: usize = 1000;
+
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A copy of a session, detached from the worker's table.

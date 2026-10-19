@@ -50,6 +50,7 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         update: Default::default(),
         system: Default::default(),
         umem_bytes: 0,
+        detail: Default::default(),
         stop: &STOP,
     });
     // Made-up traffic every 5 s, so the Reporting graphs have something to

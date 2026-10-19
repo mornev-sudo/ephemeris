@@ -68,6 +68,7 @@ pub fn fall_back(config: &Path, text: &str, error: &str, now_unix: u64) -> Resul
     let failed = dir.join(format!("{name}.failed-{now_unix}"));
     crate::files::write_private(&failed, text.as_bytes())
         .with_context(|| format!("saving {}", failed.display()))?;
+    prune_failed(&dir, name);
     let note = Fallback {
         failed_unix: now_unix,
         error: error.to_string(),
@@ -76,6 +77,30 @@ pub fn fall_back(config: &Path, text: &str, error: &str, now_unix: u64) -> Resul
     write_atomic(&dir.join(NOTE), &serde_json::to_string(&note)?)?;
     write_atomic(config, &good)?;
     Ok(true)
+}
+
+/// How many failed configs to keep for inspection.
+pub const FAILED_KEEP: usize = 5;
+
+/// Remove all but the newest [`FAILED_KEEP`] `<name>.failed-<unix>` files, so
+/// a config that keeps failing can't fill the disk.
+fn prune_failed(dir: &Path, name: &str) {
+    let prefix = format!("{name}.failed-");
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut kept: Vec<(u64, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().into_string().ok()?;
+            let at = n.strip_prefix(&prefix)?.parse().ok()?;
+            Some((at, e.path()))
+        })
+        .collect();
+    kept.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, p) in kept.into_iter().skip(FAILED_KEEP) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// A fallback that happened just before this start, if any. Read once: the
@@ -116,6 +141,29 @@ mod tests {
         let note = take_note(&cfg).unwrap();
         assert_eq!(note.error, "device ens16 is down");
         assert!(take_note(&cfg).is_none(), "shown for one start only");
+    }
+
+    #[test]
+    fn only_the_newest_failed_configs_are_kept() {
+        let cfg = dir("prune");
+        std::fs::write(&cfg, "good").unwrap();
+        mark_good(&cfg, "good").unwrap();
+        for at in 1..=8 {
+            std::fs::write(&cfg, format!("bad {at}")).unwrap();
+            assert!(fall_back(&cfg, &format!("bad {at}"), "e", at).unwrap());
+        }
+        let d = cfg.parent().unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.contains(".failed-"))
+            .collect();
+        left.sort();
+        let want: Vec<String> = (4..=8)
+            .map(|n| format!("ephemeris.toml.failed-{n}"))
+            .collect();
+        assert_eq!(left, want);
     }
 
     #[test]

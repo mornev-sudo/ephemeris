@@ -201,7 +201,7 @@ async function refreshSessions() {
   const list = await api("GET", "/sessions?limit=1000");
   const f = $("sessfilter").value.trim().toLowerCase();
   const shown = list.filter(x => !f || JSON.stringify(x).toLowerCase().includes(f));
-  $("sesscount").textContent = `${shown.length} of ${list.length} sessions (busiest first)`;
+  $("sesscount").textContent = `${shown.length} of ${list.length} sessions (the newest, at most 1000)`;
   table($("sess"), ["Proto", "Initiator", "NAT as", "Responder", "State", "Packets →/←", "Bytes →/←", "Age", "Idle"],
     shown.map(x => [x.proto, td(x.initiator, "mono"), td(x.nat || "—", "mono"), td(x.responder, "mono"),
       td(x.state, x.state === "established" ? "ok" : ""), n(x.packets[0]) + " / " + n(x.packets[1]),
@@ -389,7 +389,7 @@ function control(c, obj) {
     return e;
   } else {
     e = document.createElement("input");
-    if (c.type === "number") { e.type = "number"; e.min = c.min ?? 0; }
+    if (c.type === "number") { e.type = "number"; e.min = c.min ?? 0; if (c.max) e.max = c.max; }
     e.value = v == null ? "" : c.type === "list" ? v.join(", ") : String(v);
     if (c.placeholder) e.placeholder = c.placeholder;
     e.oninput = () => {
@@ -659,11 +659,11 @@ function renderCfg() {
   formFields($("f-sess"), cfg.sessions, [
     { key: "max_per_worker", label: "Sessions per worker", type: "number", min: 1, help: "Memory is reserved up front (~150 bytes each)." },
     { key: "tcp_strict", label: "Strict TCP (only a SYN may open a session)", type: "check" },
-    { key: "tcp_handshake_timeout_secs", label: "TCP handshake timeout (s)", type: "number", min: 1 },
-    { key: "tcp_established_timeout_secs", label: "TCP established timeout (s)", type: "number", min: 1 },
-    { key: "udp_timeout_secs", label: "UDP timeout (s)", type: "number", min: 1 },
-    { key: "udp_stream_timeout_secs", label: "UDP stream timeout (s)", type: "number", min: 1 },
-    { key: "icmp_timeout_secs", label: "ICMP timeout (s)", type: "number", min: 1 },
+    { key: "tcp_handshake_timeout_secs", max: 3600, label: "TCP handshake timeout (s)", type: "number", min: 1 },
+    { key: "tcp_established_timeout_secs", max: 3600, label: "TCP established timeout (s)", type: "number", min: 1 },
+    { key: "udp_timeout_secs", max: 3600, label: "UDP timeout (s)", type: "number", min: 1 },
+    { key: "udp_stream_timeout_secs", max: 3600, label: "UDP stream timeout (s)", type: "number", min: 1 },
+    { key: "icmp_timeout_secs", max: 3600, label: "ICMP timeout (s)", type: "number", min: 1 },
   ]);
   formFields($("f-dp"), cfg.dataplane, [
     { key: "workers", label: "Worker threads (one per NIC queue)", type: "number", min: 1 },
@@ -671,7 +671,7 @@ function renderCfg() {
     { key: "bind_mode", label: "AF_XDP mode", type: "select", options: [["auto", "auto"], ["copy", "copy"], ["zerocopy", "zero-copy"]] },
     { key: "ring_size", label: "Ring size", type: "number", min: 64 },
     { key: "busy_poll", label: "Busy polling (lowest latency, 100% CPU)", type: "check" },
-    { key: "stats_interval_secs", label: "Log statistics every (s)", type: "number", min: 1 },
+    { key: "stats_interval_secs", label: "Log statistics every (s, 0 = off)", type: "number", min: 0 },
   ]);
   formFields($("f-mgmt"), cfg.management, [
     { key: "enabled", label: "Web portal and API enabled", type: "check" },

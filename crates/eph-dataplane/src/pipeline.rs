@@ -309,6 +309,10 @@ impl Pipeline {
         self.arp_pending.remove(&k);
     }
 
+    pub fn neighbor_count(&self) -> usize {
+        self.neighbors.len()
+    }
+
     pub fn neighbors(&self) -> impl Iterator<Item = Neighbor> + '_ {
         self.neighbors.iter().map(|(&(port, ip), e)| Neighbor {
             port,

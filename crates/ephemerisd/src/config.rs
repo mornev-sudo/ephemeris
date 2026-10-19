@@ -175,8 +175,10 @@ pub struct DataplaneCfg {
     pub busy_poll: bool,
     /// Optional CPU to pin each worker to, in worker order.
     pub cpus: Vec<usize>,
+    /// Log a statistics line this often (0 = never; the portal and
+    /// `ephctl status` show the same, without filling the journal).
     pub stats_interval_secs: u64,
-    /// How many sessions to list with each stats report.
+    /// How many of the newest sessions to log with each statistics line.
     pub show_sessions: usize,
 }
 
@@ -189,8 +191,8 @@ impl Default for DataplaneCfg {
             ring_size: 2048,
             busy_poll: false,
             cpus: vec![],
-            stats_interval_secs: 10,
-            show_sessions: 10,
+            stats_interval_secs: 0,
+            show_sessions: 0,
         }
     }
 }
@@ -489,16 +491,33 @@ impl Default for SessionsCfg {
 }
 
 impl SessionsCfg {
+    /// The data plane's settings. No session may sit idle for more than an
+    /// hour ([`eph_dataplane::MAX_IDLE_SECS`]): longer timeouts are capped.
     pub fn to_config(&self) -> SessionConfig {
+        let cap = |name: &str, v: u64| {
+            if v > eph_dataplane::MAX_IDLE_SECS {
+                tracing::warn!(
+                    "sessions.{name} = {v}: using {}, the most a session may stay idle",
+                    eph_dataplane::MAX_IDLE_SECS
+                );
+            }
+            v.min(eph_dataplane::MAX_IDLE_SECS)
+        };
         SessionConfig {
             max_sessions: self.max_per_worker,
             tcp_strict: self.tcp_strict,
             timeouts: Timeouts {
-                tcp_handshake: self.tcp_handshake_timeout_secs,
-                tcp_established: self.tcp_established_timeout_secs,
-                udp: self.udp_timeout_secs,
-                udp_stream: self.udp_stream_timeout_secs,
-                icmp: self.icmp_timeout_secs,
+                tcp_handshake: cap(
+                    "tcp_handshake_timeout_secs",
+                    self.tcp_handshake_timeout_secs,
+                ),
+                tcp_established: cap(
+                    "tcp_established_timeout_secs",
+                    self.tcp_established_timeout_secs,
+                ),
+                udp: cap("udp_timeout_secs", self.udp_timeout_secs),
+                udp_stream: cap("udp_stream_timeout_secs", self.udp_stream_timeout_secs),
+                icmp: cap("icmp_timeout_secs", self.icmp_timeout_secs),
                 ..Timeouts::default()
             },
         }
@@ -631,6 +650,23 @@ impl Config {
         }
         if self.sessions.max_per_worker == 0 || self.sessions.max_per_worker > 16_000_000 {
             bail!("sessions.max_per_worker must be between 1 and 16000000");
+        }
+        // Timeouts above an hour are capped when applied (`to_config`), not
+        // refused: a config saved by an older release must still start.
+        let s = &self.sessions;
+        for (name, v) in [
+            ("tcp_handshake_timeout_secs", s.tcp_handshake_timeout_secs),
+            (
+                "tcp_established_timeout_secs",
+                s.tcp_established_timeout_secs,
+            ),
+            ("udp_timeout_secs", s.udp_timeout_secs),
+            ("udp_stream_timeout_secs", s.udp_stream_timeout_secs),
+            ("icmp_timeout_secs", s.icmp_timeout_secs),
+        ] {
+            if v == 0 {
+                bail!("sessions.{name} must be at least 1");
+            }
         }
         if self.management.enabled {
             self.management
@@ -1458,6 +1494,23 @@ mod tests {
         let c = parse(text).unwrap();
         let ports = c.ports(|_| Ok([0; 6])).unwrap();
         c.fib(&ports).unwrap();
+    }
+
+    #[test]
+    fn session_timeouts_are_capped_at_an_hour() {
+        let text = include_str!("../../../config/ephemeris.example.toml");
+        let mut c = parse(text).unwrap();
+        // A config from an older release with a long timeout still loads...
+        c.sessions.tcp_established_timeout_secs = 86_400;
+        c.sessions.udp_stream_timeout_secs = 7_200;
+        c.validate().unwrap();
+        // ...but no session stays idle for more than an hour.
+        let t = c.sessions.to_config().timeouts;
+        assert_eq!(t.tcp_established, eph_dataplane::MAX_IDLE_SECS);
+        assert_eq!(t.udp_stream, eph_dataplane::MAX_IDLE_SECS);
+        assert_eq!(t.udp, 30, "shorter ones are left alone");
+        c.sessions.icmp_timeout_secs = 0;
+        assert!(c.validate().is_err());
     }
 
     const DHCP_CFG: &str = r#"

@@ -215,6 +215,11 @@ check "TCP A->B (iperf3)"                  ip netns exec ci-ha iperf3 -c 10.10.2
 grep -E "receiver" "$WORK/out" | sed 's/^/        /' || true
 check "NAT: B sees the router's address"   grep -q "Accepted connection from 10.10.2.1," "$WORK/iperf-b.log"
 check "NAT shown on the session"           sh -c "curl -skf -b '$WORK/cookies' '$WEB/api/v1/sessions?limit=50' | grep -q '\"nat\":\"10.10.2.1:'"
+# Bounded resources (0.9.0): newest sessions first, at most 1000; a capped
+# journal; the portal and API at a lower CPU priority than the workers.
+check "sessions: newest first, at most 1000" sh -c "curl -skf -b '$WORK/cookies' '$WEB/api/v1/sessions?limit=5000' | python3 -c 'import json,sys; a=[s[\"age_secs\"] for s in json.load(sys.stdin)]; assert 0 < len(a) <= 1000 and a == sorted(a), a'"
+check "journal size capped"                on_router "systemd-analyze cat-config systemd/journald.conf | grep -q '^SystemMaxUse=256M'"
+check "management thread at lower priority" on_router 'p=$(systemctl show -p MainPID --value ephemerisd); for t in /proc/$p/task/*; do [ "$(cat $t/comm)" = eph-mgmt ] && cut -d" " -f19 $t/stat; done | grep -qx 10'
 ip netns exec ci-hb iperf3 -s -D -1
 sleep 0.5
 check "TCP B->A on A's session"            ip netns exec ci-ha iperf3 -c 10.10.2.10 -t3 -R

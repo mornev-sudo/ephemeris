@@ -94,6 +94,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         punts,
         endpoints,
         umem_bytes,
+        detail,
     } = dp;
     let d = &cfg.dataplane;
 
@@ -134,6 +135,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         update: Default::default(),
         system: Default::default(),
         umem_bytes,
+        detail,
         stop: &STOP,
     });
     let mgmt = m.enabled.then(|| {
@@ -152,6 +154,8 @@ pub fn run(config_path: &Path) -> Result<()> {
         std::thread::Builder::new()
             .name("eph-mgmt".into())
             .spawn(move || {
+                // The portal and API give way to the data plane under load.
+                lower_priority(10);
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -171,7 +175,10 @@ pub fn run(config_path: &Path) -> Result<()> {
         let dir = state_dir.clone();
         std::thread::Builder::new()
             .name("eph-dhcp".into())
-            .spawn(move || crate::dhcp::service::run(&shared, rx, &STOP, &dir))
+            .spawn(move || {
+                lower_priority(5);
+                crate::dhcp::service::run(&shared, rx, &STOP, &dir)
+            })
             .expect("spawning DHCP service")
     });
 
@@ -190,6 +197,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             .expect("spawning path selector")
     });
 
+    let log_stats = d.stats_interval_secs > 0;
     let interval = Duration::from_secs(d.stats_interval_secs.max(1));
     let mut next = Instant::now() + interval;
     let sample_every = Duration::from_secs(crate::mgmt::history::INTERVAL_SECS);
@@ -216,8 +224,15 @@ pub fn run(config_path: &Path) -> Result<()> {
                 .record(at, unix, &sum, Some(&sys));
             *shared.system.lock().unwrap() = Some(sys);
         }
-        if Instant::now() >= next && workers > 0 {
+        if log_stats && Instant::now() >= next && workers > 0 {
             next += interval;
+            if d.show_sessions > 0 {
+                // Have the workers gather their newest sessions for next time.
+                shared.detail.store(
+                    crate::report::unix_ms() + 2 * interval.as_millis() as u64 + 2_000,
+                    Ordering::Relaxed,
+                );
+            }
             print_stats(&shared, d.show_sessions);
         }
     }
@@ -299,6 +314,8 @@ struct Dataplane {
     endpoints: Arc<eph_dataplane::overlay::Endpoints>,
     /// Packet buffer memory reserved, all workers.
     umem_bytes: u64,
+    /// Shared with the workers: until when the API wants session lists.
+    detail: crate::report::DetailWanted,
 }
 
 impl Dataplane {
@@ -314,6 +331,7 @@ impl Dataplane {
                 overlay.tethers.len(),
             )),
             umem_bytes: 0,
+            detail: Default::default(),
             overlay,
             runtime: cfg
                 .interfaces
@@ -464,7 +482,10 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     // One control channel per worker: neighbour updates from siblings, and
     // FIB/port changes from the management plane.
     let (txs, rxs): (Vec<_>, Vec<_>) = (0..workers).map(|_| mpsc::channel()).unzip();
-    let (punt_tx, punt_rx) = mpsc::channel();
+    // Bounded: if the control plane falls behind (a DHCP flood), packets
+    // for it are dropped and counted, never queued without end.
+    let (punt_tx, punt_rx) = mpsc::sync_channel(1024);
+    let detail: crate::report::DetailWanted = Default::default();
     let mut zero_copy = vec![false; ports.len()];
     let reports: Vec<Arc<Mutex<Report>>> = (0..workers).map(|_| Default::default()).collect();
     let mut pool = Vec::new();
@@ -523,6 +544,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             siblings,
             report: reports[w].clone(),
             punt: punt_tx.clone(),
+            detail: detail.clone(),
             busy_poll: d.busy_poll,
             cpu: d.cpus.get(w).copied(),
         });
@@ -573,6 +595,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         punts: Some(punt_rx),
         endpoints,
         umem_bytes: frames as u64 * FRAME_SIZE as u64 * workers as u64,
+        detail,
     })
 }
 
@@ -622,22 +645,38 @@ fn path_loop(shared: &Shared, epoch: Instant, replay: &ReplayGuard, state_dir: &
     }
 }
 
+/// Make the calling thread nicer (0 = normal, 19 = lowest), so that on a
+/// busy router the workers get the CPU first. Linux sets this per thread.
+fn lower_priority(nice: i32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let tid = libc::gettid() as libc::id_t;
+        if libc::setpriority(libc::PRIO_PROCESS, tid, nice) != 0 {
+            warn!(
+                "could not lower thread priority: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = nice;
+}
+
 fn print_stats(shared: &Shared, show_sessions: usize) {
     let s = Summary::collect(&shared.reports);
-    let ports = shared.ports.read().unwrap().clone();
     let drops: Vec<String> = s.drops.iter().map(|(k, v)| format!("{k}={v}")).collect();
     info!(
-        "rx={} forwarded={} originated={} kernel-drops={} fill-empty={} drops[{}]",
+        "rx={} forwarded={} originated={} kernel-drops={} fill-empty={} sessions={} (created {}, expired {}) neighbors={} drops[{}]",
         s.rx,
         s.forwarded,
         s.originated,
         s.kernel_drops,
         s.fill_empty,
+        s.sessions_active,
+        s.sessions_created,
+        s.sessions_expired,
+        s.neighbor_count,
         drops.join(" ")
-    );
-    info!(
-        "sessions: active={} created={} expired={}",
-        s.sessions_active, s.sessions_created, s.sessions_expired
     );
     let health = shared.health.read().unwrap().clone();
     for (t, (st, h)) in shared
@@ -657,15 +696,9 @@ fn print_stats(shared: &Shared, show_sessions: usize) {
             st.rx_packets
         );
     }
-    for v in s.sessions.iter().take(show_sessions) {
+    let mut newest: Vec<_> = s.sessions.iter().collect();
+    newest.sort_by_key(|v| std::cmp::Reverse(v.session.created_ns));
+    for v in newest.into_iter().take(show_sessions) {
         info!("  {v}");
-    }
-    for n in &s.neighbors {
-        info!(
-            "  neighbor {:<15} {} on {}",
-            n.ip,
-            eth::fmt_mac(&n.mac),
-            ports[n.port as usize].name
-        );
     }
 }

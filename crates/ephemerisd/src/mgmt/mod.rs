@@ -83,6 +83,8 @@ pub struct Shared {
     pub system: Mutex<Option<sysinfo::Snapshot>>,
     /// Packet buffer memory (UMEM) reserved at start, all workers.
     pub umem_bytes: u64,
+    /// Until when (Unix ms) the workers gather session / neighbour lists.
+    pub detail: crate::report::DetailWanted,
     /// Set to stop the daemon (systemd then starts it again).
     pub stop: &'static AtomicBool,
 }
@@ -118,6 +120,21 @@ impl Shared {
     pub fn summary(&self) -> Summary {
         Summary::collect(&self.reports)
     }
+
+    /// For the session and neighbour views: ask the workers for their lists
+    /// (for the next 15 s), and wait for a fresh set if there isn't one.
+    pub async fn detail(&self) -> Summary {
+        use std::sync::atomic::Ordering;
+        let now = crate::report::unix_ms();
+        self.detail.store(now + 15_000, Ordering::Relaxed);
+        let s = self.summary();
+        if self.reports.is_empty() || now.saturating_sub(s.detail_ms) <= 2_000 {
+            return s;
+        }
+        // Workers publish every 250 ms and gather lists at most once a second.
+        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+        self.summary()
+    }
 }
 
 /// All workers' reports added up.
@@ -141,6 +158,10 @@ pub struct Summary {
     pub ports: Vec<eph_dataplane::PortCounters>,
     /// Per worker, in worker order.
     pub workers: Vec<WorkerView>,
+    pub neighbor_count: u64,
+    /// The oldest worker's session/neighbour lists (Unix ms; 0 = not all
+    /// workers have them).
+    pub detail_ms: u64,
 }
 
 /// One worker's load and table use.
@@ -189,7 +210,7 @@ impl Summary {
                 busy_ns: r.busy_ns,
                 sessions: r.stats.sessions_active,
                 sessions_max: r.sessions_max,
-                neighbors: r.neighbors.len() as u64,
+                neighbors: r.neighbor_count,
                 nat: r.nat_active,
             });
             for n in &r.neighbors {
@@ -204,6 +225,12 @@ impl Summary {
             .map(|r| (r.name(), drops[*r as usize]))
             .collect();
         s.neighbors = neighbors.into_values().collect();
+        s.neighbor_count = s.workers.iter().map(|w| w.neighbors).max().unwrap_or(0);
+        s.detail_ms = reports
+            .iter()
+            .map(|r| r.lock().unwrap().detail_ms)
+            .min()
+            .unwrap_or(0);
         s
     }
 }

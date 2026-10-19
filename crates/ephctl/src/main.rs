@@ -27,7 +27,7 @@ struct Cli {
 enum Cmd {
     /// Interfaces, counters, drops and session totals.
     Status,
-    /// Live sessions, busiest first.
+    /// Live sessions, newest first (at most 1000).
     Sessions {
         #[arg(short, long, default_value_t = 50)]
         limit: usize,

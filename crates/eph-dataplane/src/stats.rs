@@ -77,10 +77,12 @@ pub enum DropReason {
     DhcpToControl,
     /// PPPoE discovery or PPP control packet handed to the control plane.
     PppoeToControl,
+    /// For the control plane, but its queue was full (e.g. a DHCP flood).
+    ControlQueueFull,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 34] = [
+    pub const ALL: [DropReason; 35] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -115,6 +117,7 @@ impl DropReason {
         DropReason::OverlayReplay,
         DropReason::DhcpToControl,
         DropReason::PppoeToControl,
+        DropReason::ControlQueueFull,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -154,6 +157,7 @@ impl DropReason {
             DropReason::OverlayReplay => "overlay-replay",
             DropReason::DhcpToControl => "dhcp-to-control",
             DropReason::PppoeToControl => "pppoe-to-control",
+            DropReason::ControlQueueFull => "control-queue-full",
         }
     }
 }

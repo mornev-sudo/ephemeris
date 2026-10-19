@@ -7,7 +7,7 @@
 //! | GET    | /whoami                   | who is logged in, and how                   |
 //! | POST   | /system/password          | change the admin password {current?, new}   |
 //! | GET    | /status                   | ports, counters, drops, session totals      |
-//! | GET    | /sessions?limit=N         | live sessions, busiest first                |
+//! | GET    | /sessions?limit=N         | the newest sessions (at most 1000)          |
 //! | GET    | /neighbors                | ARP table                                   |
 //! | GET    | /stats/history?secs=N     | sessions, pps, bps, drops every 5 s (≤1 h)  |
 //! | GET    | /stats/resources          | CPU, memory, disk, threads, table capacity  |
@@ -582,7 +582,7 @@ async fn status(State(s): St) -> Json<Value> {
             "rx_bps": r.rx_bps, "tx_bps": r.tx_bps, "drops_per_sec": r.drops_per_sec,
         })),
         "drops_total": super::history::drops_total(&sum),
-        "neighbors": sum.neighbors.len(),
+        "neighbors": sum.neighbor_count,
         "pending_confirm_secs": cfg.pending_confirm_secs(),
         "candidate_staged": cfg.candidate_text().is_some(),
         "dataplane_error": s.startup.dataplane_error,
@@ -596,10 +596,14 @@ struct Limit {
 }
 
 async fn sessions(State(s): St, Query(q): Query<Limit>) -> Json<Value> {
-    let mut list = s.summary().sessions;
-    // Busiest first: what an operator usually wants to see.
-    list.sort_by_key(|v| std::cmp::Reverse(v.session.bytes[0] + v.session.bytes[1]));
-    let limit = q.limit.unwrap_or(200).min(10_000);
+    // The newest sessions (each worker gathers its newest 1000 while
+    // someone looks; together, the newest 1000 of those).
+    let mut list = s.detail().await.sessions;
+    list.sort_by_key(|v| std::cmp::Reverse(v.session.created_ns));
+    let limit = q
+        .limit
+        .unwrap_or(crate::report::SESSION_DETAIL)
+        .min(crate::report::SESSION_DETAIL);
     let (f, r) = (Dir::Forward as usize, Dir::Reverse as usize);
     let out: Vec<Value> = list
         .iter()
@@ -783,9 +787,11 @@ async fn stats_resources(State(s): St) -> Json<Value> {
 async fn neighbors(State(s): St) -> Json<Value> {
     let ports = s.ports.read().unwrap().clone();
     let out: Vec<Value> = s
-        .summary()
+        .detail()
+        .await
         .neighbors
         .iter()
+        .filter(|n| (n.port as usize) < ports.len())
         .map(|n| {
             json!({
                 "ip": n.ip.to_string(), "mac": eth::fmt_mac(&n.mac),
@@ -1567,6 +1573,7 @@ address = "10.10.2.1/24"
             update: Default::default(),
             system: Default::default(),
             umem_bytes: 0,
+            detail: Default::default(),
             stop: &STOP,
         };
         (Arc::new(s), rx)
