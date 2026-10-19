@@ -73,6 +73,9 @@ pub struct ConfigManager {
     /// Lists the router's NICs, to refuse interfaces on cards that don't
     /// exist. None (tests, `--check`) skips that check.
     nics: Option<fn() -> Vec<super::nics::Nic>>,
+    /// The router's current DHCP leases: a new config is also checked as it
+    /// would apply with them (e.g. a route via the ISP's gateway).
+    leases: Option<std::sync::Arc<std::sync::Mutex<crate::dhcp::DhcpState>>>,
 }
 
 impl ConfigManager {
@@ -103,7 +106,17 @@ impl ConfigManager {
             pending: None,
             next_id: 1,
             nics: None,
+            leases: None,
         })
+    }
+
+    /// Also check new configs with the router's current DHCP leases applied.
+    pub fn check_with_leases(
+        mut self,
+        leases: std::sync::Arc<std::sync::Mutex<crate::dhcp::DhcpState>>,
+    ) -> Self {
+        self.leases = Some(leases);
+        self
     }
 
     /// Also check new configs against the NICs this router actually has.
@@ -199,6 +212,14 @@ impl ConfigManager {
         }
         let cfg = Config::parse(&text)?;
         self.check_devices(&cfg)?;
+        if let Some(l) = &self.leases {
+            let leases = l.lock().unwrap().client_leases();
+            if !leases.is_empty() {
+                let now = cfg.with_leases(&leases);
+                now.fib(&now.ports(|_| Ok([0; 6]))?)
+                    .context("with the router's current DHCP lease")?;
+            }
+        }
         let preview = Preview {
             diff: diff(&self.running_text, &text),
             apply: self.classify(&cfg, &text),

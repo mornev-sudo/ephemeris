@@ -849,7 +849,23 @@ impl Config {
                 routes.push(OverlayRoute { prefix, site_idx });
             }
         }
-        build_fib(ports, &self.static_routes()?, &routes).map_err(anyhow::Error::msg)
+        // While an interface waits for its DHCP lease, a route through a
+        // gateway on no connected subnet may be meant for that interface's
+        // network: it waits for the lease instead of being an error.
+        let mut statics = self.static_routes()?;
+        let waiting = self
+            .interfaces
+            .iter()
+            .zip(ports)
+            .any(|(i, p)| i.is_dhcp_client() && p.addr.is_unspecified());
+        if waiting {
+            statics.retain(|r| {
+                ports
+                    .iter()
+                    .any(|p| !p.addr.is_unspecified() && p.subnet.contains(r.via))
+            });
+        }
+        build_fib(ports, &statics, &routes).map_err(anyhow::Error::msg)
     }
 
     /// Compile the NAT section into the data plane's form.
@@ -1366,6 +1382,56 @@ role = "outside"
         // Round trip through the GUI's serializer keeps the nested tables.
         let text = toml::to_string(&c).unwrap();
         assert_eq!(parse(&text).unwrap(), c, "{text}");
+    }
+
+    #[test]
+    fn routes_via_a_dhcp_network_wait_for_the_lease() {
+        use crate::dhcp::client::ClientLease;
+        let with_route =
+            format!("{DHCP_CFG}\n[[route]]\nprefix = \"192.168.77.0/24\"\nvia = \"203.0.113.9\"\n");
+        // No lease yet: valid, and the route waits outside the FIB.
+        let c = parse(&with_route).unwrap();
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        assert!(c
+            .fib(&ports)
+            .unwrap()
+            .lookup("192.168.77.1".parse().unwrap())
+            .is_none());
+        // With a lease on that network, it's in.
+        let mut leases = std::collections::HashMap::new();
+        leases.insert(
+            "wan".to_string(),
+            ClientLease {
+                addr: "203.0.113.50".parse().unwrap(),
+                prefix_len: 24,
+                router: None,
+                dns: vec![],
+                server: "203.0.113.1".parse().unwrap(),
+                server_mac: [0; 6],
+                obtained_unix: 0,
+                lease_secs: 3600,
+                t1_secs: 1800,
+                t2_secs: 3150,
+            },
+        );
+        let e = c.with_leases(&leases);
+        let fib = e.fib(&e.ports(|_| Ok([0; 6])).unwrap()).unwrap();
+        assert!(fib.lookup("192.168.77.1".parse().unwrap()).is_some());
+        // ...and a gateway on no network at all is still an error then.
+        let bad = parse(&with_route.replace("203.0.113.9", "172.31.0.1"))
+            .unwrap()
+            .with_leases(&leases);
+        assert!(bad.fib(&bad.ports(|_| Ok([0; 6])).unwrap()).is_err());
+        // Without any DHCP interface, nothing waits: still an error.
+        let static_only =
+            parse(&DHCP_CFG.replace("address = \"dhcp\"", "address = \"203.0.113.50/24\""))
+                .unwrap();
+        let mut s2 = static_only.clone();
+        s2.routes.push(RouteCfg {
+            prefix: "192.168.77.0/24".into(),
+            via: "172.31.0.1".into(),
+        });
+        assert!(s2.fib(&s2.ports(|_| Ok([0; 6])).unwrap()).is_err());
     }
 
     #[test]

@@ -137,6 +137,12 @@ The new settings are a *view* of the config, `Config::with_leases`. The
 config file itself is never rewritten by DHCP, and every commit is applied
 with the current lease folded in.
 
+Static routes through a gateway on the DHCP network are fine: before the
+first lease they **wait** (accepted, but not in the forwarding table), and
+they take effect as soon as the lease shows the gateway is connected. Once
+a lease exists, a commit is also checked against it, so a route through a
+gateway that isn't reachable from the router is still refused.
+
 The last address is remembered (`client-<interface>.json`), and asked for
 again after a restart, so the ISP usually hands the same one back.
 

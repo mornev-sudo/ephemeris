@@ -60,7 +60,7 @@ pub struct Shared {
     pub startup: crate::startup::StartupState,
     /// DHCP: what the router's own clients were given, and the leases it
     /// hands out (kept by the DHCP service, read by the API).
-    pub dhcp: Mutex<crate::dhcp::DhcpState>,
+    pub dhcp: Arc<Mutex<crate::dhcp::DhcpState>>,
     /// Where SD-WAN peers without a fixed address were last heard from.
     pub endpoints: Arc<eph_dataplane::overlay::Endpoints>,
     /// Set to stop the daemon (systemd then starts it again).

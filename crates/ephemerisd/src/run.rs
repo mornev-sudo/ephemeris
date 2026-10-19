@@ -53,8 +53,11 @@ pub fn run(config_path: &Path) -> Result<()> {
     }
     // Anything that stops the data plane from starting: go back to the last
     // config that worked (and restart with it), or run management only.
+    let dhcp_state = Arc::new(Mutex::new(crate::dhcp::DhcpState::default()));
     let manager = match ConfigManager::open(config_path) {
-        Ok(m) => m.check_nics(crate::mgmt::nics::list),
+        Ok(m) => m
+            .check_nics(crate::mgmt::nics::list)
+            .check_with_leases(dhcp_state.clone()),
         Err(e) => return Err(fall_back(config_path, &text, e)),
     };
     let cfg = manager.running().clone();
@@ -124,7 +127,7 @@ pub fn run(config_path: &Path) -> Result<()> {
                 .unwrap_or(std::path::Path::new("/var/lib/ephemeris")),
         ),
         startup,
-        dhcp: Default::default(),
+        dhcp: dhcp_state,
         endpoints,
         stop: &STOP,
     });
