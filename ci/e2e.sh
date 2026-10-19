@@ -220,6 +220,9 @@ sleep 0.5
 check "TCP B->A on A's session"            ip netns exec ci-ha iperf3 -c 10.10.2.10 -t3 -R
 # With a default route via host B, 8.8.8.8 is forwarded to B (which drops
 # it): the router no longer answers Net Unreachable.
+check "resources: CPU, memory, disk"       sh -c "${SSH[*]} ephctl --json system resources | grep -q '\"available\": [1-9]' && ${SSH[*]} ephctl system resources | grep -q '^Disk /var: .* free of'"
+check "resources: capacity table"          sh -c "${SSH[*]} ephctl system resources | grep -q '^Next hops (forwarding table)'"
+check "resources: worker threads measured" sh -c "${SSH[*]} ephctl --json system resources | grep -q '\"eph-worker-0\"'"
 check "live route add"                     sh -c "${SSH[*]} ephctl route add 0.0.0.0/0 10.10.2.10 && ! ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'net unreachable'"
 check "live route delete"                  sh -c "${SSH[*]} ephctl route del 0.0.0.0/0 && ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'From 10.10.1.1 .*net unreachable'"
 

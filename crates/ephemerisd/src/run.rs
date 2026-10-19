@@ -93,6 +93,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         replay,
         punts,
         endpoints,
+        umem_bytes,
     } = dp;
     let d = &cfg.dataplane;
 
@@ -131,6 +132,8 @@ pub fn run(config_path: &Path) -> Result<()> {
         endpoints,
         history: Default::default(),
         update: Default::default(),
+        system: Default::default(),
+        umem_bytes,
         stop: &STOP,
     });
     let mgmt = m.enabled.then(|| {
@@ -192,6 +195,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     let sample_every = Duration::from_secs(crate::mgmt::history::INTERVAL_SECS);
     let mut next_sample = Instant::now();
     let started = Instant::now();
+    let mut sysinfo = crate::mgmt::sysinfo::Sampler::default();
     while !STOP.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
         if Instant::now() >= next_sample {
@@ -201,11 +205,16 @@ pub fn run(config_path: &Path) -> Result<()> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let sum = shared.summary();
+            let at = started.elapsed().as_secs_f64();
+            // The data partition is the one that can fill up (config
+            // history, leases, logs); the root is read-only.
+            let sys = sysinfo.sample(at, &["/var"]);
             shared
                 .history
                 .lock()
                 .unwrap()
-                .record(started.elapsed().as_secs_f64(), unix, &sum);
+                .record(at, unix, &sum, Some(&sys));
+            *shared.system.lock().unwrap() = Some(sys);
         }
         if Instant::now() >= next && workers > 0 {
             next += interval;
@@ -288,6 +297,8 @@ struct Dataplane {
     punts: Option<mpsc::Receiver<eph_dataplane::Punt>>,
     /// Learned addresses of SD-WAN peers without a fixed one.
     endpoints: Arc<eph_dataplane::overlay::Endpoints>,
+    /// Packet buffer memory reserved, all workers.
+    umem_bytes: u64,
 }
 
 impl Dataplane {
@@ -302,6 +313,7 @@ impl Dataplane {
             endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(
                 overlay.tethers.len(),
             )),
+            umem_bytes: 0,
             overlay,
             runtime: cfg
                 .interfaces
@@ -560,6 +572,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         replay,
         punts: Some(punt_rx),
         endpoints,
+        umem_bytes: frames as u64 * FRAME_SIZE as u64 * workers as u64,
     })
 }
 

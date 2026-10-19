@@ -20,10 +20,11 @@ serde_json.workspace = true
 md-5.workspace = true
 axum.workspace = true
 tokio.workspace = true
+# statvfs and sysconf for the resource report (also used on Linux below).
+libc.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eph-xdp.workspace = true
-libc.workspace = true

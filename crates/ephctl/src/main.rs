@@ -70,6 +70,8 @@ enum Cmd {
 enum SystemCmd {
     /// Running build and the state of the last update job.
     Status,
+    /// CPU, memory, disk, per-thread CPU, and how full every table is.
+    Resources,
     /// List installed and available versions.
     Check,
     /// Install the newest version into the idle slot. The router keeps
@@ -752,6 +754,81 @@ fn config(c: &Client, cmd: ConfigCmd, json: bool) -> Result<()> {
 fn system(c: &Client, cmd: SystemCmd, json: bool) -> Result<()> {
     let v = match cmd {
         SystemCmd::Status => c.get("/system")?,
+        SystemCmd::Resources => {
+            let v = c.get("/stats/resources")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            let f = |x: &Value| x.as_f64().unwrap_or(0.0);
+            let u = |x: &Value| x.as_u64().unwrap_or(0);
+            let sys = &v["system"];
+            let m = &sys["memory"];
+            println!(
+                "CPU {:.1}% ({} cores) · load {} · up {}",
+                f(&sys["cpu_pct"]),
+                sys["cpu_each_pct"].as_array().map_or(0, |a| a.len()),
+                sys["load"].as_array().map_or("-".into(), |a| a
+                    .iter()
+                    .map(|x| format!("{:.2}", f(x)))
+                    .collect::<Vec<_>>()
+                    .join(" ")),
+                dur(u(&sys["uptime_secs"]))
+            );
+            println!(
+                "Memory {} of {} used · huge pages {}/{}",
+                size(u(&m["used"])),
+                size(u(&m["total"])),
+                u(&m["hugepages_total"]).saturating_sub(u(&m["hugepages_free"])),
+                u(&m["hugepages_total"])
+            );
+            for d in sys["disks"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "Disk {}: {} free of {}",
+                    str(&d["path"]),
+                    size(u(&d["free"])),
+                    size(u(&d["total"]))
+                );
+            }
+            let p = &v["process"];
+            println!(
+                "ephemerisd: {:.1}% of one core, {} resident (packet buffers {}, session tables {}, forwarding table {})\n",
+                f(&p["cpu_pct"]),
+                size(u(&p["rss"])),
+                size(u(&p["memory"]["packet_buffers"])),
+                size(u(&p["memory"]["session_tables"])),
+                size(u(&p["memory"]["forwarding_table"]))
+            );
+            table(
+                &["WORKER", "BUSY", "SESSIONS", "NEIGHBOURS", "NAT"],
+                rows(&v["workers"], |w| {
+                    vec![
+                        str(&w["id"]),
+                        format!("{:.1}%", f(&w["busy_pct"])),
+                        format!("{}/{}", u(&w["sessions"]), u(&w["sessions_max"])),
+                        format!("{}/{}", u(&w["neighbors"]), u(&w["neighbors_max"])),
+                        u(&w["nat"]).to_string(),
+                    ]
+                }),
+            );
+            println!();
+            table(
+                &["TABLE", "USED", "LIMIT", "%", "NOTE"],
+                rows(&v["capacity"], |c| {
+                    let (used, max) = (u(&c["used"]), c["max"].as_u64());
+                    vec![
+                        str(&c["name"]),
+                        used.to_string(),
+                        max.map_or("-".into(), |m| m.to_string()),
+                        max.filter(|&m| m > 0).map_or("-".into(), |m| {
+                            format!("{:.0}%", 100.0 * used as f64 / m as f64)
+                        }),
+                        str(&c["note"]),
+                    ]
+                }),
+            );
+            return Ok(());
+        }
         SystemCmd::Check => c.call("POST", "/system/update/check", None)?,
         SystemCmd::Update => c.call("POST", "/system/update", None)?,
         SystemCmd::Reboot { force } => {
@@ -953,6 +1030,17 @@ fn table(head: &[&str], rows: Vec<Vec<String>>) {
     for r in rows {
         line(r);
     }
+}
+
+/// Bytes, scaled: "512 B", "3.4 MB", "1.9 GB".
+fn size(b: u64) -> String {
+    let (v, u) = match b {
+        b if b >= 1 << 30 => (b as f64 / (1u64 << 30) as f64, "GB"),
+        b if b >= 1 << 20 => (b as f64 / (1u64 << 20) as f64, "MB"),
+        b if b >= 1 << 10 => (b as f64 / 1024.0, "kB"),
+        b => return format!("{b} B"),
+    };
+    format!("{v:.1} {u}")
 }
 
 /// Bits per second, scaled: "950 bps", "12.5 kbps", "3.20 Mbps".

@@ -56,6 +56,11 @@ impl Worker {
         let mut tx_pending = vec![false; nports];
         let mut idle = 0u32;
         let mut last_report = Instant::now();
+        // Busy time: a round that handled packets counts from its start to
+        // the next round's start.
+        let mut busy_ns = 0u64;
+        let mut round_start = 0u64;
+        let mut round_busy = false;
         let mut pollfds: Vec<libc::pollfd> = self
             .socks
             .iter()
@@ -71,6 +76,10 @@ impl Worker {
 
         while !stop.load(Ordering::Relaxed) {
             let now_ns = epoch.elapsed().as_nanos() as u64;
+            if round_busy {
+                busy_ns += now_ns.saturating_sub(round_start);
+            }
+            round_start = now_ns;
             self.pipeline.set_time(now_ns);
             self.pipeline.housekeeping();
             while let Ok(msg) = self.control.try_recv() {
@@ -222,9 +231,10 @@ impl Worker {
                 }
             }
 
+            round_busy = work > 0;
             if last_report.elapsed() >= REPORT_EVERY {
                 last_report = Instant::now();
-                self.publish(now_ns);
+                self.publish(now_ns, busy_ns);
             }
 
             // 7. Nothing to do? Spin a little (cheap, lowest latency), then
@@ -245,13 +255,16 @@ impl Worker {
                 idle = 0;
             }
         }
-        self.publish(epoch.elapsed().as_nanos() as u64);
+        self.publish(epoch.elapsed().as_nanos() as u64, busy_ns);
     }
 
-    fn publish(&self, now_ns: u64) {
+    fn publish(&self, now_ns: u64, busy_ns: u64) {
         // try_lock: a worker never waits on the stats reader.
         if let Ok(mut r) = self.report.try_lock() {
             r.stats = self.pipeline.stats.clone();
+            r.busy_ns = busy_ns;
+            r.sessions_max = self.pipeline.sessions().capacity() as u64;
+            r.nat_active = self.pipeline.sessions().nat_active;
             r.neighbors = self.pipeline.neighbors().collect();
             let mut k = KernelStats::default();
             for s in &self.socks {

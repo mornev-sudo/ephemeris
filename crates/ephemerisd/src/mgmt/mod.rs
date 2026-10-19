@@ -18,6 +18,7 @@ pub mod diff;
 pub mod history;
 pub mod nics;
 pub mod paths;
+pub mod sysinfo;
 
 use crate::config::Config;
 use crate::report::{Control, Report, SessionView};
@@ -78,6 +79,10 @@ pub struct Shared {
     /// What the software-update buttons know: the version being installed
     /// and the boot loader's view (cached: the System tab polls).
     pub update: Mutex<UpdateCache>,
+    /// The latest reading of the machine's resources (every 5 s).
+    pub system: Mutex<Option<sysinfo::Snapshot>>,
+    /// Packet buffer memory (UMEM) reserved at start, all workers.
+    pub umem_bytes: u64,
     /// Set to stop the daemon (systemd then starts it again).
     pub stop: &'static AtomicBool,
 }
@@ -134,6 +139,19 @@ pub struct Summary {
     pub tethers: Vec<TetherStats>,
     /// Per interface (index = port id).
     pub ports: Vec<eph_dataplane::PortCounters>,
+    /// Per worker, in worker order.
+    pub workers: Vec<WorkerView>,
+}
+
+/// One worker's load and table use.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkerView {
+    /// Time spent handling packets since it started (ns).
+    pub busy_ns: u64,
+    pub sessions: u64,
+    pub sessions_max: u64,
+    pub neighbors: u64,
+    pub nat: u64,
 }
 
 impl Summary {
@@ -167,6 +185,13 @@ impl Summary {
                 t.tx_bytes += p.tx_bytes;
             }
             s.sessions.extend(r.sessions.iter().cloned());
+            s.workers.push(WorkerView {
+                busy_ns: r.busy_ns,
+                sessions: r.stats.sessions_active,
+                sessions_max: r.sessions_max,
+                neighbors: r.neighbors.len() as u64,
+                nat: r.nat_active,
+            });
             for n in &r.neighbors {
                 neighbors.insert((n.port, n.ip), *n);
             }

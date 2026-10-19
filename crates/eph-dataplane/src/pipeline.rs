@@ -69,7 +69,7 @@ const NEIGHBOR_REFRESH_NS: u64 = 300 * 1_000_000_000;
 const NEIGHBOR_FORGET_NS: u64 = 1200 * 1_000_000_000;
 /// Neighbours per worker. A large subnet full of ARP senders can't grow the
 /// table without bound.
-const NEIGHBOR_MAX: usize = 16384;
+pub const NEIGHBOR_MAX: usize = 16384;
 /// Tell sibling workers about a re-confirmed neighbour at most this often.
 const NEIGHBOR_SHARE_NS: u64 = 60 * 1_000_000_000;
 /// Cap on outstanding ARP attempts, so a scan of a /8 can't eat memory.

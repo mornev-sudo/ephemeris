@@ -203,7 +203,23 @@ impl<T> Fib<T> {
     pub fn tbl8_groups(&self) -> usize {
         self.tbl8.len() / 256
     }
+
+    /// Distinct next hops in use (at most [`MAX_NEXT_HOPS`]).
+    pub fn next_hops(&self) -> usize {
+        self.values.len().saturating_sub(1)
+    }
+
+    /// Memory the lookup tables take: 32 MiB for tbl24, plus 512 bytes per
+    /// tbl8 group.
+    pub fn memory_bytes(&self) -> usize {
+        (self.tbl24.len() + self.tbl8.len()) * 2
+    }
 }
+
+/// Capacity limits (entries are 15-bit ids): distinct next hops, and /24s
+/// holding routes longer than /24 (each takes a 256-entry tbl8 group).
+pub const MAX_NEXT_HOPS: usize = MAX_ID;
+pub const MAX_TBL8_GROUPS: usize = MAX_ID + 1;
 
 #[cfg(test)]
 mod tests {
@@ -242,11 +258,20 @@ mod tests {
         assert_eq!(fib.lookup(ip("10.1.2.200")), Some(&"host"));
         assert_eq!(fib.lookup(ip("10.1.2.201")), Some(&"slash25"));
         assert_eq!(fib.tbl8_groups(), 1);
+        assert_eq!(fib.memory_bytes(), ((1 << 24) + 256) * 2);
     }
 
     #[test]
     fn no_default_route_means_none() {
         let fib = Fib::build([(p("192.168.0.0/16"), 1)]).unwrap();
+        assert_eq!(fib.next_hops(), 1);
+        let two = Fib::build([
+            (p("10.0.0.0/8"), 1),
+            (p("10.1.0.0/16"), 2),
+            (p("10.2.0.0/16"), 1),
+        ])
+        .unwrap();
+        assert_eq!(two.next_hops(), 2, "next hops are shared between routes");
         assert_eq!(fib.lookup(ip("192.168.4.4")), Some(&1));
         assert_eq!(fib.lookup(ip("192.169.0.0")), None);
         let empty: Fib<u8> = Fib::build([]).unwrap();

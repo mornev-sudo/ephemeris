@@ -28,6 +28,14 @@ pub struct Sample {
     pub drops_total: u64,
     /// Per interface, in port order.
     pub ports: Vec<PortRate>,
+    /// The machine: all CPUs (0-100) and memory in use (bytes).
+    pub cpu_pct: f64,
+    pub mem_used: u64,
+    pub mem_total: u64,
+    /// ephemerisd's CPU (100 = one core) and how busy each worker really
+    /// was handling packets (0-100, time-based).
+    pub process_cpu_pct: f64,
+    pub workers_busy_pct: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -44,6 +52,7 @@ struct Totals {
     at: f64,
     ports: Vec<eph_dataplane::PortCounters>,
     drops: u64,
+    busy_ns: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -55,11 +64,18 @@ pub struct History {
 impl History {
     /// Turn the counters now into a sample. `at` is a monotonic time in
     /// seconds, `unix` the wall clock for the graph's time axis.
-    pub fn record(&mut self, at: f64, unix: u64, s: &Summary) {
+    pub fn record(
+        &mut self,
+        at: f64,
+        unix: u64,
+        s: &Summary,
+        sys: Option<&super::sysinfo::Snapshot>,
+    ) {
         let now = Totals {
             at,
             ports: s.ports.clone(),
             drops: drops_total(s),
+            busy_ns: s.workers.iter().map(|w| w.busy_ns).collect(),
         };
         let Some(prev) = self.last.replace(now.clone()) else {
             return; // rates need two readings
@@ -85,6 +101,15 @@ impl History {
             })
             .collect();
         let sum = |f: fn(&PortRate) -> f64| ports.iter().map(f).sum::<f64>();
+        let workers_busy_pct = now
+            .busy_ns
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let p = prev.busy_ns.get(i).copied().unwrap_or(b);
+                (b.saturating_sub(p) as f64 / (dt * 1e9) * 100.0).min(100.0)
+            })
+            .collect();
         self.samples.push_back(Sample {
             t: unix,
             sessions: s.sessions_active,
@@ -95,6 +120,11 @@ impl History {
             drops_per_sec: rate(now.drops, prev.drops),
             drops_total: now.drops,
             ports,
+            cpu_pct: sys.map_or(0.0, |x| x.cpu_pct),
+            mem_used: sys.map_or(0, |x| x.memory.used),
+            mem_total: sys.map_or(0, |x| x.memory.total),
+            process_cpu_pct: sys.map_or(0.0, |x| x.process_cpu_pct),
+            workers_busy_pct,
         });
         while self.samples.len() > KEEP {
             self.samples.pop_front();
@@ -149,9 +179,9 @@ mod tests {
     #[test]
     fn counters_become_rates() {
         let mut h = History::default();
-        h.record(0.0, 1000, &summary(0, 0, 0, 0));
+        h.record(0.0, 1000, &summary(0, 0, 0, 0), None);
         assert!(h.latest().is_none(), "one reading isn't a rate yet");
-        h.record(5.0, 1005, &summary(5000, 625_000, 50, 12));
+        h.record(5.0, 1005, &summary(5000, 625_000, 50, 12), None);
         let s = h.latest().unwrap();
         assert_eq!(s.t, 1005);
         assert_eq!(s.sessions, 12);
@@ -165,10 +195,22 @@ mod tests {
     }
 
     #[test]
+    fn worker_busy_time_becomes_a_percentage() {
+        let mut h = History::default();
+        let mut s = summary(0, 0, 0, 0);
+        s.workers = vec![Default::default(), Default::default()];
+        h.record(0.0, 0, &s, None);
+        s.workers[0].busy_ns = 2_500_000_000; // 2.5 s of 5 s
+        s.workers[1].busy_ns = 50_000_000;
+        h.record(5.0, 5, &s, None);
+        assert_eq!(h.latest().unwrap().workers_busy_pct, vec![50.0, 1.0]);
+    }
+
+    #[test]
     fn a_restart_never_gives_negative_rates() {
         let mut h = History::default();
-        h.record(0.0, 0, &summary(1_000_000, 1_000_000, 100, 5));
-        h.record(5.0, 5, &summary(10, 10, 0, 5));
+        h.record(0.0, 0, &summary(1_000_000, 1_000_000, 100, 5), None);
+        h.record(5.0, 5, &summary(10, 10, 0, 5), None);
         let s = h.latest().unwrap();
         assert_eq!((s.rx_pps, s.drops_per_sec), (0.0, 0.0));
     }
@@ -177,7 +219,7 @@ mod tests {
     fn keeps_an_hour() {
         let mut h = History::default();
         for i in 0..(KEEP as u64 + 50) {
-            h.record(i as f64 * 5.0, i * 5, &summary(i, i, 0, 0));
+            h.record(i as f64 * 5.0, i * 5, &summary(i, i, 0, 0), None);
         }
         assert_eq!(h.since(u64::MAX).len(), KEEP);
         assert_eq!(

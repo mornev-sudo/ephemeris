@@ -10,6 +10,7 @@
 //! | GET    | /sessions?limit=N         | live sessions, busiest first                |
 //! | GET    | /neighbors                | ARP table                                   |
 //! | GET    | /stats/history?secs=N     | sessions, pps, bps, drops every 5 s (≤1 h)  |
+//! | GET    | /stats/resources          | CPU, memory, disk, threads, table capacity  |
 //! | GET    | /dhcp                     | DHCP: the router's own leases, leases given |
 //! | GET    | /wan                      | outside interfaces: static / DHCP / PPPoE   |
 //! | GET    | /routes                   | forwarding table                            |
@@ -104,6 +105,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/sessions", get(sessions))
         .route("/neighbors", get(neighbors))
         .route("/stats/history", get(stats_history))
+        .route("/stats/resources", get(stats_resources))
         .route("/dhcp", get(dhcp_status))
         .route("/wan", get(wan_status))
         .route("/routes", get(routes).post(add_route).delete(del_route))
@@ -640,6 +642,141 @@ async fn stats_history(State(s): St, Query(q): Query<HistoryQuery>) -> Json<Valu
         "interval_secs": super::history::INTERVAL_SECS,
         "interfaces": names,
         "samples": s.history.lock().unwrap().since(secs),
+    }))
+}
+
+/// The router's resources and how full its tables are.
+async fn stats_resources(State(s): St) -> Json<Value> {
+    let sum = s.summary();
+    let sys = s.system.lock().unwrap().clone().unwrap_or_default();
+    let busy = s
+        .history
+        .lock()
+        .unwrap()
+        .latest()
+        .map(|x| x.workers_busy_pct.clone())
+        .unwrap_or_default();
+    let fib = s.fib.read().unwrap().clone();
+    let drop = |name: &str| sum.drops.get(name).copied().unwrap_or(0);
+
+    let workers: Vec<Value> = sum
+        .workers
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            json!({
+                "id": i, "busy_pct": busy.get(i).copied().unwrap_or(0.0),
+                "sessions": w.sessions, "sessions_max": w.sessions_max,
+                "neighbors": w.neighbors, "neighbors_max": eph_dataplane::NEIGHBOR_MAX,
+                "nat": w.nat,
+            })
+        })
+        .collect();
+
+    // Capacity: each limit the router has, and how close it is.
+    let mut capacity = vec![];
+    let mut cap = |name: &str, used: u64, max: Option<u64>, note: String| {
+        capacity.push(json!({ "name": name, "used": used, "max": max, "note": note }));
+    };
+    let sessions: u64 = sum.workers.iter().map(|w| w.sessions).sum();
+    let sessions_max: u64 = sum.workers.iter().map(|w| w.sessions_max).sum();
+    cap(
+        "Sessions",
+        sessions,
+        (sessions_max > 0).then_some(sessions_max),
+        format!(
+            "{} refused because a table was full (raise sessions.max_per_worker)",
+            drop("session-table-full")
+        ),
+    );
+    let busiest_neigh = sum.workers.iter().map(|w| w.neighbors).max().unwrap_or(0);
+    cap(
+        "Neighbours (ARP), busiest worker",
+        busiest_neigh,
+        Some(eph_dataplane::NEIGHBOR_MAX as u64),
+        "hosts the router knows the MAC address of".into(),
+    );
+    cap(
+        "NAT translations",
+        sum.workers.iter().map(|w| w.nat).sum(),
+        None,
+        format!(
+            "~64,000 ports per outside address and destination; {} sessions found no free port",
+            drop("nat-exhausted")
+        ),
+    );
+    cap(
+        "Routes",
+        fib.routes().len() as u64,
+        None,
+        "routes up to /24 have no practical limit".into(),
+    );
+    cap(
+        "Next hops (forwarding table)",
+        fib.next_hops() as u64,
+        Some(eph_fib::MAX_NEXT_HOPS as u64),
+        "distinct gateways, interfaces and SD-WAN sites routes point to".into(),
+    );
+    cap(
+        "/24s holding longer routes",
+        fib.tbl8_groups() as u64,
+        Some(eph_fib::MAX_TBL8_GROUPS as u64),
+        "each /24 with a /25-/32 route inside it takes one".into(),
+    );
+    // DHCP pools: leased (or offered) out of the range's size.
+    let cfg = s.config.lock().unwrap().running().clone();
+    let st = s.dhcp.lock().unwrap().clone();
+    for i in &cfg.interfaces {
+        let Some(d) = &i.dhcp else { continue };
+        let size = d
+            .range
+            .split_once('-')
+            .and_then(|(a, b)| {
+                let a: std::net::Ipv4Addr = a.trim().parse().ok()?;
+                let b: std::net::Ipv4Addr = b.trim().parse().ok()?;
+                Some((u32::from(b) - u32::from(a)) as u64 + 1)
+            })
+            .unwrap_or(0);
+        let leased = st.leases.get(&i.name).map_or(0, |l| {
+            l.iter()
+                .filter(|x| x.state != crate::dhcp::server::LeaseState::Declined)
+                .count() as u64
+        });
+        cap(
+            &format!("DHCP pool on {}", i.name),
+            leased,
+            Some(size),
+            d.range.clone(),
+        );
+    }
+    let health = s.health.read().unwrap().clone();
+    if !s.overlay.tethers.is_empty() {
+        cap(
+            "SD-WAN tethers up",
+            health.iter().filter(|h| h.up).count() as u64,
+            Some(s.overlay.tethers.len() as u64),
+            "of the configured tethers".into(),
+        );
+    }
+
+    let session_bytes = sessions_max * std::mem::size_of::<eph_dataplane::Session>() as u64;
+    Json(json!({
+        "system": {
+            "cpu_pct": sys.cpu_pct, "cpu_each_pct": sys.cpu_each_pct,
+            "memory": sys.memory, "load": sys.load, "uptime_secs": sys.uptime_secs,
+            "disks": sys.disks,
+        },
+        "process": {
+            "rss": sys.process_rss, "cpu_pct": sys.process_cpu_pct, "threads": sys.threads,
+            // The big, fixed parts of ephemerisd's memory.
+            "memory": {
+                "packet_buffers": s.umem_bytes,
+                "session_tables": session_bytes,
+                "forwarding_table": fib.memory_bytes(),
+            },
+        },
+        "workers": workers,
+        "capacity": capacity,
     }))
 }
 
@@ -1428,6 +1565,8 @@ address = "10.10.2.1/24"
             endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
             history: Default::default(),
             update: Default::default(),
+            system: Default::default(),
+            umem_bytes: 0,
             stop: &STOP,
         };
         (Arc::new(s), rx)

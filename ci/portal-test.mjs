@@ -58,6 +58,8 @@ try {
     await page.click("button[data-tab=reports]");
     await page.waitForFunction(() => document.querySelectorAll("#charts svg").length === 4);
     await page.waitForSelector("#ifrates td:has-text('lan-a')");
+    await page.waitForSelector("#captab td:has-text('Next hops')");
+    await page.waitForSelector("#syscardsr .card:has-text('Memory')");
     await page.screenshot({ path: `${shots}/portal-reporting.png`, fullPage: true });
   });
   await step("sessions tab", async () => {

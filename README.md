@@ -115,6 +115,7 @@ Plain-language explanations of everything in here, in reading order:
 - [x] **DHCP:** server on inside interfaces (ranges, reservations, persistent leases, DNS passed on from the WAN), client on outside interfaces (address, gateway and default route applied live)
 - [x] **PPPoE:** outside interfaces dial their ISP (RFC 2516 discovery, LCP with keepalives, PAP / CHAP-MD5, IPCP with DNS), 1492 MTU and MSS handled, applied live
 - [x] **Reporting:** open sessions, packets/s, throughput and drops sampled every 5 s; live graphs in the portal (last hour), the same numbers on the dashboard and in `ephctl status`
+- [x] **Resources and capacity:** CPU (per core, per thread), memory and huge pages, disk, worker busy %, and every table's usage against its limit (FIB, sessions, neighbours, NAT, DHCP pools, tethers)
 - [ ] **Next for the edge:** destination NAT / port forwarding, VLANs (802.1Q), `ephsh` router CLI
 - [ ] **Phase 4: SD-WAN.**
   - [x] 4a: UDP overlay tethers over multiple WANs, in-place encapsulation, probing (latency/jitter/loss), app-aware path selection with SLAs and hysteresis, failover, MSS clamping, path MTU

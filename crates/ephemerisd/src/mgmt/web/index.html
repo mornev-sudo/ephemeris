@@ -37,6 +37,9 @@
   .chart .axis { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .charthead { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
   .charthead h3 { margin: 0 auto 0 0; }
+  .bar { position: relative; height: 8px; min-width: 90px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  .bar > i { position: absolute; inset: 0 auto 0 0; background: var(--ok); }
+  .bar.warn > i { background: var(--warn); } .bar.bad > i { background: var(--bad); }
   .legend { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .legend::before { content: ""; display: inline-block; width: 10px; height: 3px; margin-right: 5px; vertical-align: middle; background: var(--c); }
   .card .s { font-size: 12px; color: var(--muted); }
@@ -120,6 +123,15 @@
     </div>
     <div class="charts" id="charts"></div>
     <section><h2>Per interface, last 5 seconds</h2><div class="tablewrap"><table id="ifrates"></table></div></section>
+    <h2 style="margin-top:20px">System</h2>
+    <div class="grid" id="syscardsr"></div>
+    <div class="charts" id="syscharts" style="margin-top:12px"></div>
+    <section><h2>Capacity</h2><p class="s">Every limit the router has, and how close it is. Amber above 80%, red above 95%.</p>
+      <div class="tablewrap"><table id="captab"></table></div></section>
+    <section><h2>Workers</h2><p class="s">Busy: the share of time spent handling packets (real load, even with busy polling, which keeps a core at 100% CPU regardless).</p>
+      <div class="tablewrap"><table id="wrktab"></table></div></section>
+    <section><h2>ephemerisd: CPU per thread and memory</h2><div class="tablewrap"><table id="thrtab"></table></div>
+      <div class="tablewrap" style="margin-top:8px"><table id="memtab"></table></div></section>
   </div>
 
   <div id="tab-sessions" class="hidden">

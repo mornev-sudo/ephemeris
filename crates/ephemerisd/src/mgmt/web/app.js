@@ -78,6 +78,53 @@ function lineChart(box, title, times, series, fmt) {
   box.append(c);
 }
 
+function bytes2(x) {
+  const u = [["TB", 2 ** 40], ["GB", 2 ** 30], ["MB", 2 ** 20], ["kB", 2 ** 10]].find(([, d]) => x >= d);
+  return u ? (x / u[1]).toFixed(x / u[1] >= 100 ? 0 : 1) + " " + u[0] : x + " B";
+}
+function pct(x) { return (x >= 10 ? x.toFixed(0) : x.toFixed(1)) + "%"; }
+/// A usage bar: green, amber above 80%, red above 95%.
+function usage(used, max) {
+  const d = el("td");
+  if (!max) { d.textContent = "no fixed limit"; d.className = "s"; return d; }
+  const f = used / max, b = el("div", undefined, "bar" + (f > 0.95 ? " bad" : f > 0.8 ? " warn" : ""));
+  const i = document.createElement("i"); i.style.width = Math.min(100, f * 100).toFixed(1) + "%"; b.append(i);
+  b.title = pct(f * 100); d.append(b); return d;
+}
+
+async function refreshResources(samples) {
+  const r = await api("GET", "/stats/resources");
+  const m = r.system.memory, disk = (r.system.disks || [])[0];
+  $("syscardsr").replaceChildren(
+    card("CPU", pct(r.system.cpu_pct), `${r.system.cpu_each_pct.length} cores · ephemerisd ${pct(r.process.cpu_pct)} of one core`),
+    card("Memory", m.total ? pct(100 * m.used / m.total) : "–", `${bytes2(m.used)} of ${bytes2(m.total)} · ephemerisd ${bytes2(r.process.rss)}`),
+    card("Huge pages", m.hugepages_total ? `${m.hugepages_total - m.hugepages_free} / ${m.hugepages_total}` : "none", m.hugepage_size ? `${bytes2(m.hugepage_size)} each: packet buffers` : ""),
+    card("Disk (" + (disk ? disk.path : "/var") + ")", disk ? pct(100 * disk.used / disk.total) : "–", disk ? `${bytes2(disk.free)} free of ${bytes2(disk.total)}` : ""),
+    card("Load", r.system.load.map(x => x.toFixed(2)).join(" "), "1, 5, 15 minutes"),
+    card("Uptime", dur(r.system.uptime_secs), "since the router booted"));
+  const t = samples.map(s => s.t);
+  const box = $("syscharts"); box.replaceChildren();
+  lineChart(box, "CPU", t, [
+    { label: "all cores", color: "var(--accent)", values: samples.map(s => s.cpu_pct) },
+    { label: "ephemerisd (1 core = 100)", color: "var(--ok)", values: samples.map(s => s.process_cpu_pct) }], pct);
+  lineChart(box, "Memory in use", t, [{ label: "used", color: "var(--accent)", values: samples.map(s => s.mem_used) }], bytes2);
+  const nw = Math.max(0, ...samples.map(s => (s.workers_busy_pct || []).length));
+  const colors = ["var(--accent)", "var(--ok)", "var(--warn)", "var(--bad)"];
+  lineChart(box, "Workers busy", t, [...Array(nw).keys()].map(i => ({
+    label: "worker " + i, color: colors[i % 4], values: samples.map(s => (s.workers_busy_pct || [])[i] || 0) })), pct);
+  table($("captab"), ["Table", "Used", "Limit", "", "Note"], r.capacity.map(c =>
+    [c.name, n(c.used), c.max == null ? "–" : n(c.max), usage(c.used, c.max), td(c.note, "s")]));
+  table($("wrktab"), ["Worker", "Busy", "Sessions", "Neighbours", "NAT translations"], r.workers.map(w =>
+    ["worker " + w.id, pct(w.busy_pct), `${n(w.sessions)} / ${n(w.sessions_max)}`, `${n(w.neighbors)} / ${n(w.neighbors_max)}`, n(w.nat)]));
+  table($("thrtab"), ["Thread", "CPU (1 core = 100%)"], r.process.threads.map(x => [td(x.name, "mono"), pct(x.cpu_pct)]));
+  const pm = r.process.memory;
+  table($("memtab"), ["ephemerisd memory", "Size"], [
+    ["Resident (all of it)", bytes2(r.process.rss)],
+    ["Packet buffers (reserved at start)", bytes2(pm.packet_buffers)],
+    ["Session tables (reserved at start)", bytes2(pm.session_tables)],
+    ["Forwarding table", bytes2(pm.forwarding_table)]]);
+}
+
 let reportRange = 900;
 async function refreshReports() {
   const h = await api("GET", "/stats/history?secs=" + reportRange);
@@ -95,6 +142,7 @@ async function refreshReports() {
   $("reportmeta").textContent = latest
     ? `Every ${h.interval_secs} s · dropped packets since start: ${n(latest.drops_total)} · last sample ${new Date(latest.t * 1000).toLocaleTimeString()}`
     : `Every ${h.interval_secs} s`;
+  await refreshResources(S);
   table($("ifrates"), ["Interface", "In", "Out", "In (pps)", "Out (pps)"],
     latest ? h.interfaces.map((name, i) => { const p = latest.ports[i] || {}; return [name, bps(p.rx_bps || 0), bps(p.tx_bps || 0), pps(p.rx_pps || 0), pps(p.tx_pps || 0)]; }) : []);
 }
@@ -114,6 +162,12 @@ async function refreshDash() {
     + ". Fix the configuration (Configuration tab), commit, then restart the data plane.");
   if (s.fallback) warn.push(`A newer configuration failed to start (${s.fallback.error}), so the router went back to the last one that worked. `
     + `The failed one was kept as ${s.fallback.failed_file}.`);
+  try {
+    const res = await api("GET", "/stats/resources");
+    for (const d of res.system.disks || [])
+      if (d.total && d.used / d.total > 0.9)
+        warn.push(`The data disk (${d.path}) is ${pct(100 * d.used / d.total)} full: ${bytes2(d.free)} left. Config history, leases and logs live there.`);
+  } catch { /* the warning is a nicety */ }
   $("dashwarn").replaceChildren(...warn.map(w => el("p", w)));
   $("dashwarn").classList.toggle("hidden", !warn.length);
   const wan = await api("GET", "/wan");

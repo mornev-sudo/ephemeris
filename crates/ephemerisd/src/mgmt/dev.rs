@@ -48,6 +48,8 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
         history: Default::default(),
         update: Default::default(),
+        system: Default::default(),
+        umem_bytes: 0,
         stop: &STOP,
     });
     // Made-up traffic every 5 s, so the Reporting graphs have something to
@@ -56,6 +58,7 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         let shared = shared.clone();
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
+            let mut sampler = super::sysinfo::Sampler::default();
             let mut sum = super::Summary {
                 ports: vec![Default::default(); shared.ports.read().unwrap().len()],
                 ..Default::default()
@@ -76,7 +79,13 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                shared.history.lock().unwrap().record(t, unix, &sum);
+                let sys = sampler.sample(t, &["/"]);
+                shared
+                    .history
+                    .lock()
+                    .unwrap()
+                    .record(t, unix, &sum, Some(&sys));
+                *shared.system.lock().unwrap() = Some(sys);
                 std::thread::sleep(std::time::Duration::from_secs(
                     super::history::INTERVAL_SECS,
                 ));

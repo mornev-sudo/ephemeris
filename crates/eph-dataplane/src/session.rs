@@ -324,9 +324,16 @@ pub struct SessionTable {
     /// TCP segments whose sequence number didn't fit their connection; any
     /// RST or FIN in them was ignored.
     pub blind: u64,
+    /// Sessions with a NAT translation right now.
+    pub nat_active: u64,
 }
 
 impl SessionTable {
+    /// How many sessions the table can hold (allocated up front).
+    pub fn capacity(&self) -> u32 {
+        self.cfg.max_sessions
+    }
+
     pub fn new(cfg: SessionConfig) -> Self {
         // A per-process random seed, so an attacker can't precompute flows
         // that all land in the same hash bucket. (FxHash is fast but not a
@@ -344,6 +351,7 @@ impl SessionTable {
             created: 0,
             expired: 0,
             blind: 0,
+            nat_active: 0,
         }
     }
 
@@ -605,7 +613,9 @@ impl SessionTable {
             return false;
         }
         self.map.insert(nat.xkey, idx);
-        self.slab[idx as usize].nat = Some(nat);
+        if self.slab[idx as usize].nat.replace(nat).is_none() {
+            self.nat_active += 1;
+        }
         true
     }
 
@@ -617,6 +627,7 @@ impl SessionTable {
         self.map.remove(&key);
         if let Some(n) = nat {
             self.map.remove(&n.xkey);
+            self.nat_active = self.nat_active.saturating_sub(1);
         }
         self.free.push(idx);
     }

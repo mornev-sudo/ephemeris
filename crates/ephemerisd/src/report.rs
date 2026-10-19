@@ -45,6 +45,12 @@ pub struct Report {
     pub sessions: Vec<SessionView>,
     /// Per overlay tether: counters and probe measurements.
     pub tethers: Vec<TetherStats>,
+    /// Time spent on loop rounds that had packets to handle (ns, since the
+    /// worker started): divided by the time passed, how busy it really is,
+    /// even with busy polling (which shows 100% CPU regardless).
+    pub busy_ns: u64,
+    pub sessions_max: u64,
+    pub nat_active: u64,
 }
 
 /// A copy of a session, detached from the worker's table.

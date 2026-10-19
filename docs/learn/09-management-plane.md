@@ -148,6 +148,44 @@ How it's measured:
 Sampling itself runs all the time. It's a few additions every 5 seconds,
 so the graphs already show the last hour when you open the page.
 
+### Resources and capacity
+
+The Reporting tab's **System** section, `ephctl system resources` and
+`GET /api/v1/stats/resources` show what the router itself uses, from `/proc`
+and `statvfs` ([`sysinfo.rs`](../../crates/ephemerisd/src/mgmt/sysinfo.rs)):
+
+- **The machine:**
+  - CPU per core and in total, as a share of time over the last interval;
+  - memory, and the **huge pages** the packet buffers live in;
+  - load average and uptime;
+  - free space on the data partition `/var`. The dashboard warns above
+    90%, since config history, leases and logs live there.
+- **ephemerisd:**
+  - its resident memory, with the big fixed parts named: packet buffers
+    and session tables (both reserved at start), and the forwarding table
+    (32 MiB for DIR-24-8's first level);
+  - **CPU per thread** (`eph-worker-0`, `eph-mgmt`, `eph-dhcp`...).
+- **Workers' busy %:** the share of *time* each worker spent on loop rounds
+  that had packets to handle. CPU % can't show this: with `busy_poll` a
+  worker spins at 100% CPU even when there's nothing to do. Busy % is the
+  real load either way.
+- **Capacity:** every limit the router has, and how close it is (amber
+  above 80%, red above 95%):
+
+  | Table | Limit |
+  |---|---|
+  | Sessions | `sessions.max_per_worker` × workers; refusals are counted |
+  | Neighbours (ARP) | 16,384 per worker |
+  | NAT translations | ~64,000 ports per outside address and destination; port exhaustion is counted |
+  | Routes | no practical limit up to /24 |
+  | Next hops | 32,767 distinct gateways, interfaces and SD-WAN sites |
+  | /24s holding longer routes | 32,768 (each /24 containing a /25-/32 route takes one 256-entry group) |
+  | DHCP pools | the size of each range |
+  | SD-WAN tethers | up / configured |
+
+  There's no separate RIB yet: connected, static, DHCP/PPPoE and SD-WAN
+  routes go straight into the FIB, so its figures are the real ones.
+
 ## When a config won't start
 
 Validation catches most mistakes before a commit. Some only show up when
