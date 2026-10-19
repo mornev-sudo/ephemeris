@@ -3,7 +3,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 let signedIn = false;
-let last = null, timer = null, current = "dash";
+let timer = null, current = "dash";
 
 // The session lives in an HttpOnly cookie the page can't read; X-Ephemeris
 // proves to the router that a request came from this page (anti-CSRF).
@@ -32,13 +32,81 @@ function dur(s) { if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s/
 
 function card(title, value, sub) { const c = el("div", undefined, "card"); c.append(el("h3", title), el("div", value, "v"), el("div", sub || "", "s")); return c; }
 
+/// Bits per second, scaled: 950 bps, 12.5 kbps, 3.20 Mbps, 1.05 Gbps.
+function bps(x) {
+  const u = [["Gbps", 1e9], ["Mbps", 1e6], ["kbps", 1e3]].find(([, d]) => x >= d);
+  if (!u) return Math.round(x) + " bps";
+  const v = x / u[1];
+  return (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)) + " " + u[0];
+}
+function pps(x) { return x >= 10 ? n(Math.round(x)) + " pps" : x.toFixed(1) + " pps"; }
+
+/// A line chart as inline SVG (the CSP allows no chart libraries, and none
+/// are needed). `series`: [{label, color, values}], all as long as `times`.
+function lineChart(box, title, times, series, fmt) {
+  const W = 640, H = 180, L = 70, R = 10, T = 10, B = 24;
+  const ns = "http://www.w3.org/2000/svg";
+  const mk = (tag, attrs, text) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+  const max = Math.max(1e-9, ...series.flatMap(s => s.values));
+  // A "nice" top for the axis: 1, 2 or 5 times a power of ten.
+  const p = 10 ** Math.floor(Math.log10(max)), top = [1, 2, 5, 10].map(m => m * p).find(v => v >= max);
+  const x = i => L + (times.length < 2 ? 0 : (i / (times.length - 1)) * (W - L - R));
+  const y = v => T + (1 - v / top) * (H - T - B);
+  const svg = mk("svg", { viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img", "aria-label": title });
+  for (let k = 0; k <= 4; k++) {
+    const v = top * k / 4;
+    svg.append(mk("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), class: "grid" }));
+    svg.append(mk("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end", class: "axis" }, fmt(v)));
+  }
+  if (times.length) {
+    const hhmm = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    [0, Math.floor((times.length - 1) / 2), times.length - 1].forEach((i, k) =>
+      svg.append(mk("text", { x: x(i), y: H - 6, "text-anchor": ["start", "middle", "end"][k], class: "axis" }, hhmm(times[i]))));
+  }
+  series.forEach(s => {
+    if (!s.values.length) return;
+    const d = s.values.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+    svg.append(mk("path", { d, fill: "none", style: `stroke:${s.color}`, "stroke-width": 2, "vector-effect": "non-scaling-stroke" }));
+  });
+  const head = el("div", undefined, "charthead");
+  head.append(el("h3", title));
+  series.forEach(s => {
+    const k = el("span", `${s.label}: ${s.values.length ? fmt(s.values[s.values.length - 1]) : "–"}`, "legend");
+    k.style.setProperty("--c", s.color); head.append(k);
+  });
+  const c = el("div", undefined, "card chartcard"); c.append(head, svg);
+  box.append(c);
+}
+
+let reportRange = 900;
+async function refreshReports() {
+  const h = await api("GET", "/stats/history?secs=" + reportRange);
+  const S = h.samples, t = S.map(s => s.t);
+  const IN = "var(--accent)", OUT = "var(--ok)";
+  const box = $("charts"); box.replaceChildren();
+  if (S.length < 2) box.append(el("p", "Collecting: the first points appear within 10 seconds.", "s"));
+  lineChart(box, "Open sessions", t, [{ label: "sessions", color: IN, values: S.map(s => s.sessions) }], v => n(Math.round(v)));
+  lineChart(box, "Packets per second", t, [
+    { label: "in", color: IN, values: S.map(s => s.rx_pps) }, { label: "out", color: OUT, values: S.map(s => s.tx_pps) }], pps);
+  lineChart(box, "Throughput", t, [
+    { label: "in", color: IN, values: S.map(s => s.rx_bps) }, { label: "out", color: OUT, values: S.map(s => s.tx_bps) }], bps);
+  lineChart(box, "Dropped packets per second", t, [{ label: "drops", color: "var(--bad)", values: S.map(s => s.drops_per_sec) }], pps);
+  const latest = S[S.length - 1];
+  $("reportmeta").textContent = latest
+    ? `Every ${h.interval_secs} s · dropped packets since start: ${n(latest.drops_total)} · last sample ${new Date(latest.t * 1000).toLocaleTimeString()}`
+    : `Every ${h.interval_secs} s`;
+  table($("ifrates"), ["Interface", "In", "Out", "In (pps)", "Out (pps)"],
+    latest ? h.interfaces.map((name, i) => { const p = latest.ports[i] || {}; return [name, bps(p.rx_bps || 0), bps(p.tx_bps || 0), pps(p.rx_pps || 0), pps(p.tx_pps || 0)]; }) : []);
+}
+document.querySelectorAll("#reportrange button").forEach(b => b.onclick = () => {
+  reportRange = Number(b.dataset.secs);
+  document.querySelectorAll("#reportrange button").forEach(x => x.classList.toggle("on", x === b));
+  refreshReports().catch(() => {});
+});
+
 async function refreshDash() {
   const s = await api("GET", "/status");
-  const now = performance.now();
-  let pps = "–";
-  if (last) { const dt = (now - last.t) / 1000; pps = n(Math.max(0, Math.round((s.counters.forwarded - last.fwd) / dt))) + " pps"; }
-  last = { t: now, fwd: s.counters.forwarded };
-  const totalDrops = Object.values(s.drops).reduce((a, b) => a + b, 0);
+  const r = s.rates;
   $("meta").textContent = `v${s.version} · build ${s.build} · up ${dur(s.uptime_secs)} · ${s.workers} worker(s)`
     + (s.pending_confirm_secs != null ? ` · ⚠ unconfirmed commit rolls back in ${s.pending_confirm_secs}s` : "");
   const warn = [];
@@ -48,12 +116,23 @@ async function refreshDash() {
     + `The failed one was kept as ${s.fallback.failed_file}.`);
   $("dashwarn").replaceChildren(...warn.map(w => el("p", w)));
   $("dashwarn").classList.toggle("hidden", !warn.length);
+  const wan = await api("GET", "/wan");
+  table($("wantab"), ["Interface", "Mode", "State", "Address", "Gateway", "DNS", ""], wan.map(w => {
+    const ok = w.state === "up" || w.state === "bound";
+    let detail = "";
+    if (w.mode === "pppoe") detail = w.pppoe.session != null
+      ? `${w.pppoe.concentrator || "ISP"} · session ${w.pppoe.session} · MTU ${w.pppoe.mtu} · up ${dur(w.pppoe.up_for_secs)}`
+      : (w.pppoe.last_error ? "last error: " + w.pppoe.last_error : "dialling as " + w.pppoe.username);
+    if (w.mode === "dhcp" && w.dhcp.server) detail = `from ${w.dhcp.server} · lease ends in ${dur(w.dhcp.expires_in_secs)}`;
+    return [w.interface, { pppoe: "PPPoE", dhcp: "DHCP", static: "static" }[w.mode], td(w.state || "—", ok ? "ok" : "warn"),
+      td(w.address || "—", "mono"), td(w.gateway || "—", "mono"), td((w.dns || []).join(", ") || "—", "mono"), td(detail, "s")];
+  }));
+  // The same four numbers as the Reporting graphs (last 5 s).
   $("cards").replaceChildren(
-    card("Forwarding", pps, n(s.counters.forwarded) + " packets total"),
-    card("Received", n(s.counters.rx), "packets"),
-    card("Sessions", n(s.sessions.active), n(s.sessions.created) + " created · " + n(s.sessions.expired) + " expired"),
-    card("Drops", n(totalDrops), "kernel " + n(s.counters.kernel_drops) + " · fill-empty " + n(s.counters.fill_empty)),
-    card("Routes", n(s.routes), n(s.neighbors) + " neighbours"));
+    card("Open sessions", n(s.sessions.active), n(s.sessions.created) + " created · " + n(s.sessions.expired) + " expired"),
+    card("Packets per second", r ? pps(r.rx_pps + r.tx_pps) : "–", r ? `in ${pps(r.rx_pps)} · out ${pps(r.tx_pps)}` : "measuring…"),
+    card("Throughput", r ? bps(r.rx_bps + r.tx_bps) : "–", r ? `in ${bps(r.rx_bps)} · out ${bps(r.tx_bps)}` : "measuring…"),
+    card("Dropped packets", n(s.drops_total), r ? `${pps(r.drops_per_sec)} now · see Drops by reason` : "see Drops by reason"));
   table($("ports"), ["Name", "Role", "Device", "Address", "MAC", "XDP", "Zero-copy", "New sessions", "MSS adjust"],
     s.ports.map(p => [p.name, p.role, td(p.device, "mono"), td(p.address, "mono"), td(p.mac, "mono"),
       td(p.xdp_mode, p.xdp_mode === "Native" ? "ok" : "warn"), p.zero_copy ? "yes" : "no",
@@ -215,9 +294,9 @@ function control(c, obj) {
     e = el("div", undefined, "row");
     const inp = document.createElement("input");
     inp.type = "password"; inp.autocomplete = "off"; inp.spellcheck = false;
-    inp.value = v || ""; inp.placeholder = "none: tethers stay down";
+    inp.value = v || ""; inp.placeholder = c.generate === false ? "" : "none: tethers stay down";
     inp.className = "mono"; inp.style.minWidth = "14em";
-    inp.oninput = () => { obj[c.key] = inp.value.trim() || null; dirty(); };
+    inp.oninput = () => { obj[c.key] = c.generate === false ? inp.value : (inp.value.trim() || null); dirty(); };
     const show = el("button", "Show", "btn"); show.type = "button";
     show.onclick = () => { const hidden = inp.type === "password"; inp.type = hidden ? "text" : "password"; show.textContent = hidden ? "Hide" : "Show"; };
     const gen = el("button", "Generate", "btn"); gen.type = "button";
@@ -229,7 +308,8 @@ function control(c, obj) {
     };
     const copy = el("button", "Copy", "btn"); copy.type = "button";
     copy.onclick = async () => { if (!inp.value) return; try { await navigator.clipboard.writeText(inp.value); copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1500); } catch { inp.type = "text"; inp.select(); } };
-    e.append(inp, show, gen, copy);
+    e.append(inp, show);
+    if (c.generate !== false) e.append(gen, copy);
     e.dataset.field = c.key;
     return e;
   } else {
@@ -310,6 +390,51 @@ function renderNics() {
   box.append(t);
 }
 
+/// Internet connection: per outside interface, static / DHCP / PPPoE.
+function renderWanCfg() {
+  const box = $("f-wan");
+  box.replaceChildren();
+  const outside = cfg.interface.filter(i => i.role === "outside");
+  if (!outside.length) box.append(el("p", "No outside interface yet: set an interface's role to outside (Interfaces).", "s"));
+  outside.forEach(i => {
+    const mode = ["dhcp", "pppoe"].includes((i.address || "").toLowerCase()) ? i.address.toLowerCase() : "static";
+    const c = el("div", undefined, "card"); c.style.marginBottom = "12px";
+    c.append(el("h3", `${i.name} (${i.device})`));
+    const f = el("div");
+    const m = { mode };
+    formFields(f, m, [{ key: "mode", label: "Connection", type: "select",
+      options: [["static", "Static address"], ["dhcp", "DHCP (from the ISP)"], ["pppoe", "PPPoE (dial with a username)"]] }]);
+    f.querySelector("select").onchange = e => {
+      const v = e.target.value;
+      i.address = v === "static" ? "" : v;
+      i.pppoe = v === "pppoe" ? (i.pppoe || { username: "", password: "", service: "", mtu: null }) : null;
+      if (v !== "static") i.gateway = null;
+      dirty(); renderCfg();
+    };
+    c.append(f);
+    const g = el("div");
+    if (mode === "static") {
+      formFields(g, i, [
+        { key: "address", label: "Address / prefix", placeholder: "203.0.113.2/29" },
+        { key: "gateway", label: "Gateway (the ISP's router)", optional: true, placeholder: "203.0.113.1",
+          help: "Add a default route via it under Static routes to reach the internet." },
+      ]);
+    } else if (mode === "pppoe") {
+      i.pppoe = i.pppoe || { username: "", password: "", service: "", mtu: null };
+      formFields(g, i.pppoe, [
+        { key: "username", label: "Username", placeholder: "you@isp" },
+        { key: "password", label: "Password", type: "key", generate: false },
+        { key: "service", label: "Service name", placeholder: "any (most ISPs)" },
+        { key: "mtu", label: "MTU", type: "number", min: 576, optional: true, placeholder: "1492" },
+      ]);
+    } else {
+      g.append(el("p", "The address, gateway, default route and DNS servers come from the ISP's DHCP server.", "s"));
+    }
+    c.append(g);
+    box.append(c);
+  });
+}
+
 /// SD-WAN: this router's place in the network, and the other sites.
 function renderSdwanCfg() {
   const box = $("f-sdwan");
@@ -366,8 +491,8 @@ function renderDhcpCfg() {
     const c = el("div", undefined, "card");
     c.style.marginBottom = "12px";
     c.append(el("h3", `${i.name || "(unnamed)"} · ${i.address || "no address"}`));
-    if ((i.address || "").toLowerCase() === "dhcp") {
-      c.append(el("p", "Gets its own address by DHCP: can't serve it.", "s"));
+    if (["dhcp", "pppoe"].includes((i.address || "").toLowerCase())) {
+      c.append(el("p", `Gets its own address (${i.address.toUpperCase()}): can't serve DHCP.`, "s"));
       box.append(c);
       return;
     }
@@ -428,6 +553,7 @@ function renderCfg() {
   ], () => ({ name: "", device: unusedNics()[0]?.name || "", address: "", role: "inside", allow_new_sessions: null, mss_adjust: null, gateway: null, dhcp: null }), "Add interface");
   renderNics();
   renderDhcpCfg();
+  renderWanCfg();
   renderSdwanCfg();
 
   formTable($("f-routes"), cfg.route, [
@@ -540,7 +666,7 @@ $("sessfilter").oninput = () => refreshSessions().catch(() => {});
 function show(tab) {
   current = tab;
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
-  ["dash", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.toggle("hidden", t !== tab));
+  ["dash", "reports", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.toggle("hidden", t !== tab));
   tick(true);
 }
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => show(b.dataset.tab));
@@ -556,23 +682,26 @@ async function tick(first) {
     else if (tab === "routes") await refreshRoutes();
     else if (tab === "sdwan") await refreshSdwan();
     else if (tab === "dhcp") await refreshDhcp();
+    else if (tab === "reports") await refreshReports();
     else if (tab === "config" && first && !cfgDirty) await loadConfig(); // never throw away unsaved edits
     else if (tab === "system") await refreshSystem();
   } catch (e) { if (e.message !== "unauthorised") console.warn(e); }
-  if (tab === current && tab !== "config") timer = setTimeout(tick, 2000);
+  // Reporting follows the 5-second samples; nothing polls while the page
+  // is hidden (a background tab, a minimised window).
+  if (tab === current && tab !== "config" && !document.hidden) timer = setTimeout(tick, tab === "reports" ? 5000 : 2000);
 }
 
 function showLogin(err) {
   signedIn = false; clearTimeout(timer);
   $("login").classList.remove("hidden"); $("loginerr").textContent = err || "";
   $("tabs").classList.add("hidden"); $("logout").classList.add("hidden"); $("meta").textContent = "";
-  ["dash", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.add("hidden"));
+  ["dash", "reports", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.add("hidden"));
   $("password").focus();
 }
 function signedInUi() {
   signedIn = true;
   $("login").classList.add("hidden"); $("tabs").classList.remove("hidden"); $("logout").classList.remove("hidden");
-  last = null; show("dash");
+  show("dash");
 }
 $("login").onsubmit = async (e) => {
   e.preventDefault();
@@ -587,3 +716,8 @@ $("logout").onclick = async () => { try { await api("POST", "/logout"); } catch 
 
 // Already signed in (session cookie still valid)?
 api("GET", "/whoami").then(signedInUi, () => showLogin());
+
+document.addEventListener("visibilitychange", () => {
+  if (!signedIn) return;
+  if (document.hidden) clearTimeout(timer); else tick();
+});

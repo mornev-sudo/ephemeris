@@ -342,6 +342,7 @@ mod tests {
             mss_adjust: None,
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
+            pppoe: crate::config::Pppoe::Off,
         }
     }
 

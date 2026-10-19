@@ -15,6 +15,7 @@ pub mod configmgr;
 #[cfg(not(target_os = "linux"))]
 pub mod dev;
 pub mod diff;
+pub mod history;
 pub mod nics;
 pub mod paths;
 
@@ -63,6 +64,8 @@ pub struct Shared {
     pub dhcp: Arc<Mutex<crate::dhcp::DhcpState>>,
     /// Where SD-WAN peers without a fixed address were last heard from.
     pub endpoints: Arc<eph_dataplane::overlay::Endpoints>,
+    /// Rates sampled every few seconds, for the Reporting graphs.
+    pub history: Mutex<history::History>,
     /// Set to stop the daemon (systemd then starts it again).
     pub stop: &'static AtomicBool,
 }
@@ -72,7 +75,7 @@ impl Shared {
     /// changes [`Config::live_applicable`] accepts (same interfaces).
     pub fn apply_live(&self, cfg: &Config) -> Result<()> {
         // Interfaces on DHCP use whatever their lease currently says.
-        let cfg = &cfg.with_leases(&self.dhcp.lock().unwrap().client_leases());
+        let cfg = &cfg.with_links(&self.dhcp.lock().unwrap());
         let old = self.ports.read().unwrap().clone();
         let ports: Arc<[Port]> = cfg
             .ports(|i| {
@@ -117,6 +120,8 @@ pub struct Summary {
     pub sessions: Vec<SessionView>,
     pub neighbors: Vec<Neighbor>,
     pub tethers: Vec<TetherStats>,
+    /// Per interface (index = port id).
+    pub ports: Vec<eph_dataplane::PortCounters>,
 }
 
 impl Summary {
@@ -140,6 +145,15 @@ impl Summary {
             s.sessions_expired += r.stats.sessions_expired;
             s.tcp_blind += r.stats.tcp_blind;
             s.arp_conflicts += r.stats.arp_conflicts;
+            if s.ports.len() < r.stats.ports.len() {
+                s.ports.resize(r.stats.ports.len(), Default::default());
+            }
+            for (t, p) in s.ports.iter_mut().zip(&r.stats.ports) {
+                t.rx_packets += p.rx_packets;
+                t.rx_bytes += p.rx_bytes;
+                t.tx_packets += p.tx_packets;
+                t.tx_bytes += p.tx_bytes;
+            }
             s.sessions.extend(r.sessions.iter().cloned());
             for n in &r.neighbors {
                 neighbors.insert((n.port, n.ip), *n);

@@ -46,8 +46,42 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         startup: Default::default(),
         dhcp: Default::default(),
         endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
+        history: Default::default(),
         stop: &STOP,
     });
+    // Made-up traffic every 5 s, so the Reporting graphs have something to
+    // draw while working on them.
+    {
+        let shared = shared.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let mut sum = super::Summary {
+                ports: vec![Default::default(); shared.ports.read().unwrap().len()],
+                ..Default::default()
+            };
+            loop {
+                let t = t0.elapsed().as_secs_f64();
+                let wave = 1.0 + (t / 60.0).sin();
+                for (i, p) in sum.ports.iter_mut().enumerate() {
+                    let pk = (4000.0 * wave / (i + 1) as f64) as u64 * 5;
+                    p.rx_packets += pk;
+                    p.rx_bytes += pk * 900;
+                    p.tx_packets += pk / 2;
+                    p.tx_bytes += pk / 2 * 400;
+                }
+                sum.sessions_active = (200.0 * wave) as u64 + 20;
+                *sum.drops.entry("no-route").or_default() += (3.0 * wave) as u64;
+                let unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                shared.history.lock().unwrap().record(t, unix, &sum);
+                std::thread::sleep(std::time::Duration::from_secs(
+                    super::history::INTERVAL_SECS,
+                ));
+            }
+        });
+    }
     println!("dev portal: http://127.0.0.1:8080/  (admin / dev)");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

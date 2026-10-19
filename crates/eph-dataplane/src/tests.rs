@@ -7,7 +7,7 @@
 
 use crate::overlay::Overlay;
 use crate::*;
-use eph_packet::{arp, checksum, eth, icmp, ipv4, Mac};
+use eph_packet::{arp, checksum, eth, icmp, ipv4, pppoe, Mac};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -39,6 +39,7 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             mss_adjust: None,
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
+            pppoe: crate::config::Pppoe::Off,
         },
         Port {
             id: 1,
@@ -51,6 +52,7 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             mss_adjust: None,
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
+            pppoe: crate::config::Pppoe::Off,
         },
     ]);
     let statics = [StaticRoute {
@@ -367,6 +369,7 @@ fn static_route_gateway_must_be_connected() {
         mss_adjust: None,
         dhcp: crate::config::Dhcp::Off,
         gateway: None,
+        pppoe: crate::config::Pppoe::Off,
     }];
     let bad = [StaticRoute {
         prefix: "0.0.0.0/0".parse().unwrap(),
@@ -985,4 +988,159 @@ fn dhcp_goes_to_the_control_plane_only_where_enabled() {
     let (mut f, n) = dhcp_discover(HOST_B);
     r.process(1, &mut f, 0, n);
     assert_eq!(r.punts.len(), 1);
+}
+
+// ---------------------------------------------------------------- PPPoE
+
+const AC: Mac = [0x02, 0, 0, 0, 0, 0xac];
+
+/// lan-b as a PPPoE link: our address 203.0.113.50/32, the ISP's end
+/// 203.0.113.1, session 0x42, default route through it.
+fn pppoe_router(state: Pppoe) -> Pipeline {
+    let mut r = router();
+    let mut ports = r.ports().to_vec();
+    ports[1].addr = ip("203.0.113.50");
+    ports[1].subnet = "203.0.113.50/32".parse().unwrap();
+    ports[1].gateway = Some(ip("203.0.113.1"));
+    ports[1].role = Role::Outside;
+    ports[1].pppoe = state;
+    // The default route through the ISP exists once the session is up.
+    let statics: Vec<StaticRoute> = match state {
+        Pppoe::Up { .. } => vec![StaticRoute {
+            prefix: "0.0.0.0/0".parse().unwrap(),
+            via: ip("203.0.113.1"),
+        }],
+        _ => vec![],
+    };
+    let fib = build_fib(&ports, &statics, &[]).unwrap();
+    r.set_ports(ports.into());
+    r.set_fib(Arc::new(fib));
+    learn(&mut r, 0, HOST_A, "10.10.1.10");
+    r
+}
+
+const UP: Pppoe = Pppoe::Up {
+    session: 0x42,
+    peer: AC,
+    mtu: 1492,
+};
+
+#[test]
+fn pppoe_wraps_outgoing_and_unwraps_incoming() {
+    let mut r = pppoe_router(UP);
+    // Out: host A pings the internet. Leaves wrapped, to the AC, no ARP.
+    let mut f = vec![0u8; 2048];
+    let (p, n) = ping(R0, HOST_A, "10.10.1.10", "8.8.8.8", 64);
+    f[256..256 + n].copy_from_slice(&p[..n]);
+    let Verdict::Tx { port, off, len } = r.process(0, &mut f, 256, n) else {
+        panic!("not sent")
+    };
+    assert_eq!(
+        (port, off, len),
+        (1, 256 - 8, n + 8),
+        "8 bytes in front, nothing copied"
+    );
+    let o = &f[off..off + len];
+    assert_eq!(
+        (eth::dst(o), eth::src(o), eth::ethertype(o)),
+        (AC, R1, pppoe::TYPE_SESSION)
+    );
+    assert_eq!(
+        &o[14..22],
+        &[
+            0x11,
+            0x00,
+            0x00,
+            0x42,
+            ((n - 14 + 2) >> 8) as u8,
+            (n - 14 + 2) as u8,
+            0x00,
+            0x21
+        ]
+    );
+    let inner = ipv4::parse(&o[22..]).unwrap();
+    assert_eq!(
+        (inner.src, inner.dst, inner.ttl),
+        (ip("203.0.113.50"), ip("8.8.8.8"), 63),
+        "NATed, one hop"
+    );
+
+    // In: the reply, wrapped by the ISP, reaches host A as plain Ethernet.
+    let mut reply = o.to_vec();
+    let ip_off = 22;
+    reply[ip_off + 12..ip_off + 16].copy_from_slice(&[8, 8, 8, 8]);
+    reply[ip_off + 16..ip_off + 20].copy_from_slice(&[203, 0, 113, 50]);
+    reply[ip_off + 20] = icmp::ECHO_REPLY;
+    reply[ip_off + 22..ip_off + 24].fill(0);
+    let c = checksum::checksum(&reply[ip_off + 20..]);
+    reply[ip_off + 22..ip_off + 24].copy_from_slice(&c.to_be_bytes());
+    reply[ip_off + 10..ip_off + 12].fill(0);
+    let c = checksum::checksum(&reply[ip_off..ip_off + 20]);
+    reply[ip_off + 10..ip_off + 12].copy_from_slice(&c.to_be_bytes());
+    eth::write(&mut reply, R1, AC, pppoe::TYPE_SESSION);
+    let mut g = vec![0u8; 2048];
+    g[256..256 + reply.len()].copy_from_slice(&reply);
+    let Verdict::Tx { port, off, .. } = r.process(1, &mut g, 256, reply.len()) else {
+        panic!("reply not forwarded")
+    };
+    assert_eq!(
+        (port, eth::dst(&g[off..]), eth::ethertype(&g[off..])),
+        (0, HOST_A, eth::TYPE_IPV4)
+    );
+    assert_eq!(
+        ipv4::parse(&g[off + 14..]).unwrap().dst,
+        ip("10.10.1.10"),
+        "un-NATed"
+    );
+    // Counted per interface.
+    assert_eq!(r.stats.ports[1].rx_packets, 1);
+}
+
+#[test]
+fn pppoe_mtu_and_control_traffic() {
+    let mut r = pppoe_router(UP);
+    // 1500 bytes with DF doesn't fit 1492: "fragmentation needed, MTU 1492".
+    let (mut f, n) = ping(R0, HOST_A, "10.10.1.10", "8.8.8.8", 64);
+    let big = 14 + 1500;
+    f.resize(big + 256, 0);
+    f[14 + 2..14 + 4].copy_from_slice(&1500u16.to_be_bytes());
+    f[14 + 10..14 + 12].fill(0);
+    let c = checksum::checksum(&f[14..34]);
+    f[14 + 10..14 + 12].copy_from_slice(&c.to_be_bytes());
+    let _ = n;
+    let Verdict::Tx { port, off, len } = r.process(0, &mut f, 0, big) else {
+        panic!()
+    };
+    assert_eq!(port, 0, "an ICMP error back to the sender");
+    let e = &f[off + 14..off + len];
+    assert_eq!(
+        (e[20], e[21]),
+        (icmp::DEST_UNREACHABLE, icmp::CODE_FRAG_NEEDED)
+    );
+    assert_eq!(u16::from_be_bytes([e[26], e[27]]), 1492);
+
+    // Discovery and PPP control go to the control plane.
+    let padt = pppoe::discovery(AC, R1, pppoe::PADT, 0x42, &[]);
+    let mut f = padt.clone();
+    assert_eq!(
+        r.process(1, &mut f, 0, padt.len()),
+        Verdict::Drop(DropReason::PppoeToControl)
+    );
+    let echo = pppoe::session(AC, R1, 0x42, pppoe::PROTO_LCP, &[9, 1, 0, 8, 1, 2, 3, 4]);
+    let mut f = echo.clone();
+    assert_eq!(
+        r.process(1, &mut f, 0, echo.len()),
+        Verdict::Drop(DropReason::PppoeToControl)
+    );
+    assert_eq!(r.punts.len(), 2);
+
+    // Still dialling: nothing leaves, and no ARP is tried on the link.
+    let mut r = pppoe_router(Pppoe::Dialing);
+    let (mut f, n) = ping(R0, HOST_A, "10.10.1.10", "8.8.8.8", 64);
+    // (Host A hears "network unreachable"; nothing goes out of lan-b.)
+    assert!(!matches!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Tx { port: 1, .. }
+    ));
+    assert!(r.emits.is_empty(), "no ARP request on a PPPoE link");
 }

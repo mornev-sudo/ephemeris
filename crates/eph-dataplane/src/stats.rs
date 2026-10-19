@@ -75,10 +75,12 @@ pub enum DropReason {
     OverlayReplay,
     /// DHCP packet handed to the control plane (server or client).
     DhcpToControl,
+    /// PPPoE discovery or PPP control packet handed to the control plane.
+    PppoeToControl,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 33] = [
+    pub const ALL: [DropReason; 34] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -112,6 +114,7 @@ impl DropReason {
         DropReason::OverlayAuth,
         DropReason::OverlayReplay,
         DropReason::DhcpToControl,
+        DropReason::PppoeToControl,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -150,6 +153,7 @@ impl DropReason {
             DropReason::OverlayAuth => "overlay-auth",
             DropReason::OverlayReplay => "overlay-replay",
             DropReason::DhcpToControl => "dhcp-to-control",
+            DropReason::PppoeToControl => "pppoe-to-control",
         }
     }
 }
@@ -171,6 +175,17 @@ pub struct Stats {
     /// believed).
     pub arp_conflicts: u64,
     pub drops: [u64; DropReason::COUNT],
+    /// Per interface (index = port id): what came in and what went out.
+    pub ports: Vec<PortCounters>,
+}
+
+/// Traffic through one interface. Bytes are whole Ethernet frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PortCounters {
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
 }
 
 // By hand: `Default` isn't derived for arrays longer than 32.
@@ -186,11 +201,22 @@ impl Default for Stats {
             tcp_blind: 0,
             arp_conflicts: 0,
             drops: [0; DropReason::COUNT],
+            ports: Vec::new(),
         }
     }
 }
 
 impl Stats {
+    /// A frame left through `port` (the I/O layer calls this once it's on
+    /// the TX ring).
+    #[inline(always)]
+    pub fn sent(&mut self, port: crate::PortId, len: usize) {
+        if let Some(p) = self.ports.get_mut(port as usize) {
+            p.tx_packets += 1;
+            p.tx_bytes += len as u64;
+        }
+    }
+
     #[inline(always)]
     pub fn drop(&mut self, r: DropReason) {
         self.drops[r as usize] += 1;

@@ -129,6 +129,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         startup,
         dhcp: dhcp_state,
         endpoints,
+        history: Default::default(),
         stop: &STOP,
     });
     let mgmt = m.enabled.then(|| {
@@ -187,8 +188,24 @@ pub fn run(config_path: &Path) -> Result<()> {
 
     let interval = Duration::from_secs(d.stats_interval_secs.max(1));
     let mut next = Instant::now() + interval;
+    let sample_every = Duration::from_secs(crate::mgmt::history::INTERVAL_SECS);
+    let mut next_sample = Instant::now();
+    let started = Instant::now();
     while !STOP.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
+        if Instant::now() >= next_sample {
+            next_sample += sample_every;
+            let unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let sum = shared.summary();
+            shared
+                .history
+                .lock()
+                .unwrap()
+                .record(started.elapsed().as_secs_f64(), unix, &sum);
+        }
         if Instant::now() >= next && workers > 0 {
             next += interval;
             print_stats(&shared, d.show_sessions);

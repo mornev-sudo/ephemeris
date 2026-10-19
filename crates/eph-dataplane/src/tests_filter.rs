@@ -39,6 +39,7 @@ fn port(id: u16, addr: &str, subnet: &str, mss_adjust: Option<u16>) -> Port {
         mss_adjust,
         dhcp: crate::config::Dhcp::Off,
         gateway: None,
+        pppoe: crate::config::Pppoe::Off,
     }
 }
 

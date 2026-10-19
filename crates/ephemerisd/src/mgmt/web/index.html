@@ -31,6 +31,14 @@
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
   .card h3 { margin: 0 0 4px; font-size: 12px; font-weight: 500; color: var(--muted); }
   .card .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 12px; }
+  .chart { width: 100%; height: auto; display: block; }
+  .chart .grid { stroke: var(--line); stroke-width: 1; }
+  .chart .axis { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .charthead { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+  .charthead h3 { margin: 0 auto 0 0; }
+  .legend { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .legend::before { content: ""; display: inline-block; width: 10px; height: 3px; margin-right: 5px; vertical-align: middle; background: var(--c); }
   .card .s { font-size: 12px; color: var(--muted); }
   section { margin-top: 20px; }
   section h2 { font-size: 14px; margin: 0 0 8px; }
@@ -72,6 +80,7 @@
   <h1><span>●</span> Ephemeris</h1>
   <nav id="tabs">
     <button data-tab="dash" class="on">Dashboard</button>
+    <button data-tab="reports">Reporting</button>
     <button data-tab="sessions">Sessions</button>
     <button data-tab="routes">Routes</button>
     <button data-tab="dhcp">DHCP</button>
@@ -96,9 +105,21 @@
   <div id="tab-dash">
     <div class="card warnbox bad hidden" id="dashwarn" role="alert"></div>
     <div class="grid" id="cards"></div>
+    <section><h2>Internet connections</h2><div class="tablewrap"><table id="wantab"></table></div></section>
     <section><h2>Interfaces</h2><div class="tablewrap"><table id="ports"></table></div></section>
     <section><h2>Drops by reason</h2><div class="tablewrap"><table id="drops"></table></div></section>
     <section><h2>Neighbours (ARP)</h2><div class="tablewrap"><table id="neigh"></table></div></section>
+  </div>
+
+  <div id="tab-reports" class="hidden">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <p class="s" id="reportmeta" style="margin:0"></p>
+      <nav class="subnav" id="reportrange" style="margin:0;border:0">
+        <button data-secs="900" class="on">15 minutes</button><button data-secs="3600">1 hour</button>
+      </nav>
+    </div>
+    <div class="charts" id="charts"></div>
+    <section><h2>Per interface, last 5 seconds</h2><div class="tablewrap"><table id="ifrates"></table></div></section>
   </div>
 
   <div id="tab-sessions" class="hidden">
@@ -161,6 +182,7 @@
 
     <nav class="subnav" id="cfgnav">
       <button data-sec="ifaces" class="on">Interfaces</button>
+      <button data-sec="wan">Internet connection</button>
       <button data-sec="dhcp">DHCP server</button>
       <button data-sec="routing">Static routes</button>
       <button data-sec="sdwan">SD-WAN</button>
@@ -179,6 +201,11 @@
       <h3>Network cards not in use</h3>
       <p class="s">Cards the router found that no interface uses yet. After adding or removing one, the data plane needs a restart.</p>
       <div class="tablewrap" id="f-nics"></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-wan">
+      <p class="s">How each outside interface gets its address: fixed by you, from the ISP's DHCP server, or by dialling PPPoE
+        (DSL and many fibre lines). DHCP and PPPoE also bring the gateway, the default route and DNS servers, applied without a restart.</p>
+      <div id="f-wan"></div>
     </section>
     <section class="cfgsec hidden" id="sec-dhcp">
       <p class="s">Lease addresses to devices on an interface. Interfaces whose own address comes from DHCP can't serve it.

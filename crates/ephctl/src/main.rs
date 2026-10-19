@@ -36,6 +36,8 @@ enum Cmd {
     Neighbors,
     /// DHCP: the addresses the router got, and the leases it handed out.
     Dhcp,
+    /// Internet connections: each outside interface (static, DHCP or PPPoE).
+    Wan,
     /// The forwarding table.
     Routes,
     /// SD-WAN: tethers, their measured health, and which path each class uses.
@@ -208,6 +210,24 @@ fn run(cli: Cli) -> Result<()> {
                 dur(s["uptime_secs"].as_u64().unwrap_or(0)),
                 s["workers"]
             );
+            // The same four numbers as the portal's Reporting tab.
+            let r = &s["rates"];
+            let f = |k: &str| r[k].as_f64().unwrap_or(0.0);
+            println!(
+                "Open sessions {} · {} pps (in {} / out {}) · {} (in {} / out {}) · dropped {}",
+                s["sessions"]["active"],
+                if r.is_null() {
+                    "-".into()
+                } else {
+                    format!("{:.0}", f("rx_pps") + f("tx_pps"))
+                },
+                f("rx_pps").round(),
+                f("tx_pps").round(),
+                bits(f("rx_bps") + f("tx_bps")),
+                bits(f("rx_bps")),
+                bits(f("tx_bps")),
+                s["drops_total"],
+            );
             if let Some(secs) = s["pending_confirm_secs"].as_u64() {
                 println!("!! unconfirmed commit: rolls back in {secs}s (ephctl config confirm)");
             }
@@ -309,6 +329,65 @@ fn run(cli: Cli) -> Result<()> {
             table(
                 &["IP", "MAC", "INTERFACE"],
                 rows(&v, |x| vec![str(&x["ip"]), str(&x["mac"]), str(&x["port"])]),
+            );
+        }
+        Cmd::Wan => {
+            let v = c.get("/wan")?;
+            if json {
+                print(&v);
+                return Ok(());
+            }
+            let o = |x: &Value| if x.is_null() { "-".into() } else { str(x) };
+            table(
+                &[
+                    "INTERFACE",
+                    "MODE",
+                    "STATE",
+                    "ADDRESS",
+                    "GATEWAY",
+                    "DNS",
+                    "DETAIL",
+                ],
+                rows(&v, |x| {
+                    let dns: Vec<String> = x["dns"]
+                        .as_array()
+                        .map(|a| a.iter().map(str).collect())
+                        .unwrap_or_default();
+                    let p = &x["pppoe"];
+                    let detail = match x["mode"].as_str() {
+                        Some("pppoe") => match (p["last_error"].as_str(), p["session"].as_u64()) {
+                            (_, Some(sid)) => format!(
+                                "{} session {sid:#06x}, MTU {}, up {}",
+                                o(&p["concentrator"]),
+                                o(&p["mtu"]),
+                                p["up_for_secs"].as_u64().map_or("-".into(), dur)
+                            ),
+                            (Some(e), None) => format!("last error: {e}"),
+                            _ => format!("user {}", o(&p["username"])),
+                        },
+                        Some("dhcp") => format!(
+                            "server {}, lease ends in {}",
+                            o(&x["dhcp"]["server"]),
+                            x["dhcp"]["expires_in_secs"]
+                                .as_u64()
+                                .map_or("-".into(), dur)
+                        ),
+                        _ => String::new(),
+                    };
+                    vec![
+                        str(&x["interface"]),
+                        str(&x["mode"]),
+                        str(&x["state"]),
+                        o(&x["address"]),
+                        o(&x["gateway"]),
+                        if dns.is_empty() {
+                            "-".into()
+                        } else {
+                            dns.join(",")
+                        },
+                        detail,
+                    ]
+                }),
             );
         }
         Cmd::Dhcp => {
@@ -843,6 +922,21 @@ fn table(head: &[&str], rows: Vec<Vec<String>>) {
     }
     for r in rows {
         line(r);
+    }
+}
+
+/// Bits per second, scaled: "950 bps", "12.5 kbps", "3.20 Mbps".
+fn bits(x: f64) -> String {
+    let (v, u) = match x {
+        x if x >= 1e9 => (x / 1e9, "Gbps"),
+        x if x >= 1e6 => (x / 1e6, "Mbps"),
+        x if x >= 1e3 => (x / 1e3, "kbps"),
+        x => return format!("{x:.0} bps"),
+    };
+    match v {
+        v if v >= 100.0 => format!("{v:.0} {u}"),
+        v if v >= 10.0 => format!("{v:.1} {u}"),
+        v => format!("{v:.2} {u}"),
     }
 }
 

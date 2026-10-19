@@ -1,5 +1,5 @@
-//! The DHCP service: one thread running every DHCP server and client the
-//! configuration asks for.
+//! The address service: one thread running every DHCP server and client,
+//! and every PPPoE dialer, the configuration asks for.
 //!
 //! - Packets arrive from the workers (`Pipeline::punts`) and replies go out
 //!   through worker 0 (`Control::Transmit`).
@@ -7,16 +7,19 @@
 //!   and the router asks for its own previous WAN address after a restart.
 //! - When a client gets, changes or loses its lease, the new address,
 //!   gateway and default route are applied live (`Shared::apply_live`).
+//! - PPPoE works the same way: discovery and PPP control frames arrive
+//!   here, a session coming up or going down is applied live.
 //! - Configuration changes (a commit) are picked up within a second.
 
 use super::client::{Client, Event};
 use super::server::{Lease, Server, ServerCfg};
-use super::ClientStatus;
+use super::{ClientStatus, PppoeStatus};
 use crate::config::Config;
 use crate::mgmt::Shared;
+use crate::pppoe::client::{self as ppp, Client as Dialer};
 use crate::report::Control;
 use eph_dataplane::{PortId, Punt};
-use eph_packet::dhcp;
+use eph_packet::{dhcp, pppoe};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +37,7 @@ pub fn run(shared: &Shared, punts: Receiver<Punt>, stop: &AtomicBool, state_dir:
         dir,
         servers: HashMap::new(),
         clients: HashMap::new(),
+        dialers: HashMap::new(),
         seen: None,
         learned_dns: vec![],
     };
@@ -57,6 +61,12 @@ pub fn run(shared: &Shared, punts: Receiver<Punt>, stop: &AtomicBool, state_dir:
             svc.shared.transmit(*port, f);
         }
     }
+    // ...and end PPPoE sessions properly (LCP Terminate, PADT).
+    for (port, d) in svc.dialers.iter_mut() {
+        for f in d.hang_up() {
+            svc.shared.transmit(*port, f);
+        }
+    }
 }
 
 struct Service<'a> {
@@ -64,6 +74,7 @@ struct Service<'a> {
     dir: PathBuf,
     servers: HashMap<PortId, Server>,
     clients: HashMap<PortId, Client>,
+    dialers: HashMap<PortId, Dialer>,
     /// The configuration the servers and clients were built from.
     seen: Option<Config>,
     /// DNS servers last handed to servers without their own.
@@ -72,10 +83,20 @@ struct Service<'a> {
 
 impl Service<'_> {
     fn packet(&mut self, p: Punt) {
+        let now = now_unix();
+        if let Some(f) = pppoe::Frame::parse(&p.frame) {
+            if let Some(d) = self.dialers.get_mut(&p.port) {
+                let (out, event) = d.handle(&f, now);
+                for f in out {
+                    self.shared.transmit(p.port, f);
+                }
+                self.dialer_event(p.port, event);
+            }
+            return;
+        }
         let Some(rx) = dhcp::parse_frame(&p.frame) else {
             return;
         };
-        let now = now_unix();
         if let Some(s) = self.servers.get_mut(&p.port) {
             let (reply, changed) = s.handle(&rx, now);
             if let Some(f) = reply {
@@ -104,6 +125,14 @@ impl Service<'_> {
                 self.shared.transmit(port, f);
             }
             self.client_event(port, event);
+        }
+        let ports: Vec<PortId> = self.dialers.keys().copied().collect();
+        for port in ports {
+            let (out, event) = self.dialers.get_mut(&port).unwrap().tick(now);
+            for f in out {
+                self.shared.transmit(port, f);
+            }
+            self.dialer_event(port, event);
         }
         let expired: Vec<PortId> = self
             .servers
@@ -146,6 +175,26 @@ impl Service<'_> {
         self.seen = None;
     }
 
+    fn dialer_event(&mut self, port: PortId, event: Option<ppp::Event>) {
+        let Some(event) = event else {
+            return;
+        };
+        let d = &self.dialers[&port];
+        match &event {
+            ppp::Event::Up(l) => info!(
+                "PPPoE: {} connected to {} (session {:#06x}): {} peer {}, MTU {}",
+                d.cfg.interface, l.ac_name, l.session, l.addr, l.peer, l.mtu
+            ),
+            ppp::Event::Down(why) => warn!("PPPoE: {} down: {why}", d.cfg.interface),
+        }
+        self.publish();
+        let running = self.shared.config.lock().unwrap().running().clone();
+        if let Err(e) = self.shared.apply_live(&running) {
+            warn!("PPPoE: applying the session: {e:#}");
+        }
+        self.seen = None; // LANs using learned DNS hear about the ISP's
+    }
+
     /// Make the API's view (and the live config's) match ours.
     fn publish(&self) {
         let mut st = self.shared.dhcp.lock().unwrap();
@@ -166,6 +215,20 @@ impl Service<'_> {
             .servers
             .values()
             .map(|s| (s.cfg.interface.clone(), s.leases.clone()))
+            .collect();
+        st.pppoe = self
+            .dialers
+            .values()
+            .map(|d| {
+                (
+                    d.cfg.interface.clone(),
+                    PppoeStatus {
+                        phase: d.phase,
+                        link: d.link.clone(),
+                        last_error: d.last_error.clone(),
+                    },
+                )
+            })
             .collect();
     }
 
@@ -252,6 +315,43 @@ impl Service<'_> {
             }
         }
         self.clients = clients;
+
+        // PPPoE dialers: kept while their settings stay the same.
+        let mut dialers = HashMap::new();
+        for i in running.interfaces.iter().filter(|i| i.is_pppoe()) {
+            let (Some((port, mac)), Some(p)) = (mac_of(&i.name), &i.pppoe) else {
+                continue;
+            };
+            let settings = ppp::Settings {
+                interface: i.name.clone(),
+                mac,
+                username: p.username.clone(),
+                password: p.password.clone(),
+                service: p.service.clone(),
+                mtu: p.mtu(),
+            };
+            let d = match self.dialers.remove(&port) {
+                Some(d) if d.cfg == settings => d,
+                old => {
+                    if let Some(mut old) = old {
+                        lost |= old.link.is_some();
+                        for f in old.hang_up() {
+                            self.shared.transmit(port, f);
+                        }
+                    }
+                    info!("PPPoE: dialling on {} as {}", i.name, p.username);
+                    Dialer::new(settings, seed())
+                }
+            };
+            dialers.insert(port, d);
+        }
+        for (port, mut d) in self.dialers.drain() {
+            lost |= d.link.is_some();
+            for f in d.hang_up() {
+                self.shared.transmit(port, f);
+            }
+        }
+        self.dialers = dialers;
         self.seen = Some(running.clone());
         self.publish();
         if lost {

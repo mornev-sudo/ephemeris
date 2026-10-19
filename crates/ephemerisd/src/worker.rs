@@ -147,6 +147,7 @@ impl Worker {
                             };
                             if self.socks[port as usize].tx.push(desc) {
                                 tx_pending[port as usize] = true;
+                                self.pipeline.stats.sent(port, len);
                             } else {
                                 self.pipeline.stats.drop(DropReason::TxRingFull);
                                 free.push(base);
@@ -169,6 +170,7 @@ impl Worker {
                     options: 0,
                 }) {
                     tx_pending[e.port as usize] = true;
+                    self.pipeline.stats.sent(e.port, e.len);
                 } else {
                     free.push(addr);
                 }
@@ -190,6 +192,7 @@ impl Worker {
                 }) {
                     tx_pending[port as usize] = true;
                     self.pipeline.stats.originated += 1;
+                    self.pipeline.stats.sent(port, frame.len());
                 } else {
                     free.push(addr);
                 }

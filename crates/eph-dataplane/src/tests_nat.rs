@@ -36,6 +36,7 @@ fn router(nat: NatConfig) -> Pipeline {
             mss_adjust: None,
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
+            pppoe: crate::config::Pppoe::Off,
         },
         Port {
             id: 1,
@@ -48,6 +49,7 @@ fn router(nat: NatConfig) -> Pipeline {
             mss_adjust: None,
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
+            pppoe: crate::config::Pppoe::Off,
         },
     ]);
     let routes = [StaticRoute {

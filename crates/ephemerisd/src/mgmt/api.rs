@@ -9,7 +9,9 @@
 //! | GET    | /status                   | ports, counters, drops, session totals      |
 //! | GET    | /sessions?limit=N         | live sessions, busiest first                |
 //! | GET    | /neighbors                | ARP table                                   |
+//! | GET    | /stats/history?secs=N     | sessions, pps, bps, drops every 5 s (≤1 h)  |
 //! | GET    | /dhcp                     | DHCP: the router's own leases, leases given |
+//! | GET    | /wan                      | outside interfaces: static / DHCP / PPPoE   |
 //! | GET    | /routes                   | forwarding table                            |
 //! | POST   | /routes  {prefix, via}    | add/replace a static route (commits)        |
 //! | DELETE | /routes?prefix=P          | remove a static route (commits)             |
@@ -101,7 +103,9 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/status", get(status))
         .route("/sessions", get(sessions))
         .route("/neighbors", get(neighbors))
+        .route("/stats/history", get(stats_history))
         .route("/dhcp", get(dhcp_status))
+        .route("/wan", get(wan_status))
         .route("/routes", get(routes).post(add_route).delete(del_route))
         .route("/config", get(config))
         .route(
@@ -570,6 +574,12 @@ async fn status(State(s): St) -> Json<Value> {
             "expired": sum.sessions_expired,
         },
         "routes": s.fib.read().unwrap().routes().len(),
+        // The four headline numbers, over the last sampling interval.
+        "rates": s.history.lock().unwrap().latest().map(|r| json!({
+            "sessions": r.sessions, "rx_pps": r.rx_pps, "tx_pps": r.tx_pps,
+            "rx_bps": r.rx_bps, "tx_bps": r.tx_bps, "drops_per_sec": r.drops_per_sec,
+        })),
+        "drops_total": super::history::drops_total(&sum),
         "neighbors": sum.neighbors.len(),
         "pending_confirm_secs": cfg.pending_confirm_secs(),
         "candidate_staged": cfg.candidate_text().is_some(),
@@ -610,6 +620,29 @@ async fn sessions(State(s): St, Query(q): Query<Limit>) -> Json<Value> {
     Json(Value::Array(out))
 }
 
+#[derive(Deserialize)]
+struct HistoryQuery {
+    /// How far back, in seconds (default 15 minutes, at most an hour).
+    secs: Option<u64>,
+}
+
+/// The Reporting graphs' data: one sample every 5 seconds.
+async fn stats_history(State(s): St, Query(q): Query<HistoryQuery>) -> Json<Value> {
+    let secs = q.secs.unwrap_or(900).min(3600);
+    let names: Vec<String> = s
+        .ports
+        .read()
+        .unwrap()
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    Json(json!({
+        "interval_secs": super::history::INTERVAL_SECS,
+        "interfaces": names,
+        "samples": s.history.lock().unwrap().since(secs),
+    }))
+}
+
 async fn neighbors(State(s): St) -> Json<Value> {
     let ports = s.ports.read().unwrap().clone();
     let out: Vec<Value> = s
@@ -621,6 +654,62 @@ async fn neighbors(State(s): St) -> Json<Value> {
                 "ip": n.ip.to_string(), "mac": eth::fmt_mac(&n.mac),
                 "port": ports[n.port as usize].name,
             })
+        })
+        .collect();
+    Json(Value::Array(out))
+}
+
+/// Every outside interface: how it gets its address and how that's going.
+async fn wan_status(State(s): St) -> Json<Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cfg = s.config.lock().unwrap().running().clone();
+    let st = s.dhcp.lock().unwrap().clone();
+    let ports = s.ports.read().unwrap().clone();
+    let out: Vec<Value> = cfg
+        .interfaces
+        .iter()
+        .zip(ports.iter())
+        .filter(|(i, _)| i.role == crate::config::RoleCfg::Outside)
+        .map(|(i, p)| {
+            let addr = (!p.addr.is_unspecified()).then(|| format!("{}/{}", p.addr, p.subnet.len()));
+            let gw = p.gateway.map(|g| g.to_string());
+            if i.is_pppoe() {
+                let ps = st.pppoe.get(&i.name);
+                let l = ps.and_then(|x| x.link.as_ref());
+                json!({
+                    "interface": i.name, "mode": "pppoe",
+                    "state": ps.map(|x| x.phase), "address": addr, "gateway": gw,
+                    "dns": l.map(|l| l.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
+                    "pppoe": {
+                        "username": i.pppoe.as_ref().map(|c| c.username.clone()),
+                        "concentrator": l.map(|l| l.ac_name.clone()),
+                        "session": l.map(|l| l.session),
+                        "mtu": l.map(|l| l.mtu),
+                        "up_for_secs": l.map(|l| now.saturating_sub(l.up_since_unix)),
+                        "last_error": ps.and_then(|x| x.last_error.clone()),
+                    },
+                })
+            } else if i.is_dhcp_client() {
+                let c = st.clients.get(&i.name);
+                let l = c.and_then(|c| c.lease.as_ref());
+                json!({
+                    "interface": i.name, "mode": "dhcp",
+                    "state": c.map(|c| c.phase), "address": addr, "gateway": gw,
+                    "dns": l.map(|l| l.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
+                    "dhcp": {
+                        "server": l.map(|l| l.server.to_string()),
+                        "expires_in_secs": l.map(|l| l.expires_unix().saturating_sub(now)),
+                    },
+                })
+            } else {
+                json!({
+                    "interface": i.name, "mode": "static", "state": "up",
+                    "address": addr, "gateway": gw, "dns": null,
+                })
+            }
         })
         .collect();
     Json(Value::Array(out))
@@ -1257,6 +1346,7 @@ address = "10.10.2.1/24"
             startup: Default::default(),
             dhcp: Default::default(),
             endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
+            history: Default::default(),
             stop: &STOP,
         };
         (Arc::new(s), rx)

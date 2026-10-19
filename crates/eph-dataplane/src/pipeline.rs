@@ -1,4 +1,4 @@
-use crate::config::{Dhcp, NextHop, Port, PortId, Role};
+use crate::config::{Dhcp, NextHop, Port, PortId, Pppoe, Role};
 use crate::filter;
 use crate::nat::{self, NatConfig};
 use crate::overlay::{
@@ -9,7 +9,7 @@ use crate::session::{
 };
 use crate::stats::{DropReason, Stats};
 use eph_fib::Fib;
-use eph_packet::{arp, checksum, eth, icmp, ipv4, l4, Mac};
+use eph_packet::{arp, checksum, eth, icmp, ipv4, l4, pppoe, Mac};
 use rustc_hash::FxSeededState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
@@ -155,6 +155,7 @@ impl Pipeline {
         sessions: SessionConfig,
         overlay: Arc<Overlay>,
     ) -> Self {
+        let nports = ports.len();
         let replay = Arc::new(ReplayGuard::new(overlay.sites.len()));
         let endpoints = Arc::new(Endpoints::new(overlay.tethers.len()));
         Pipeline {
@@ -184,7 +185,10 @@ impl Pipeline {
             icmp_last_refill: 0,
             ip_ident: 0,
             now_ns: 0,
-            stats: Stats::default(),
+            stats: Stats {
+                ports: vec![Default::default(); nports],
+                ..Stats::default()
+            },
             emits: Vec::with_capacity(64),
             learned: Vec::with_capacity(16),
             punts: Vec::new(),
@@ -331,6 +335,12 @@ impl Pipeline {
     /// The MAC to send to `ip` on `port`, if known. An old entry is still
     /// used while an ARP request re-checks it; a very old one is forgotten.
     fn neighbor(&mut self, port: PortId, ip: Ipv4Addr) -> Option<Mac> {
+        // On a PPPoE link everything goes to the access concentrator.
+        match self.ports[port as usize].pppoe {
+            Pppoe::Up { peer, .. } => return Some(peer),
+            Pppoe::Dialing => return None,
+            Pppoe::Off => {}
+        }
         let e = *self.neighbors.get(&(port, ip))?;
         let age = self.now_ns.saturating_sub(e.confirmed_ns);
         if age >= NEIGHBOR_FORGET_NS {
@@ -358,10 +368,18 @@ impl Pipeline {
         len: usize,
     ) -> Verdict {
         self.stats.rx += 1;
-        let v = self.classify(ingress, frame, off, len);
-        match v {
-            Verdict::Drop(r) => self.stats.drop(r),
-            Verdict::Tx { .. } => {}
+        if let Some(p) = self.stats.ports.get_mut(ingress as usize) {
+            p.rx_packets += 1;
+            p.rx_bytes += len as u64;
+        }
+        let mut v = self.classify(ingress, frame, off, len);
+        if let Verdict::Tx { port, off, len } = v {
+            if self.ports[port as usize].pppoe != Pppoe::Off {
+                v = self.pppoe_wrap(frame, port, off, len);
+            }
+        }
+        if let Verdict::Drop(r) = v {
+            self.stats.drop(r);
         }
         v
     }
@@ -379,9 +397,116 @@ impl Pipeline {
         match eth::ethertype(pkt) {
             eth::TYPE_IPV4 => self.ipv4(ingress, frame, off, len, None),
             eth::TYPE_ARP => self.arp(ingress, frame, off, len),
+            pppoe::TYPE_DISCOVERY | pppoe::TYPE_SESSION if port.pppoe != Pppoe::Off => {
+                self.pppoe_rx(ingress, frame, off, len)
+            }
             eth::TYPE_VLAN => Verdict::Drop(DropReason::Vlan),
             _ => Verdict::Drop(DropReason::UnsupportedEthertype),
         }
+    }
+
+    /// PPPoE in: IPv4 in our session is unwrapped and routed like any
+    /// other packet; discovery and PPP control go to the control plane.
+    fn pppoe_rx(&mut self, ingress: PortId, frame: &mut [u8], off: usize, len: usize) -> Verdict {
+        const H: usize = ETH + pppoe::SESSION_HDR_LEN;
+        let p = &self.ports[ingress as usize];
+        let data = &frame[off..off + len];
+        let is_session_ipv4 = eth::ethertype(data) == pppoe::TYPE_SESSION
+            && len >= H
+            && data[ETH] == 0x11
+            && data[ETH + 1] == pppoe::CODE_SESSION
+            && u16::from_be_bytes([data[ETH + 6], data[ETH + 7]]) == pppoe::PROTO_IPV4;
+        if let (true, Some((session, peer, _))) = (is_session_ipv4, p.pppoe_up()) {
+            if u16::from_be_bytes([data[ETH + 2], data[ETH + 3]]) != session
+                || eth::src(data) != peer
+            {
+                return Verdict::Drop(DropReason::NotForUs);
+            }
+            // PPPoE length counts the 2-byte PPP protocol field.
+            let ip_len = (u16::from_be_bytes([data[ETH + 4], data[ETH + 5]]) as usize)
+                .saturating_sub(2)
+                .min(len - H);
+            // Turn it back into a plain Ethernet frame 8 bytes further on.
+            let mac = p.mac;
+            let new_off = off + pppoe::SESSION_HDR_LEN;
+            eth::write(&mut frame[new_off..], mac, peer, eth::TYPE_IPV4);
+            return self.ipv4(ingress, frame, new_off, ETH + ip_len, None);
+        }
+        if self.punts.len() < PUNT_MAX {
+            self.punts.push(Punt {
+                port: ingress,
+                frame: frame[off..off + len].to_vec(),
+            });
+        }
+        Verdict::Drop(DropReason::PppoeToControl)
+    }
+
+    /// PPPoE out: put the session header in front of the IPv4 packet (in the
+    /// frame's headroom; the packet itself doesn't move).
+    fn pppoe_wrap(
+        &mut self,
+        frame: &mut [u8],
+        port: PortId,
+        mut off: usize,
+        len: usize,
+    ) -> Verdict {
+        let Some((session, peer, _)) = self.ports[port as usize].pppoe_up() else {
+            return Verdict::Drop(DropReason::NoRoute); // still dialling
+        };
+        if eth::ethertype(&frame[off..]) != eth::TYPE_IPV4 {
+            return Verdict::Drop(DropReason::UnsupportedEthertype);
+        }
+        const N: usize = pppoe::SESSION_HDR_LEN;
+        if off < N {
+            if off + len + N > frame.len() {
+                return Verdict::Drop(DropReason::TooBig);
+            }
+            frame.copy_within(off..off + len, off + N);
+            off += N;
+        }
+        let new_off = off - N;
+        let mac = self.ports[port as usize].mac;
+        let f = &mut frame[new_off..];
+        eth::write(f, peer, mac, pppoe::TYPE_SESSION);
+        f[ETH] = 0x11;
+        f[ETH + 1] = pppoe::CODE_SESSION;
+        f[ETH + 2..ETH + 4].copy_from_slice(&session.to_be_bytes());
+        f[ETH + 4..ETH + 6].copy_from_slice(&((len - ETH + 2) as u16).to_be_bytes());
+        f[ETH + 6..ETH + 8].copy_from_slice(&pppoe::PROTO_IPV4.to_be_bytes());
+        Verdict::Tx {
+            port,
+            off: new_off,
+            len: len + N,
+        }
+    }
+
+    /// The MTU of the PPPoE link `dst` is routed out of, if it is one.
+    fn pppoe_mtu_towards(&self, dst: Ipv4Addr) -> Option<usize> {
+        if !self.ports.iter().any(|p| p.pppoe_up().is_some()) {
+            return None; // the common case: one cheap check, no lookup
+        }
+        match self.fib.lookup(dst)? {
+            NextHop::Ip { port, .. } => self.ports[*port as usize]
+                .pppoe_up()
+                .map(|(_, _, m)| m as usize),
+            NextHop::Site(_) => None,
+        }
+    }
+
+    /// Queue a frame the router made itself, wrapped for PPPoE if needed.
+    fn push_emit(&mut self, mut e: Emit) {
+        if self.ports[e.port as usize].pppoe != Pppoe::Off {
+            const N: usize = pppoe::SESSION_HDR_LEN;
+            if e.len + N > EMIT_MAX {
+                return;
+            }
+            e.frame.copy_within(0..e.len, N);
+            match self.pppoe_wrap(&mut e.frame, e.port, N, e.len) {
+                Verdict::Tx { off: 0, len, .. } => e.len = len,
+                _ => return,
+            }
+        }
+        self.emits.push(e);
     }
 
     /// UDP to the DHCP server port on a serving port, or to the client port
@@ -488,6 +613,9 @@ impl Pipeline {
 
     /// Queue an ARP request for `ip` out of `port`, at most once per second.
     fn resolve(&mut self, port: PortId, ip: Ipv4Addr) {
+        if self.ports[port as usize].pppoe != Pppoe::Off {
+            return; // no ARP on a PPPoE link
+        }
         let now = self.now_ns;
         if let Some(&last) = self.arp_pending.get(&(port, ip)) {
             if now.saturating_sub(last) < ARP_RETRY_NS {
@@ -509,7 +637,7 @@ impl Pipeline {
             frame: [0; EMIT_MAX],
         };
         e.len = arp::build_request(&mut e.frame, p.mac, p.addr, ip);
-        self.emits.push(e);
+        self.push_emit(e);
         self.stats.originated += 1;
     }
 
@@ -574,6 +702,26 @@ impl Pipeline {
                 0,
                 DropReason::TtlExceeded,
             );
+        }
+
+        // A PPPoE link carries 8 bytes less than Ethernet (1492). Checked
+        // before NAT, so the "too big" error goes to the real sender.
+        if let Some(mtu) = self.pppoe_mtu_towards(h.dst) {
+            if h.total_len > mtu {
+                if frame[off + ETH + 6] & 0x40 == 0 {
+                    return Verdict::Drop(DropReason::TooBig); // fragmentation not implemented
+                }
+                return self.icmp_error(
+                    ingress,
+                    frame,
+                    off,
+                    &h,
+                    icmp::DEST_UNREACHABLE,
+                    icmp::CODE_FRAG_NEEDED,
+                    mtu as u32,
+                    DropReason::TooBig,
+                );
+            }
         }
 
         let allow_new = match via {
@@ -1477,7 +1625,7 @@ impl Pipeline {
                 continue;
             };
             e.len = total;
-            self.emits.push(e);
+            self.push_emit(e);
             self.tether_stats[i].probes_sent += 1;
             self.stats.originated += 1;
         }

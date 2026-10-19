@@ -29,6 +29,40 @@ pub struct Port {
     /// The next hop towards everything beyond this link (an ISP's router),
     /// if known: used for SD-WAN tethers leaving through this port.
     pub gateway: Option<Ipv4Addr>,
+    /// PPPoE on this link (the ISP side of a DSL/fibre line).
+    pub pppoe: Pppoe,
+}
+
+/// A port's PPPoE state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pppoe {
+    #[default]
+    Off,
+    /// Dialling: discovery and PPP control go to the control plane.
+    Dialing,
+    /// A session: IPv4 is carried in it, to the access concentrator.
+    Up {
+        session: u16,
+        peer: eph_packet::Mac,
+        mtu: u16,
+    },
+}
+
+impl Port {
+    /// The PPPoE session, if one is up.
+    pub fn pppoe_up(&self) -> Option<(u16, eph_packet::Mac, u16)> {
+        match self.pppoe {
+            Pppoe::Up { session, peer, mtu } => Some((session, peer, mtu)),
+            _ => None,
+        }
+    }
+
+    /// Can `ip` be reached directly on this link? On a PPPoE link the far
+    /// end (`gateway`) is the only neighbour, outside the router's /32.
+    pub fn reaches(&self, ip: Ipv4Addr) -> bool {
+        !self.addr.is_unspecified()
+            && (self.subnet.contains(ip) || (self.pppoe_up().is_some() && self.gateway == Some(ip)))
+    }
 }
 
 /// The router's DHCP role on a port.
@@ -113,6 +147,16 @@ pub fn build_fib(
                 gateway: None,
             },
         ));
+        // A PPPoE link's far end is connected too, though not in our /32.
+        if let (Some(_), Some(peer)) = (p.pppoe_up(), p.gateway) {
+            routes.push((
+                Prefix::new(peer, 32).expect("a /32"),
+                NextHop::Ip {
+                    port: p.id,
+                    gateway: None,
+                },
+            ));
+        }
     }
     for r in overlay {
         routes.push((r.prefix, NextHop::Site(r.site_idx)));
@@ -120,7 +164,9 @@ pub fn build_fib(
     for r in statics {
         let port = ports
             .iter()
-            .filter(|p| p.subnet.contains(r.via))
+            .filter(|p| {
+                p.subnet.contains(r.via) || (p.pppoe_up().is_some() && p.gateway == Some(r.via))
+            })
             .max_by_key(|p| p.subnet.len())
             .ok_or_else(|| {
                 format!(

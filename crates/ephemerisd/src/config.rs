@@ -226,6 +226,39 @@ pub struct InterfaceCfg {
     /// Serve DHCP on this interface (inside interfaces).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dhcp: Option<DhcpServerCfg>,
+    /// Dial the ISP over PPPoE (`address = "pppoe"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pppoe: Option<PppoeCfg>,
+    /// The PPPoE session while it's up (filled in by `with_links`, never
+    /// part of the file): session id, concentrator MAC, MTU.
+    #[serde(skip)]
+    pub pppoe_session: Option<(u16, Mac, u16)>,
+    /// The address a DHCP lease or PPPoE session gave this interface right
+    /// now (`with_links`; never in the file). `address` keeps saying
+    /// "dhcp" / "pppoe", so the interface stays in that mode, e.g. DHCP
+    /// renewals keep reaching the client.
+    #[serde(skip)]
+    pub addr_now: Option<(Ipv4Addr, u8)>,
+}
+
+/// PPPoE login for an outside interface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PppoeCfg {
+    pub username: String,
+    pub password: String,
+    /// Service-Name to ask for (some ISPs need one); empty: any.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub service: String,
+    /// Largest IP packet on the link (default 1492: Ethernet minus PPPoE).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+}
+
+impl PppoeCfg {
+    pub fn mtu(&self) -> u16 {
+        self.mtu.unwrap_or(eph_packet::pppoe::DEFAULT_MTU)
+    }
 }
 
 /// DHCP server settings for one interface.
@@ -354,6 +387,14 @@ impl InterfaceCfg {
     /// Does this interface get its address by DHCP?
     pub fn is_dhcp_client(&self) -> bool {
         self.address.eq_ignore_ascii_case("dhcp")
+    }
+    /// Does this interface dial its ISP over PPPoE?
+    pub fn is_pppoe(&self) -> bool {
+        self.address.eq_ignore_ascii_case("pppoe")
+    }
+    /// Is the address handed out by someone else (DHCP or PPPoE)?
+    pub fn has_dynamic_address(&self) -> bool {
+        self.is_dhcp_client() || self.is_pppoe()
     }
     pub fn role(&self) -> Role {
         match self.role {
@@ -649,6 +690,35 @@ impl Config {
                     bail!("two interfaces are named {}", a.name);
                 }
             }
+            if a.is_pppoe() {
+                let Some(p) = &a.pppoe else {
+                    bail!("interface {}: address = \"pppoe\" needs an [interface.pppoe] section (username, password)", a.name);
+                };
+                if p.username.is_empty() {
+                    bail!("interface {}: PPPoE needs a username", a.name);
+                }
+                if !(576..=eph_packet::pppoe::DEFAULT_MTU).contains(&p.mtu()) {
+                    bail!(
+                        "interface {}: PPPoE mtu must be between 576 and 1492",
+                        a.name
+                    );
+                }
+                if a.role != RoleCfg::Outside {
+                    bail!(
+                        "interface {}: PPPoE is for outside interfaces (role = \"outside\")",
+                        a.name
+                    );
+                }
+                if a.dhcp.is_some() || a.gateway.is_some() {
+                    bail!("interface {}: a PPPoE interface can't serve DHCP or set a gateway (the ISP's end is the gateway)", a.name);
+                }
+                continue;
+            } else if a.pppoe.is_some() {
+                bail!(
+                    "interface {}: [interface.pppoe] only applies with address = \"pppoe\"",
+                    a.name
+                );
+            }
             if a.is_dhcp_client() {
                 if a.dhcp.is_some() {
                     bail!(
@@ -686,7 +756,7 @@ impl Config {
                 );
             }
             for (j, &(_, other)) in addrs.iter().enumerate().skip(i + 1) {
-                if self.interfaces[j].is_dhcp_client() {
+                if self.interfaces[j].has_dynamic_address() {
                     continue;
                 }
                 if net.contains(other.addr()) || other.contains(net.addr()) {
@@ -722,7 +792,7 @@ impl Config {
             let Some(l) = i.is_dhcp_client().then(|| leases.get(&i.name)).flatten() else {
                 continue;
             };
-            i.address = format!("{}/{}", l.addr, l.prefix_len);
+            i.addr_now = Some((l.addr, l.prefix_len));
             if let Some(r) = l.router {
                 i.gateway = Some(r.to_string());
                 if !default_set {
@@ -737,12 +807,49 @@ impl Config {
         c
     }
 
+    /// This config as it applies right now: DHCP leases (`with_leases`) and
+    /// PPPoE sessions. A session gives its interface a /32, with the ISP's
+    /// end as the gateway and (if nothing else supplies one) the default
+    /// route.
+    pub fn with_links(&self, st: &crate::dhcp::DhcpState) -> Config {
+        let mut c = self.with_leases(&st.client_leases());
+        let mut default_set = c
+            .routes
+            .iter()
+            .any(|r| r.prefix.parse::<Prefix>().is_ok_and(|p| p.len() == 0));
+        for i in &mut c.interfaces {
+            let Some(l) = i
+                .is_pppoe()
+                .then(|| st.pppoe.get(&i.name).and_then(|p| p.link.as_ref()))
+                .flatten()
+            else {
+                continue;
+            };
+            i.addr_now = Some((l.addr, 32));
+            i.gateway = Some(l.peer.to_string());
+            i.pppoe_session = Some((l.session, l.ac_mac, l.mtu));
+            if !default_set && !l.peer.is_unspecified() {
+                c.routes.push(RouteCfg {
+                    prefix: "0.0.0.0/0".into(),
+                    via: l.peer.to_string(),
+                });
+                default_set = true;
+            }
+        }
+        c
+    }
+
     pub fn interface_addrs(&self) -> Result<Vec<(Ipv4Addr, Prefix)>> {
         self.interfaces
             .iter()
             .map(|i| {
-                if i.is_dhcp_client() {
-                    // No address until a lease arrives (see `with_leases`).
+                if i.has_dynamic_address() {
+                    // The lease's / session's address (see `with_links`),
+                    // or none yet.
+                    if let Some((ip, len)) = i.addr_now {
+                        let net = Prefix::new(ip, len).context("bad prefix length")?;
+                        return Ok((ip, net));
+                    }
                     return Ok((
                         Ipv4Addr::UNSPECIFIED,
                         Prefix::new(Ipv4Addr::UNSPECIFIED, 32).unwrap(),
@@ -798,7 +905,15 @@ impl Config {
                     subnet,
                     allow_new_sessions: i.allows_new_sessions(),
                     role: i.role(),
-                    mss_adjust: i.mss_adjust,
+                    // Over PPPoE, TCP segments must fit its smaller MTU.
+                    mss_adjust: i.mss_adjust.or_else(|| {
+                        i.is_pppoe().then(|| {
+                            i.pppoe
+                                .as_ref()
+                                .map_or(eph_packet::pppoe::DEFAULT_MTU, |p| p.mtu())
+                                - 40
+                        })
+                    }),
                     dhcp: if i.is_dhcp_client() {
                         eph_dataplane::Dhcp::Client
                     } else if i.dhcp.is_some() {
@@ -807,6 +922,13 @@ impl Config {
                         eph_dataplane::Dhcp::Off
                     },
                     gateway: i.gateway.as_deref().and_then(|g| g.parse().ok()),
+                    pppoe: match (i.is_pppoe(), i.pppoe_session) {
+                        (false, _) => eph_dataplane::Pppoe::Off,
+                        (true, None) => eph_dataplane::Pppoe::Dialing,
+                        (true, Some((session, peer, mtu))) => {
+                            eph_dataplane::Pppoe::Up { session, peer, mtu }
+                        }
+                    },
                 })
             })
             .collect()
@@ -857,13 +979,9 @@ impl Config {
             .interfaces
             .iter()
             .zip(ports)
-            .any(|(i, p)| i.is_dhcp_client() && p.addr.is_unspecified());
+            .any(|(i, p)| i.has_dynamic_address() && p.addr.is_unspecified());
         if waiting {
-            statics.retain(|r| {
-                ports
-                    .iter()
-                    .any(|p| !p.addr.is_unspecified() && p.subnet.contains(r.via))
-            });
+            statics.retain(|r| ports.iter().any(|p| p.reaches(r.via)));
         }
         build_fib(ports, &statics, &routes).map_err(anyhow::Error::msg)
     }
@@ -959,6 +1077,10 @@ impl Config {
         o.site_id = oc.site_id;
         o.udp_port = oc.udp_port;
         o.mtu = oc.mtu;
+        // Tethers over a PPPoE WAN lose 8 more bytes: shrink the default.
+        if oc.mtu == DEFAULT_MTU && self.interfaces.iter().any(|i| i.is_pppoe()) {
+            o.mtu = DEFAULT_MTU - eph_packet::pppoe::SESSION_HDR_LEN as u16;
+        }
         o.allow_new_sessions = oc.allow_new_sessions;
         if !(576..=9000).contains(&oc.mtu) {
             bail!("overlay.mtu must be between 576 and 9000");
@@ -1434,6 +1556,109 @@ role = "outside"
         assert!(s2.fib(&s2.ports(|_| Ok([0; 6])).unwrap()).is_err());
     }
 
+    const PPPOE_CFG: &str = r#"
+[[interface]]
+name = "lan"
+device = "ens19"
+address = "10.10.1.1/24"
+
+[[interface]]
+name = "wan"
+device = "ens20"
+address = "pppoe"
+role = "outside"
+
+[interface.pppoe]
+username = "alice@isp"
+password = "s3cret"
+"#;
+
+    #[test]
+    fn pppoe_config_and_session() {
+        use crate::dhcp::{DhcpState, PppoeStatus};
+        use crate::pppoe::client::{Link, Phase};
+        let c = parse(PPPOE_CFG).unwrap();
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!(ports[1].pppoe, eph_dataplane::Pppoe::Dialing);
+        assert_eq!(
+            ports[1].mss_adjust,
+            Some(1452),
+            "MSS fits the PPPoE MTU by default"
+        );
+        // Session up: a /32, the ISP's end as gateway and default route.
+        let mut st = DhcpState::default();
+        st.pppoe.insert(
+            "wan".into(),
+            PppoeStatus {
+                phase: Phase::Up,
+                link: Some(Link {
+                    session: 0x42,
+                    ac_mac: [2, 0, 0, 0, 0, 0xac],
+                    ac_name: "bras".into(),
+                    addr: "203.0.113.50".parse().unwrap(),
+                    peer: "203.0.113.1".parse().unwrap(),
+                    dns: vec!["9.9.9.9".parse().unwrap()],
+                    mtu: 1492,
+                    up_since_unix: 0,
+                }),
+                last_error: None,
+            },
+        );
+        let e = c.with_links(&st);
+        assert_eq!(e.interfaces[1].address, "pppoe");
+        assert_eq!(
+            e.interface_addrs().unwrap()[1].0,
+            "203.0.113.50".parse::<Ipv4Addr>().unwrap()
+        );
+        let ports = e.ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!(
+            ports[1].pppoe,
+            eph_dataplane::Pppoe::Up {
+                session: 0x42,
+                peer: [2, 0, 0, 0, 0, 0xac],
+                mtu: 1492
+            }
+        );
+        let fib = e.fib(&ports).unwrap();
+        for dst in ["8.8.8.8", "203.0.113.1"] {
+            assert!(
+                matches!(
+                    fib.lookup(dst.parse().unwrap()),
+                    Some(NextHop::Ip { port: 1, .. })
+                ),
+                "{dst} out of the PPPoE link"
+            );
+        }
+        assert_eq!(
+            st.learned_dns(),
+            vec!["9.9.9.9".parse::<Ipv4Addr>().unwrap()]
+        );
+        // The file itself is untouched by a session.
+        assert_eq!(
+            toml::to_string(&c).unwrap(),
+            toml::to_string(&parse(PPPOE_CFG).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn bad_pppoe_settings_are_refused() {
+        let err =
+            |from: &str, to: &str| parse(&PPPOE_CFG.replace(from, to)).unwrap_err().to_string();
+        assert!(err(
+            "[interface.pppoe]\nusername = \"alice@isp\"\npassword = \"s3cret\"\n",
+            ""
+        )
+        .contains("needs an [interface.pppoe]"));
+        assert!(err("username = \"alice@isp\"", "username = \"\"").contains("username"));
+        assert!(err("role = \"outside\"", "role = \"inside\"").contains("outside interfaces"));
+        assert!(err("password = \"s3cret\"", "password = \"s3cret\"\nmtu = 1500").contains("mtu"));
+        let stray = PPPOE_CFG.replace("address = \"pppoe\"", "address = \"203.0.113.2/24\"");
+        assert!(parse(&stray)
+            .unwrap_err()
+            .to_string()
+            .contains("only applies"));
+    }
+
     #[test]
     fn bad_dhcp_settings_are_refused() {
         let err =
@@ -1471,7 +1696,16 @@ role = "outside"
             },
         );
         let e = c.with_leases(&leases);
-        assert_eq!(e.interfaces[1].address, "203.0.113.50/24");
+        assert_eq!(e.interfaces[1].address, "dhcp", "still a DHCP interface");
+        assert_eq!(
+            e.interface_addrs().unwrap()[1].1.to_string(),
+            "203.0.113.0/24"
+        );
+        assert_eq!(
+            e.ports(|_| Ok([0; 6])).unwrap()[1].dhcp,
+            eph_dataplane::Dhcp::Client,
+            "renewals still reach the client"
+        );
         assert_eq!(e.routes[0].via, "203.0.113.1");
         let ports = e.ports(|_| Ok([0; 6])).unwrap();
         assert_eq!(ports[1].gateway, Some("203.0.113.1".parse().unwrap()));

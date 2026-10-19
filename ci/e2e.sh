@@ -30,6 +30,8 @@ cleanup() {
     [[ -n $QEMU_PID ]] && kill "$QEMU_PID" 2>/dev/null || true
     [[ -n $HTTP_PID ]] && kill "$HTTP_PID" 2>/dev/null || true
     [[ -n $DNSMASQ_PID ]] && { kill "$DNSMASQ_PID" 2>/dev/null; wait "$DNSMASQ_PID" 2>/dev/null; } || true
+    pkill -f "pppoe-server -I eth0" 2>/dev/null || true
+    pkill -x pppd 2>/dev/null || true
     # This runs as root; the workflow uploads the logs as a normal user.
     chmod -R a+rX "$LOGS" 2>/dev/null || true
     ip netns del ci-ha 2>/dev/null || true
@@ -229,6 +231,27 @@ check "bad config falls back by itself"    wait_for 60 "the fallback" on_router 
 check "last good config restored"          on_router "cmp -s /var/lib/ephemeris/ephemeris.toml /run/good.toml && ls /var/lib/ephemeris/ephemeris.toml.failed-*"
 # (The restart means lan-b asks for its lease again: allow it a moment.)
 check "forwarding again after the fallback" wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+
+# ------------------------------------------------------------ PPPoE
+# A real, independent PPPoE implementation plays the ISP: rp-pppoe's
+# pppoe-server with pppd, requiring CHAP and handing out 10.10.9.2 and a DNS
+# server. lan-b switches from DHCP to PPPoE (a commit, applied live), and
+# back afterwards (a rollback).
+echo "PPPoE:"
+modprobe ppp_generic 2>/dev/null || true
+printf '"ephemeris" * "ci-s3cret" *\n' > /etc/ppp/chap-secrets
+printf 'require-chap\nlcp-echo-interval 5\nlcp-echo-failure 3\nms-dns 10.10.9.53\nnoipdefault\nnodefaultroute\nmtu 1492\nmru 1492\ndebug\nlogfile %s/pppd.log\n' "$LOGS" > "$WORK/pppoe-options"
+ip netns exec ci-hb pppoe-server -I eth0 -L 10.10.9.1 -R 10.10.9.2 -N 4 -O "$WORK/pppoe-options" \
+    > "$LOGS/pppoe-server.log" 2>&1 || echo "pppoe-server didn't start" >> "$LOGS/pppoe-server.log"
+sed 's/^address = "dhcp"$/address = "pppoe"/' "$WORK/ephemeris.toml" > "$WORK/pppoe.toml"
+printf '\n[interface.pppoe]\nusername = "ephemeris"\npassword = "ci-s3cret"\n' >> "$WORK/pppoe.toml"
+on_router "cat > /run/pppoe.toml" < "$WORK/pppoe.toml"
+check "switch lan-b to PPPoE"              on_router "ephctl config load /run/pppoe.toml && ephctl config commit"
+check "PPPoE session up (CHAP)"            wait_for 60 "a PPPoE session" on_router "ephctl wan | grep lan-b | grep pppoe | grep up | grep -q '10.10.9.2/32'"
+check "DNS from IPCP"                      sh -c "${SSH[*]} ephctl --json wan | grep -q 10.10.9.53"
+check "traffic over PPPoE (NAT)"           wait_for 30 "ping over PPPoE" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.9.1
+check "back to DHCP"                       on_router "ephctl config rollback 1"
+check "forwarding again over DHCP"         wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
 
 # ------------------------------------------------------------ updates
 if [[ -n $UPDATE_DIR ]]; then

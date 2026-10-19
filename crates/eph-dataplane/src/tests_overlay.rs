@@ -133,6 +133,7 @@ fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
         mss_adjust: None,
         dhcp: crate::config::Dhcp::Off,
         gateway: None,
+        pppoe: crate::config::Pppoe::Off,
     }
 }
 

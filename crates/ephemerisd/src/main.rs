@@ -12,6 +12,7 @@ mod dhcp;
 mod files;
 mod mgmt;
 mod overlay_state;
+mod pppoe;
 mod report;
 #[cfg(target_os = "linux")]
 mod run;

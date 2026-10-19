@@ -213,9 +213,9 @@ impl ConfigManager {
         let cfg = Config::parse(&text)?;
         self.check_devices(&cfg)?;
         if let Some(l) = &self.leases {
-            let leases = l.lock().unwrap().client_leases();
-            if !leases.is_empty() {
-                let now = cfg.with_leases(&leases);
+            let st = l.lock().unwrap().clone();
+            if !st.clients.is_empty() || !st.pppoe.is_empty() {
+                let now = cfg.with_links(&st);
                 now.fib(&now.ports(|_| Ok([0; 6]))?)
                     .context("with the router's current DHCP lease")?;
             }
@@ -801,6 +801,9 @@ address = "10.10.2.1/24"
                 mss_adjust: None,
                 gateway: None,
                 dhcp: None,
+                pppoe: None,
+                pppoe_session: None,
+                addr_now: None,
             });
             m.text_from_model(&cfg).unwrap()
         };

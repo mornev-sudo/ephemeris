@@ -22,6 +22,15 @@ pub struct DhcpState {
     pub clients: HashMap<String, ClientStatus>,
     /// Leases handed out, by interface name.
     pub leases: HashMap<String, Vec<server::Lease>>,
+    /// PPPoE connections, by interface name.
+    pub pppoe: HashMap<String, PppoeStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PppoeStatus {
+    pub phase: crate::pppoe::client::Phase,
+    pub link: Option<crate::pppoe::client::Link>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +57,12 @@ impl DhcpState {
             .into_iter()
             .filter_map(|n| self.clients[n].lease.as_ref())
             .flat_map(|l| l.dns.iter().copied())
+            .chain(
+                self.pppoe
+                    .values()
+                    .filter_map(|p| p.link.as_ref())
+                    .flat_map(|l| l.dns.iter().copied()),
+            )
             .fold(vec![], |mut v, d| {
                 if !v.contains(&d) {
                     v.push(d);

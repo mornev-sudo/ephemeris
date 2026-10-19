@@ -15,6 +15,7 @@ pub mod eth;
 pub mod icmp;
 pub mod ipv4;
 pub mod l4;
+pub mod pppoe;
 
 pub use eth::Mac;
 

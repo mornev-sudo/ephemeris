@@ -113,6 +113,41 @@ forms, the browser sends the configuration as structured data
 changed, in place, so the file stays readable and hand-written comments
 around them survive.
 
+## Reporting: four numbers, every 5 seconds
+
+Everywhere the router reports traffic (the portal's **Reporting** tab, the
+dashboard cards, `ephctl status`), it shows the same four things:
+
+| Number | Meaning |
+|---|---|
+| **Open sessions** | flows in the session tables right now (chapter 7) |
+| **Packets per second** | in and out, across all interfaces |
+| **Throughput** | in and out in bits per second, scaled to bps / kbps / Mbps / Gbps |
+| **Dropped packets** | the running total, and the rate; *Drops by reason* on the dashboard says why |
+
+How it's measured:
+
+1. **Counters.** Each worker counts packets and bytes per interface as they
+   arrive (in the pipeline) and as they go onto a transmit ring (in the
+   worker). That covers forwarded traffic and the router's own: ARP, ICMP,
+   probes, DHCP, PPPoE.
+2. **Sampling.** Every 5 seconds the main thread adds up all workers'
+   counters ([`history.rs`](../../crates/ephemerisd/src/mgmt/history.rs)).
+   The difference from the previous reading, divided by the time between
+   them, is a rate.
+   - **Counters can reset:** a data-plane restart starts them at zero again,
+     so a counter that went *down* gives a rate of 0, never a negative one.
+   - **One hour is kept:** 720 samples in memory, a few hundred kilobytes.
+3. **Graphs.** The Reporting tab asks for the history
+   (`GET /api/v1/stats/history`) and draws it as plain SVG lines, with no
+   chart library. The page's Content-Security-Policy wouldn't load one from
+   elsewhere anyway. It asks again every 5 seconds, and *only* while the
+   tab is open and visible: switch tabs, minimise the window or close it,
+   and the polling stops.
+
+Sampling itself runs all the time. It's a few additions every 5 seconds,
+so the graphs already show the last hour when you open the page.
+
 ## When a config won't start
 
 Validation catches most mistakes before a commit. Some only show up when
