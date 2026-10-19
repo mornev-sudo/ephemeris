@@ -42,17 +42,18 @@ jobs:
       - name: Version
         id: version
         run: |
-          # <release>.<build number>, e.g. 0.5.0.123: the release from
-          # Cargo.toml (so every image says which release it is), then this
-          # workflow's run number (so newer builds always sort as newer for
-          # A/B updates). Short on purpose: it ends up in GPT partition
-          # labels ("ephemeris_<version>_verity", at most 36 characters).
-          # The exact commit is recorded inside the image instead.
+          # <release>-<commit>, e.g. 0.7.1-9003193: the release from
+          # Cargo.toml (so every image says which release it is) and the
+          # commit it was built from (so it can be traced to its source).
+          # Newer releases sort as newer for A/B updates; builds of the same
+          # release can't be ordered, so every release gets a new version.
+          # Short on purpose: it ends up in GPT partition labels
+          # ("ephemeris_<version>_verity", at most 36 characters).
           release=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           [[ $release =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::no release version in Cargo.toml"; exit 1; }
-          v=$release.${{ github.run_number }}
+          v=$release-${GITHUB_SHA::7}
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "Image version: $v (commit ${GITHUB_SHA::7})"
+          echo "Image version: $v"
 
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable

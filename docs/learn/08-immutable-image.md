@@ -132,16 +132,18 @@ git tag v0.5.0 <commit> && git push origin v0.5.0
 
 **Every image says which release it is.** The release version lives in one
 place, `version` in the workspace [`Cargo.toml`](../../Cargo.toml). CI names
-each image `<release>.<build number>`, e.g. `0.5.0.123`: release 0.5.0, the
-123rd CI build. The build number keeps every newer build sorting as newer,
-which A/B updates rely on. The version is kept short because it ends up in
-GPT partition labels, which hold at most 36 characters. So the exact commit
-is stored next to it rather than in it. On a router:
+each image `<release>-<commit>`, e.g. `0.7.1-9003193`: release 0.7.1, built
+from commit `9003193`, so any router's image can be traced to its exact
+source. A newer release always sorts as newer, which A/B updates rely on.
+Two builds of the *same* release can't be ordered by their commit hashes,
+which is why every release gets its own version number. The version is kept
+short because it ends up in GPT partition labels, which hold at most 36
+characters. On a router:
 
 | Where | Shows |
 |---|---|
-| Console login prompt | `Ephemeris 0.5.0.123` |
-| `ephctl status`, portal header and System tab | `v0.5.0`, build `0.5.0.123 (commit dca7076)` |
+| Console login prompt | `Ephemeris 0.7.1-9003193` |
+| `ephctl status`, portal header and System tab | `v0.7.1`, build `0.7.1-9003193` |
 | `/usr/lib/ephemeris/version`, `/usr/lib/ephemeris/commit` | the raw values |
 
 To release: set the new version in `Cargo.toml`, push, wait for CI to pass,

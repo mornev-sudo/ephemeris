@@ -229,8 +229,8 @@ pub fn run(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The image build this is, e.g. "0.5.0.123 (commit dca7076)": the
-/// release, the CI build number, and the exact source it was built from.
+/// The image build this is, e.g. "0.7.1-9003193": the release and the
+/// commit it was built from (added if the version doesn't already say it).
 fn build_string() -> String {
     let read = |f: &str| {
         std::fs::read_to_string(format!("/usr/lib/ephemeris/{f}"))
@@ -239,6 +239,7 @@ fn build_string() -> String {
             .filter(|s| !s.is_empty())
     };
     match (read("version"), read("commit")) {
+        (Some(v), Some(c)) if v.ends_with(&format!("-{c}")) => v,
         (Some(v), Some(c)) => format!("{v} (commit {c})"),
         (Some(v), None) => v,
         (None, _) => format!("{} (dev)", env!("CARGO_PKG_VERSION")),

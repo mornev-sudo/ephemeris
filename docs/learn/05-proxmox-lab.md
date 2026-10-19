@@ -37,7 +37,7 @@ This creates the bridges `vmbr10` and `vmbr20`, plus containers 9101 and
 SSH_KEY=/root/id_ed25519.pub ./deploy-image.sh
 ```
 
-This downloads the latest image (e.g. `ephemeris_0.5.0.2_x86-64.qcow2`) from GitHub Releases and
+This downloads the latest image (e.g. `ephemeris_0.7.1-9003193_x86-64.qcow2`) from GitHub Releases and
 creates VM 9100 (UEFI, 3 virtio NICs). It generates an admin password, and
 passes its hash, the hostname, a two-port router config and (optionally,
 with `SSH_KEY=`) your SSH key into the VM as systemd credentials. It boots

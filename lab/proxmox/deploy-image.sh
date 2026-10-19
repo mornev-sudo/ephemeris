@@ -4,7 +4,7 @@
 #
 #   ./deploy-image.sh                                  # latest release
 #   ./deploy-image.sh 0.3.0                            # specific version
-#   IMAGE=/root/ephemeris_0.5.0.2_x86-64.qcow2 ./deploy-image.sh # local file
+#   IMAGE=/root/ephemeris_0.7.1-9003193_x86-64.qcow2 ./deploy-image.sh # local file
 #   SSH_KEY=/root/id_ed25519.pub ./deploy-image.sh     # also install an SSH key
 #
 # It prints the generated admin password at the end.
@@ -49,7 +49,7 @@ if [[ -z $IMAGE ]]; then
     fi
     dir=$CACHE/$VERSION
     mkdir -p "$dir"
-    # The image file is named after its build, e.g. ephemeris_0.5.0.2_x86-64.qcow2;
+    # The image file is named after its build, e.g. ephemeris_0.7.1-9003193_x86-64.qcow2;
     # the release's VERSION file says which build it holds.
     build=$(curl -fsSL "$base/VERSION") || die "can't read $base/VERSION (is the repo private? then download the image yourself and set IMAGE=)"
     file=ephemeris_${build}_x86-64.qcow2

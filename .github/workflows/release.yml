@@ -82,7 +82,7 @@ jobs:
           # image built from a commit whose Cargo.toml says 0.5.0.
           build=$(cat VERSION)
           rel=${GITHUB_REF_NAME#v}
-          if [[ ! $build =~ ^${rel//./\\.}\.[0-9]+$ ]]; then
+          if [[ ! $build =~ ^${rel//./\\.}-[0-9a-f]{7}$ ]]; then
             echo "::error::tag $GITHUB_REF_NAME doesn't match the image's release (build $build). Set version = \"${GITHUB_REF_NAME#v}\" in Cargo.toml, push, wait for CI, then tag that commit."
             exit 1
           fi

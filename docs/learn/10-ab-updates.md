@@ -44,8 +44,8 @@ every future version must fit in either one.
 
 The first CI run of the update test hit a classic detail: **GPT partition
 labels are limited to 36 characters**, and `ephemeris_<version>_verity` was
-38. That's why versions are short, like `0.5.0.123` (release, then CI build
-number; see chapter 8), and why `image/build.sh` refuses longer ones.
+38. That's why versions are short, like `0.7.1-9003193` (release, then
+commit; see chapter 8), and why `image/build.sh` refuses longer ones.
 
 ## Installing an update: systemd-sysupdate
 
