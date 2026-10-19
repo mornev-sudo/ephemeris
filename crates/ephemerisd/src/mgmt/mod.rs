@@ -40,6 +40,15 @@ pub struct PortRuntime {
     pub zero_copy: bool,
 }
 
+#[derive(Default)]
+pub struct UpdateCache {
+    /// The version an install was started for.
+    pub target: Option<String>,
+    /// (when, key, the boot loader's default version): `key` is the update
+    /// job's state, so a finished install is seen straight away.
+    pub default_entry: Option<(std::time::Instant, String, Option<String>)>,
+}
+
 pub struct Shared {
     pub build: String,
     pub started: Instant,
@@ -66,6 +75,9 @@ pub struct Shared {
     pub endpoints: Arc<eph_dataplane::overlay::Endpoints>,
     /// Rates sampled every few seconds, for the Reporting graphs.
     pub history: Mutex<history::History>,
+    /// What the software-update buttons know: the version being installed
+    /// and the boot loader's view (cached: the System tab polls).
+    pub update: Mutex<UpdateCache>,
     /// Set to stop the daemon (systemd then starts it again).
     pub stop: &'static AtomicBool,
 }

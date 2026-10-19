@@ -217,21 +217,42 @@ async function refreshRoutes() {
   }));
 }
 
+/// The update's phase in words: [card title, card value, card note].
+function updateText(u) {
+  switch (u && u.phase) {
+    case "installing": return ["Update", "Installing…", `${u.version || "the newest version"} into the idle slot; the router keeps forwarding`];
+    case "installed": return ["Update", "Ready: reboot to switch", `${u.version} is installed; Reboot starts it (about a minute of downtime)`];
+    case "failed": return ["Update", "Install failed", u.detail];
+    default: return ["Update", "Nothing pending", "Check for updates to look for a newer version"];
+  }
+}
+let sysUpdate = null;
 async function refreshSystem() {
   const s = await api("GET", "/system");
-  const j = s.update_job || {};
-  $("syscards").replaceChildren(card("Running version", "v" + s.version, "build " + s.build),
-    card("Update job", j.state || "unknown", j.result ? "last result: " + j.result : ""));
+  sysUpdate = s.update;
+  const [t, v, note] = updateText(s.update);
+  const c = card(t, v, note);
+  if (s.update && s.update.phase === "installed") c.classList.add("warnbox");
+  $("syscards").replaceChildren(card("Running version", "v" + s.version, "build " + s.build), c);
 }
 function sysmsg(t, cls) { $("sysmsg").textContent = t; $("sysmsg").className = cls || ""; }
 $("syscheck").onclick = async () => { sysmsg("Checking…"); try {
   const r = await api("POST", "/system/update/check");
   const pre = $("sysout"); pre.textContent = r.versions; pre.classList.remove("hidden");
   sysmsg(r.available ? "Newer version available: " + r.available : "Up to date.", "ok"); } catch (e) { sysmsg(e.message, "bad"); } };
-$("sysupdate").onclick = async () => { if (!confirm("Download and install the newest version into the idle slot?")) return;
-  try { const r = await api("POST", "/system/update"); sysmsg(r.note, "ok"); } catch (e) { sysmsg(e.message, "bad"); } };
-$("sysreboot").onclick = async () => { if (!confirm("Reboot the router now? Traffic stops for about a minute.")) return;
-  try { await api("POST", "/system/reboot"); sysmsg("Rebooting…", "warn"); } catch (e) { sysmsg(e.message, "bad"); } };
+$("sysupdate").onclick = async () => {
+  if (!confirm("Download and install the newest version into the idle slot? The router keeps running this version until you reboot.")) return;
+  try { const r = await api("POST", "/system/update"); sysmsg(r.note, "ok"); refreshSystem().catch(() => {}); } catch (e) { sysmsg(e.message, "bad"); } };
+$("sysreboot").onclick = async () => {
+  await refreshSystem().catch(() => {});
+  const u = sysUpdate || {};
+  let q = "Reboot the router now? Traffic stops for about a minute.";
+  if (u.phase === "installing")
+    q = "An update is still installing. Rebooting now cancels it (the router comes back on the current version, safely). Reboot anyway?";
+  else if (u.phase === "installed")
+    q = `Reboot into ${u.version}? Traffic stops for about a minute. If it doesn't come up healthy, the router goes back to the current version by itself.`;
+  if (!confirm(q)) return;
+  try { await api("POST", "/system/reboot"); sysmsg(u.phase === "installed" ? `Rebooting into ${u.version}…` : "Rebooting…", "warn"); } catch (e) { sysmsg(e.message, "bad"); } };
 
 $("pwform").onsubmit = async (e) => {
   e.preventDefault();

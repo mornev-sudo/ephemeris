@@ -130,6 +130,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         dhcp: dhcp_state,
         endpoints,
         history: Default::default(),
+        update: Default::default(),
         stop: &STOP,
     });
     let mgmt = m.enabled.then(|| {

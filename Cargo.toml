@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 # The release version: the one place it is set. CI builds images named
 # <this>-<commit>, and a release tag must be v<this> (release.yml).
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"

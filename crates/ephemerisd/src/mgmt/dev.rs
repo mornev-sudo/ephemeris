@@ -47,6 +47,7 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         dhcp: Default::default(),
         endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
         history: Default::default(),
+        update: Default::default(),
         stop: &STOP,
     });
     // Made-up traffic every 5 s, so the Reporting graphs have something to

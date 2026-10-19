@@ -72,10 +72,15 @@ enum SystemCmd {
     Status,
     /// List installed and available versions.
     Check,
-    /// Install the newest version into the inactive slot (then reboot).
+    /// Install the newest version into the idle slot. The router keeps
+    /// running; reboot when `ephctl system status` says it's installed.
     Update,
-    /// Reboot into the newest installed version.
-    Reboot,
+    /// Reboot (into an installed update, if there is one).
+    Reboot {
+        /// Reboot even while an update is still installing (it's cancelled).
+        #[arg(long)]
+        force: bool,
+    },
     /// Change the admin password (web "admin" and console/SSH "root").
     Password {
         /// Set a new password without the current one (forgotten password).
@@ -749,7 +754,19 @@ fn system(c: &Client, cmd: SystemCmd, json: bool) -> Result<()> {
         SystemCmd::Status => c.get("/system")?,
         SystemCmd::Check => c.call("POST", "/system/update/check", None)?,
         SystemCmd::Update => c.call("POST", "/system/update", None)?,
-        SystemCmd::Reboot => c.call("POST", "/system/reboot", None)?,
+        SystemCmd::Reboot { force } => {
+            let st = c.get("/system")?;
+            let u = &st["update"];
+            match u["phase"].as_str() {
+                Some("installing") if !force => bail!(
+                    "an update is still installing ({}): wait until `ephctl system status` says it's installed, or reboot anyway with --force",
+                    u["version"].as_str().unwrap_or("the newest version")
+                ),
+                Some("installed") => println!("Rebooting into {}…", str(&u["version"])),
+                _ => println!("Rebooting…"),
+            }
+            c.call("POST", "/system/reboot", None)?
+        }
         SystemCmd::Password { reset } => {
             let current = if reset {
                 None
@@ -793,8 +810,18 @@ fn system(c: &Client, cmd: SystemCmd, json: bool) -> Result<()> {
             "Ephemeris {}, build {build}",
             v["version"].as_str().unwrap_or("?")
         );
-        let j = &v["update_job"];
-        println!("update job: {} ({})", str(&j["state"]), str(&j["result"]));
+        let u = &v["update"];
+        let ver = u["version"].as_str().unwrap_or("the newest version");
+        match u["phase"].as_str() {
+            Some("installing") => println!(
+                "update: installing {ver} into the idle slot (the router keeps forwarding)"
+            ),
+            Some("installed") => {
+                println!("update: {ver} is installed: `ephctl system reboot` switches to it")
+            }
+            Some("failed") => println!("update: failed: {}", str(&u["detail"])),
+            _ => println!("update: nothing pending (`ephctl system check` looks for one)"),
+        }
     }
     if let Some(list) = v["versions"].as_str() {
         print!("{list}");
@@ -807,6 +834,9 @@ fn system(c: &Client, cmd: SystemCmd, json: bool) -> Result<()> {
     }
     if let Some(note) = v["note"].as_str() {
         println!("{note}");
+        if v["version"].is_string() || v["ok"] == true {
+            println!("Follow it with `ephctl system status`.");
+        }
     } else if v["ok"].as_bool() == Some(true) {
         println!("OK.");
     }

@@ -256,12 +256,14 @@ check "forwarding again over DHCP"         wait_for 60 "forwarding" ip netns exe
 # ------------------------------------------------------------ updates
 if [[ -n $UPDATE_DIR ]]; then
     echo "A/B update to $UPDATE_VERSION:"
-    check "newer version offered"          sh -c "${SSH[*]} ephctl system check | grep -q '$UPDATE_VERSION'"
+    check "newer version offered"          sh -c "${SSH[*]} ephctl system check | grep -q 'Newer version available: $UPDATE_VERSION\.'"
+    check "check shows no log chatter"     sh -c "! ${SSH[*]} ephctl system check | grep -qiE 'discovered|acquir|gpg:'"
     check "update starts"                  sh -c "${SSH[*]} ephctl system update"
     # The new UKI is installed last, with a boot counter (+3-0): when it's
     # there, the whole update is in place.
     check "update installed"               wait_for 300 "new UKI" sh -c "${SSH[*]} 'ls \$(bootctl --print-esp-path)/EFI/Linux' | grep -q '_${UPDATE_VERSION}_x86-64+3-0.efi'"
     check "update job succeeded"           sh -c "${SSH[*]} systemctl show -p Result --value ephemeris-update.service | grep -q success"
+    check "status says: installed, reboot"  wait_for 30 "installed state" sh -c "${SSH[*]} ephctl system status | grep -q '$UPDATE_VERSION is installed'"
     on_router ephctl system reboot >/dev/null 2>&1 || true
     sleep 10
     check "router comes back"              wait_for 300 "SSH after update reboot" on_router true

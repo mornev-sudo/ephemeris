@@ -126,17 +126,32 @@ knowing about.
 ```bash
 ephctl system check      # what's installed, what's available
 ephctl system update     # install the newest release into the idle slot
-ephctl system status     # wait for the update job to finish
+ephctl system status     # "update: 0.7.2-… is installed" when it's done
 ephctl system reboot     # switch to it
 ```
 
-The portal's **System** tab has the same buttons.
+The portal's **System** tab has the same buttons, and an **Update** card
+showing where things stand:
+
+| State | Meaning |
+|---|---|
+| Nothing pending | no update installed and waiting |
+| Installing… | downloading and writing the idle slot; the router keeps forwarding on the current version |
+| Ready: reboot to switch | installed: the boot loader will start it next. Nothing happens until you reboot |
+| Install failed | the reason, and where to look (`journalctl -u ephemeris-update`) |
+
+**Install never reboots by itself.** You choose when the minute of downtime
+happens. "Ready" is read from the boot loader itself: its default entry is a
+version other than the one running. Clicking Reboot during an install asks
+first. Rebooting then is safe, because the new boot entry is only written at
+the very end: the router simply comes back on the current version.
+`ephctl system reboot` refuses during an install unless you add `--force`.
 
 **The update source.** By default routers fetch from
-`https://github.com/mornev-sudo/ephemeris/releases/latest/download/`.
-While the repository is private that needs authentication, which the router
-doesn't have. You can point a router at any HTTP server holding a release's
-files, with the `ephemeris.update_url` credential:
+`https://github.com/mornev-sudo/ephemeris/releases/latest/download/`. You can
+point a router at any HTTP server holding a release's files instead (an
+offline network, a staged rollout) with the `ephemeris.update_url`
+credential:
 
 ```bash
 qm set 9100 --args "$(qm config 9100 | sed -n 's/^args: //p') \

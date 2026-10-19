@@ -1199,16 +1199,79 @@ async fn systemd_run(args: &'static [&'static str]) -> Result<String, ApiError> 
                     format!("systemd-run: {e}"),
                 )
             })?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned()
-            + &String::from_utf8_lossy(&out.stderr);
-        if out.status.success() {
-            Ok(text)
-        } else {
-            Err(ApiError(StatusCode::BAD_GATEWAY, text.trim().to_string()))
-        }
+        command_output(out.status.success(), &out.stdout, &out.stderr)
+            .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e))
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
+/// A command's answer is its stdout; its stderr is a log of what it did
+/// (systemd-sysupdate's progress, gpg's notes). Only a failure shows the
+/// log, where it's the useful part.
+fn command_output(ok: bool, stdout: &[u8], stderr: &[u8]) -> Result<String, String> {
+    let out = String::from_utf8_lossy(stdout).into_owned();
+    if ok {
+        return Ok(out);
+    }
+    let log = String::from_utf8_lossy(stderr);
+    let text = format!("{}\n{}", out.trim(), log.trim());
+    Err(text.trim().to_string())
+}
+
+/// The version in a boot entry's name: "ephemeris_0.7.1-d0d9b19_x86-64+3-0.efi"
+/// -> "0.7.1-d0d9b19".
+fn entry_version(id: &str) -> Option<String> {
+    let rest = id.strip_prefix("ephemeris_")?;
+    let (v, _) = rest.split_once("_x86-64")?;
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// The version the boot loader will start next (its default entry).
+async fn boot_default_version() -> Option<String> {
+    let out = systemd_run(&["/usr/bin/bootctl", "list", "--json=short", "--no-pager"])
+        .await
+        .ok()?;
+    let entries: Value = serde_json::from_str(&out).ok()?;
+    entries
+        .as_array()?
+        .iter()
+        .find(|e| e["isDefault"] == true)
+        .and_then(|e| e["id"].as_str())
+        .and_then(entry_version)
+}
+
+/// Where a software update stands: "idle", "installing" (into the idle
+/// slot), "installed" (reboot to switch) or "failed".
+async fn update_status(s: &Shared, job_state: &str, job_result: &str) -> Value {
+    let running = std::fs::read_to_string("/usr/lib/ephemeris/version")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    if matches!(job_state, "activating" | "active" | "reloading") {
+        let target = s.update.lock().unwrap().target.clone();
+        return json!({ "phase": "installing", "version": target });
+    }
+    // Ask the boot loader at most every 15 s, or when the job changed.
+    let key = format!("{job_state}/{job_result}");
+    let cached = s.update.lock().unwrap().default_entry.clone();
+    let default = match cached {
+        Some((at, k, v)) if k == key && at.elapsed() < Duration::from_secs(15) => v,
+        _ => {
+            let v = boot_default_version().await;
+            s.update.lock().unwrap().default_entry =
+                Some((std::time::Instant::now(), key, v.clone()));
+            v
+        }
+    };
+    match default {
+        Some(v) if !running.is_empty() && v != running => {
+            json!({ "phase": "installed", "version": v })
+        }
+        _ if job_state == "failed" || (job_result != "success" && !job_result.is_empty()) => {
+            json!({ "phase": "failed", "detail": format!("the last install ended with: {job_result} (see journalctl -u ephemeris-update)") })
+        }
+        _ => json!({ "phase": "idle" }),
+    }
 }
 
 fn systemctl(args: &[&str]) -> Result<String, ApiError> {
@@ -1244,10 +1307,17 @@ async fn system(State(s): St) -> Json<Value> {
         json!({ "state": get("ActiveState="), "result": get("Result=") })
     })
     .unwrap_or(Value::Null);
+    let update = update_status(
+        &s,
+        job["state"].as_str().unwrap_or(""),
+        job["result"].as_str().unwrap_or(""),
+    )
+    .await;
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "build": s.build,
         "update_job": job,
+        "update": update,
     }))
 }
 
@@ -1263,12 +1333,22 @@ async fn update_check() -> ApiResult {
     })))
 }
 
-async fn update_start() -> ApiResult {
+async fn update_start(State(s): St) -> ApiResult {
+    // Which version it will install, for the messages while it runs.
+    let target = systemd_run(&["/usr/lib/systemd/systemd-sysupdate", "check-new"])
+        .await
+        .map(|o| o.trim().to_string())
+        .ok()
+        .filter(|v| !v.is_empty());
+    s.update.lock().unwrap().target = target.clone();
     systemctl(&["start", "--no-block", "ephemeris-update.service"])?;
-    Ok(Json(json!({
-        "ok": true,
-        "note": "installing into the inactive slot; watch GET /system, then reboot",
-    })))
+    let note = match &target {
+        Some(v) => format!(
+            "Installing {v} into the idle slot. The router keeps forwarding; reboot when it's installed."
+        ),
+        None => "Installing the newest version into the idle slot. The router keeps forwarding; reboot when it's installed.".into(),
+    };
+    Ok(Json(json!({ "ok": true, "version": target, "note": note })))
 }
 
 async fn reboot() -> ApiResult {
@@ -1347,6 +1427,7 @@ address = "10.10.2.1/24"
             dhcp: Default::default(),
             endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
             history: Default::default(),
+            update: Default::default(),
             stop: &STOP,
         };
         (Arc::new(s), rx)
@@ -1379,6 +1460,32 @@ address = "10.10.2.1/24"
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[test]
+    fn command_output_keeps_the_log_out_of_answers() {
+        let log = b"Automatically discovered root block device '/dev/sda'.\ngpg: Good signature\n";
+        assert_eq!(
+            command_output(true, b"0.7.1-d0d9b19\n", log)
+                .unwrap()
+                .trim(),
+            "0.7.1-d0d9b19"
+        );
+        let e = command_output(false, b"", b"Failed to acquire manifest: 404\n").unwrap_err();
+        assert_eq!(e, "Failed to acquire manifest: 404");
+    }
+
+    #[test]
+    fn boot_entry_versions() {
+        assert_eq!(
+            entry_version("ephemeris_0.7.1-d0d9b19_x86-64+3-0.efi").as_deref(),
+            Some("0.7.1-d0d9b19")
+        );
+        assert_eq!(
+            entry_version("ephemeris_0.7.0.9_x86-64.efi").as_deref(),
+            Some("0.7.0.9")
+        );
+        assert_eq!(entry_version("auto-windows"), None);
     }
 
     #[tokio::test]
