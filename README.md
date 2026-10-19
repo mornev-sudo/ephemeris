@@ -118,6 +118,11 @@ Plain-language explanations of everything in here, in reading order:
 - [x] **Resources and capacity:** CPU (per core, per thread), memory and huge pages, disk, worker busy %, and every table's usage against its limit (FIB, sessions, neighbours, NAT, DHCP pools, tethers)
 - [x] **Bounded resources:** every session expires (idle limit of an hour, closed within 10 minutes), session views show the newest 1000 and are gathered only while viewed, a bounded control-plane queue, a capped journal and history, management at lower CPU priority
 - [ ] **Next for the edge:** destination NAT / port forwarding, VLANs (802.1Q), `ephsh` router CLI
+- [ ] **Performance and capacity:**
+  - [ ] Benchmarks: a microbenchmark of the per-packet pipeline (CPU ceiling per core, no NIC), and a lab test with a traffic generator (pktgen / TRex) for real packets per second on Proxmox and on hardware NICs
+  - [ ] Memory-aware sizing: `sessions.max_per_worker = "auto"` sized from the RAM available at start, and a start-up check that refuses or warns when the reserved tables (sessions, FIB, packet buffers) exceed what the machine has
+  - [ ] Scaling beyond one core per flow: spread PPPoE traffic (NICs can't hash inside PPPoE, so a PPPoE WAN lands on one queue) and SD-WAN tether traffic (one UDP flow per tether) across workers
+  - [ ] Jumbo frames: interface MTUs above 1500 (bigger packet buffers, the NIC's own MTU raised)
 - [ ] **Phase 4: SD-WAN.**
   - [x] 4a: UDP overlay tethers over multiple WANs, in-place encapsulation, probing (latency/jitter/loss), app-aware path selection with SLAs and hysteresis, failover, MSS clamping, path MTU
   - [x] 4b (first half): tether encryption and authentication with per-tether pre-shared keys (ChaCha20-Poly1305), replay protection
