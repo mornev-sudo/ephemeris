@@ -40,6 +40,10 @@ pub const OPT_PARAM_LIST: u8 = 55;
 pub const OPT_RENEWAL_TIME: u8 = 58;
 pub const OPT_REBINDING_TIME: u8 = 59;
 pub const OPT_CLIENT_ID: u8 = 61;
+/// Classless static routes (RFC 3442).
+pub const OPT_CLASSLESS_ROUTES: u8 = 121;
+/// Microsoft's pre-standard copy of option 121, same format.
+pub const OPT_MS_CLASSLESS_ROUTES: u8 = 249;
 pub const OPT_END: u8 = 255;
 pub const OPT_PAD: u8 = 0;
 
@@ -145,6 +149,36 @@ impl Message {
         let m = u32::from(self.ip(OPT_SUBNET_MASK)?);
         // Only contiguous masks are valid.
         (m.leading_ones() + m.trailing_zeros() == 32).then(|| m.leading_ones() as u8)
+    }
+
+    /// Classless static routes (RFC 3442) from `code` (121, or 249 from
+    /// older Microsoft servers): (destination, prefix length, router), with
+    /// router 0.0.0.0 meaning "on this link". `None` if absent or malformed:
+    /// a malformed option is ignored as a whole, as the RFC asks.
+    pub fn classless_routes(&self, code: u8) -> Option<Vec<(Ipv4Addr, u8, Ipv4Addr)>> {
+        let v = self.option(code)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < v.len() {
+            let width = v[i];
+            if width > 32 {
+                return None;
+            }
+            let sig = (width as usize).div_ceil(8);
+            let dest = v.get(i + 1..i + 1 + sig)?;
+            let gw = v.get(i + 1 + sig..i + 5 + sig)?;
+            let mut d = [0u8; 4];
+            d[..sig].copy_from_slice(dest);
+            let mask = if width == 0 {
+                0
+            } else {
+                u32::MAX << (32 - width)
+            };
+            let dest = Ipv4Addr::from(u32::from_be_bytes(d) & mask);
+            out.push((dest, width, Ipv4Addr::new(gw[0], gw[1], gw[2], gw[3])));
+            i += 5 + sig;
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     /// Parse the UDP payload of a DHCP packet.
@@ -317,6 +351,36 @@ mod tests {
     use super::*;
 
     const MAC: Mac = [0x02, 0, 0, 0, 0, 0x42];
+
+    #[test]
+    fn classless_routes_rfc3442() {
+        let mut m = Message::new(OP_REPLY, 1, MAC);
+        // The RFC's examples: 0/0 via 10.0.0.1, 10.17.0.0/16 via 10.0.0.2,
+        // and 192.0.2.1/32 on-link (router 0.0.0.0).
+        m.set(
+            OPT_CLASSLESS_ROUTES,
+            vec![
+                0, 10, 0, 0, 1, //
+                16, 10, 17, 10, 0, 0, 2, //
+                32, 192, 0, 2, 1, 0, 0, 0, 0,
+            ],
+        );
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(
+            m.classless_routes(OPT_CLASSLESS_ROUTES),
+            Some(vec![
+                (ip("0.0.0.0"), 0, ip("10.0.0.1")),
+                (ip("10.17.0.0"), 16, ip("10.0.0.2")),
+                (ip("192.0.2.1"), 32, ip("0.0.0.0")),
+            ])
+        );
+        // Truncated or a width over 32: the whole option is ignored.
+        m.set(OPT_CLASSLESS_ROUTES, vec![24, 10, 1, 2, 10, 0]);
+        assert_eq!(m.classless_routes(OPT_CLASSLESS_ROUTES), None);
+        m.set(OPT_CLASSLESS_ROUTES, vec![33, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(m.classless_routes(OPT_CLASSLESS_ROUTES), None);
+        assert_eq!(m.classless_routes(OPT_MS_CLASSLESS_ROUTES), None);
+    }
 
     #[test]
     fn message_round_trip() {

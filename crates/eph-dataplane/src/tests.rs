@@ -40,6 +40,8 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
+            onlink: vec![],
+            mtu: 1500,
         },
         Port {
             id: 1,
@@ -53,6 +55,8 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
+            onlink: vec![],
+            mtu: 1500,
         },
     ]);
     let statics = [StaticRoute {
@@ -117,6 +121,42 @@ fn learn(r: &mut Pipeline, port: PortId, mac: Mac, addr: &str) {
         ip: ip(addr),
         mac,
     });
+}
+
+/// On a /32 lease the gateway is outside the subnet but on the link: its
+/// ARP request to us is answered and it's learned as a neighbour.
+#[test]
+fn arp_from_an_on_link_gateway_outside_the_subnet() {
+    let mut r = router();
+    let mut ports = r.ports().to_vec();
+    ports[1].addr = ip("100.64.12.34");
+    ports[1].subnet = "100.64.12.34/32".parse().unwrap();
+    ports[1].onlink = vec!["100.64.0.1/32".parse().unwrap()];
+    r.set_ports(ports.into());
+    let (mut b, n) = arp_frame(
+        arp::OP_REQUEST,
+        HOST_B,
+        "100.64.0.1",
+        "100.64.12.34",
+        eth::BROADCAST,
+    );
+    assert!(matches!(
+        r.process(1, &mut b, 0, n),
+        Verdict::Tx { port: 1, .. }
+    ));
+    assert!(r
+        .neighbors()
+        .any(|x| x.ip == ip("100.64.0.1") && x.mac == HOST_B));
+    // Anyone else off the subnet is still ignored.
+    let (mut b, n) = arp_frame(
+        arp::OP_REQUEST,
+        HOST_A,
+        "100.64.0.9",
+        "100.64.12.34",
+        eth::BROADCAST,
+    );
+    r.process(1, &mut b, 0, n);
+    assert!(!r.neighbors().any(|x| x.ip == ip("100.64.0.9")));
 }
 
 #[test]
@@ -370,12 +410,70 @@ fn static_route_gateway_must_be_connected() {
         dhcp: crate::config::Dhcp::Off,
         gateway: None,
         pppoe: crate::config::Pppoe::Off,
+        onlink: vec![],
+        mtu: 1500,
     }];
     let bad = [StaticRoute {
         prefix: "0.0.0.0/0".parse().unwrap(),
         via: ip("172.16.0.1"),
     }];
     assert!(build_fib(&ports, &bad, &[]).is_err());
+}
+
+/// A /32 lease with its gateway outside it (ISPs, clouds): the gateway is
+/// on-link, so routes through it resolve, and a port still waiting for its
+/// address adds no 0.0.0.0/32 "connected" route.
+#[test]
+fn on_link_gateway_outside_the_subnet() {
+    let wan = |addr: &str, subnet: &str, onlink: Vec<eph_fib::Prefix>| Port {
+        id: 0,
+        name: "wan".into(),
+        mac: R0,
+        addr: ip(addr),
+        subnet: subnet.parse().unwrap(),
+        allow_new_sessions: false,
+        role: Role::Outside,
+        mss_adjust: None,
+        dhcp: crate::config::Dhcp::Client,
+        gateway: Some(ip("100.64.0.1")),
+        pppoe: crate::config::Pppoe::Off,
+        onlink,
+        mtu: 1500,
+    };
+    let default = [StaticRoute {
+        prefix: "0.0.0.0/0".parse().unwrap(),
+        via: ip("100.64.0.1"),
+    }];
+    // Without the on-link /32 the gateway can't be resolved...
+    let bare = [wan("100.64.12.34", "100.64.12.34/32", vec![])];
+    assert!(build_fib(&bare, &default, &[]).is_err());
+    // ...with it, it can, and the gateway itself is a connected host.
+    let ports = [wan(
+        "100.64.12.34",
+        "100.64.12.34/32",
+        vec!["100.64.0.1/32".parse().unwrap()],
+    )];
+    let fib = build_fib(&ports, &default, &[]).unwrap();
+    assert_eq!(
+        fib.lookup(ip("8.8.8.8")),
+        Some(&NextHop::Ip {
+            port: 0,
+            gateway: Some(ip("100.64.0.1"))
+        })
+    );
+    assert_eq!(
+        fib.lookup(ip("100.64.0.1")),
+        Some(&NextHop::Ip {
+            port: 0,
+            gateway: None
+        })
+    );
+    assert!(ports[0].reaches(ip("100.64.0.1")));
+    // Waiting for a lease: no route at all, not 0.0.0.0/32.
+    let waiting = [wan("0.0.0.0", "0.0.0.0/32", vec![])];
+    let fib = build_fib(&waiting, &[], &[]).unwrap();
+    assert!(fib.routes().is_empty(), "{:?}", fib.routes());
+    assert!(!waiting[0].reaches(ip("0.0.0.0")));
 }
 
 // ------------------------------------------------------------- Phase 1: sessions
@@ -1004,6 +1102,11 @@ fn pppoe_router(state: Pppoe) -> Pipeline {
     ports[1].gateway = Some(ip("203.0.113.1"));
     ports[1].role = Role::Outside;
     ports[1].pppoe = state;
+    if let Pppoe::Up { mtu, .. } = state {
+        // As the config builds it: the far end is on-link, the MTU 1492.
+        ports[1].onlink = vec!["203.0.113.1/32".parse().unwrap()];
+        ports[1].mtu = mtu;
+    }
     // The default route through the ISP exists once the session is up.
     let statics: Vec<StaticRoute> = match state {
         Pppoe::Up { .. } => vec![StaticRoute {
@@ -1094,6 +1197,46 @@ fn pppoe_wraps_outgoing_and_unwraps_incoming() {
     );
     // Counted per interface.
     assert_eq!(r.stats.ports[1].rx_packets, 1);
+}
+
+/// An interface MTU below 1500 (e.g. a tunnel or a provider's limit):
+/// bigger packets with DF get "fragmentation needed" with that MTU.
+#[test]
+fn interface_mtu_is_enforced() {
+    let mut r = router();
+    let mut ports = r.ports().to_vec();
+    ports[1].mtu = 1400;
+    r.set_ports(ports.into());
+    learn(&mut r, 0, HOST_A, "10.10.1.10");
+    let big = |len: u16| {
+        let (mut f, _) = ping(R0, HOST_A, "10.10.1.10", "10.10.2.10", 64);
+        let n = 14 + len as usize;
+        f.resize(n + 256, 0);
+        f[14 + 2..14 + 4].copy_from_slice(&len.to_be_bytes());
+        f[14 + 6] |= 0x40; // DF
+        f[14 + 10..14 + 12].fill(0);
+        let c = checksum::checksum(&f[14..34]);
+        f[14 + 10..14 + 12].copy_from_slice(&c.to_be_bytes());
+        (f, n)
+    };
+    let (mut f, n) = big(1450);
+    let v = r.process(0, &mut f, 0, n);
+    let Verdict::Tx { port, off, len } = v else {
+        panic!("expected an ICMP error, got {v:?}")
+    };
+    assert_eq!(port, 0, "back to the sender");
+    let e = &f[off + 14..off + len];
+    assert_eq!(
+        (e[20], e[21]),
+        (icmp::DEST_UNREACHABLE, icmp::CODE_FRAG_NEEDED)
+    );
+    assert_eq!(u16::from_be_bytes([e[26], e[27]]), 1400);
+    // Exactly the MTU fits (no error; it waits for ARP or goes out).
+    let (mut f, n) = big(1400);
+    assert!(!matches!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Tx { port: 0, .. }
+    ));
 }
 
 #[test]

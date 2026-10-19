@@ -40,6 +40,8 @@ fn port(id: u16, addr: &str, subnet: &str, mss_adjust: Option<u16>) -> Port {
         dhcp: crate::config::Dhcp::Off,
         gateway: None,
         pppoe: crate::config::Pppoe::Off,
+        onlink: vec![],
+        mtu: 1500,
     }
 }
 

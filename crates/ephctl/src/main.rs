@@ -381,6 +381,10 @@ fn run(cli: Cli) -> Result<()> {
                         ),
                         _ => String::new(),
                     };
+                    let detail = match x["apply_error"].as_str() {
+                        Some(e) => format!("NOT APPLIED: {e}; {detail}"),
+                        None => detail,
+                    };
                     vec![
                         str(&x["interface"]),
                         str(&x["mode"]),

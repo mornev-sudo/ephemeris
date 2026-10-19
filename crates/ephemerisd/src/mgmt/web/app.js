@@ -172,12 +172,13 @@ async function refreshDash() {
   $("dashwarn").classList.toggle("hidden", !warn.length);
   const wan = await api("GET", "/wan");
   table($("wantab"), ["Interface", "Mode", "State", "Address", "Gateway", "DNS", ""], wan.map(w => {
-    const ok = w.state === "up" || w.state === "bound";
+    const ok = (w.state === "up" || w.state === "bound") && !w.apply_error;
     let detail = "";
     if (w.mode === "pppoe") detail = w.pppoe.session != null
       ? `${w.pppoe.concentrator || "ISP"} · session ${w.pppoe.session} · MTU ${w.pppoe.mtu} · up ${dur(w.pppoe.up_for_secs)}`
       : (w.pppoe.last_error ? "last error: " + w.pppoe.last_error : "dialling as " + w.pppoe.username);
     if (w.mode === "dhcp" && w.dhcp.server) detail = `from ${w.dhcp.server} · lease ends in ${dur(w.dhcp.expires_in_secs)}`;
+    if (w.apply_error) detail = "not applied: " + w.apply_error + (detail ? " · " + detail : "");
     return [w.interface, { pppoe: "PPPoE", dhcp: "DHCP", static: "static" }[w.mode], td(w.state || "—", ok ? "ok" : "warn"),
       td(w.address || "—", "mono"), td(w.gateway || "—", "mono"), td((w.dns || []).join(", ") || "—", "mono"), td(detail, "s")];
   }));
@@ -457,7 +458,7 @@ function renderNics() {
     if (d.kernel) c.append(el("span", "management: used by the system", "s"));
     else {
       const b = el("button", "Use", "btn"); b.type = "button"; b.dataset.nic = d.name;
-      b.onclick = () => { cfg.interface.push({ name: "", device: d.name, address: "", role: "inside", allow_new_sessions: null, mss_adjust: null }); dirty(); renderCfg(); };
+      b.onclick = () => { cfg.interface.push(newInterface(d.name)); dirty(); renderCfg(); };
       c.append(b);
     }
     tr.append(c); t.append(tr);
@@ -465,49 +466,87 @@ function renderNics() {
   box.append(t);
 }
 
-/// Internet connection: per outside interface, static / DHCP / PPPoE.
-function renderWanCfg() {
-  const box = $("f-wan");
+const newInterface = device => ({ name: "", device, address: "", role: "inside", allow_new_sessions: null,
+  mss_adjust: null, mtu: null, gateway: null, dhcp: null });
+
+/// Interfaces: one card each with everything about it: name, card, role,
+/// addressing (static / DHCP client / PPPoE), MTU and the rest.
+function renderIfaces() {
+  const box = $("f-ifaces");
   box.replaceChildren();
-  const outside = cfg.interface.filter(i => i.role === "outside");
-  if (!outside.length) box.append(el("p", "No outside interface yet: set an interface's role to outside (Interfaces).", "s"));
-  outside.forEach(i => {
+  if (!cfg.interface.length) box.append(el("p", "No interfaces yet.", "s"));
+  cfg.interface.forEach((i, idx) => {
     const mode = ["dhcp", "pppoe"].includes((i.address || "").toLowerCase()) ? i.address.toLowerCase() : "static";
-    const c = el("div", undefined, "card"); c.style.marginBottom = "12px";
-    c.append(el("h3", `${i.name} (${i.device})`));
-    const f = el("div");
+    // The MTU lives on the interface; older configs kept PPPoE's in [pppoe].
+    if (i.pppoe && i.pppoe.mtu != null && i.mtu == null) { i.mtu = i.pppoe.mtu; i.pppoe.mtu = null; }
+    const c = el("div", undefined, "card iface"); c.style.marginBottom = "12px";
+    const head = el("div", undefined, "row");
+    head.append(el("h3", `${i.name || "new interface"}${i.device ? " (" + i.device + ")" : ""}`));
+    const del = el("button", "Remove", "btn"); del.type = "button";
+    del.onclick = () => { cfg.interface.splice(idx, 1); dirty(); renderCfg(); };
+    head.append(del);
+    c.append(head);
+
+    const general = el("div");
+    formFields(general, i, [
+      { key: "name", label: "Name", placeholder: "lan" },
+      { key: "device", label: "Network card", type: "select",
+        options: () => devices.filter(d => !d.kernel).map(d => [d.name, d.driver ? `${d.name} (${d.driver})` : d.name]) },
+      { key: "role", label: "Role", type: "select", options: [["inside", "inside: your network"], ["outside", "outside: the internet"]], empty: "inside" },
+    ]);
+    // Addressing: not a field of its own in the file (address says it).
     const m = { mode };
-    formFields(f, m, [{ key: "mode", label: "Connection", type: "select",
-      options: [["static", "Static address"], ["dhcp", "DHCP (from the ISP)"], ["pppoe", "PPPoE (dial with a username)"]] }]);
-    f.querySelector("select").onchange = e => {
+    const ml = el("div");
+    formFields(ml, m, [{ key: "mode", label: "Address", type: "select",
+      options: [["static", "Static address"], ["dhcp", "DHCP client (from a server on the link)"], ["pppoe", "PPPoE (dial with a username)"]] }]);
+    const sel = ml.querySelector("select");
+    sel.dataset.field = "addressing";
+    sel.onchange = e => {
       const v = e.target.value;
       i.address = v === "static" ? "" : v;
       i.pppoe = v === "pppoe" ? (i.pppoe || { username: "", password: "", service: "", mtu: null }) : null;
       if (v !== "static") i.gateway = null;
+      if (v === "pppoe") i.role = "outside"; // PPPoE only dials out
       dirty(); renderCfg();
     };
-    c.append(f);
-    const g = el("div");
+    general.firstChild.append(...ml.firstChild.children);
+    c.append(general);
+
+    const addr = el("div");
     if (mode === "static") {
-      formFields(g, i, [
-        { key: "address", label: "Address / prefix", placeholder: "203.0.113.2/29" },
-        { key: "gateway", label: "Gateway (the ISP's router)", optional: true, placeholder: "203.0.113.1",
-          help: "Add a default route via it under Static routes to reach the internet." },
+      formFields(addr, i, [
+        { key: "address", label: "Address / prefix", placeholder: i.role === "outside" ? "203.0.113.2/29" : "10.0.0.1/24" },
+        { key: "gateway", label: "Gateway", optional: true, placeholder: i.role === "outside" ? "203.0.113.1" : "none",
+          help: "The next router towards everything else (an ISP's). Add a default route via it under Static routes." },
       ]);
     } else if (mode === "pppoe") {
-      i.pppoe = i.pppoe || { username: "", password: "", service: "", mtu: null };
-      formFields(g, i.pppoe, [
-        { key: "username", label: "Username", placeholder: "you@isp" },
-        { key: "password", label: "Password", type: "key", generate: false },
+      formFields(addr, i.pppoe, [
+        { key: "username", label: "PPPoE username", placeholder: "you@isp" },
+        { key: "password", label: "PPPoE password", type: "key", generate: false },
         { key: "service", label: "Service name", placeholder: "any (most ISPs)" },
-        { key: "mtu", label: "MTU", type: "number", min: 576, optional: true, placeholder: "1492" },
       ]);
     } else {
-      g.append(el("p", "The address, gateway, default route and DNS servers come from the ISP's DHCP server.", "s"));
+      addr.append(el("p", "The address, subnet, gateway, default route, any routes the server sends, and DNS servers come from the DHCP server on this link.", "s"));
     }
-    c.append(g);
+    c.append(addr);
+
+    const link = el("div");
+    const maxMtu = mode === "pppoe" ? 1492 : 1500;
+    formFields(link, i, [
+      { key: "mtu", label: "MTU", type: "number", min: 576, max: maxMtu, optional: true, placeholder: String(maxMtu),
+        help: `Largest IP packet on this link (576-${maxMtu}).` },
+      { key: "mss_adjust", label: "TCP MSS adjust", type: "number", min: 536, optional: true,
+        placeholder: i.mtu && i.mtu < 1500 ? `auto (${i.mtu - 40})` : (mode === "pppoe" ? "auto (1452)" : "off") },
+      { key: "allow_new_sessions", label: "New sessions from here", type: "select", bool: true,
+        options: [["", "default for the role"], ["true", "allowed"], ["false", "replies only"]] },
+    ]);
+    c.append(link);
     box.append(c);
   });
+  const add = el("button", "Add interface", "btn"); add.type = "button";
+  add.onclick = () => { cfg.interface.push(newInterface(unusedNics()[0]?.name || "")); dirty(); renderCfg(); };
+  const foot = el("div", undefined, "row"); foot.append(add);
+  box.append(foot);
 }
 
 /// SD-WAN: this router's place in the network, and the other sites.
@@ -616,19 +655,9 @@ function suggestRange(addr) {
 function renderCfg() {
   if (!cfg) return;
   const ifaceNames = () => [["", "any"], ...cfg.interface.map(i => [i.name, i.name])];
-  formTable($("f-ifaces"), cfg.interface, [
-    { key: "name", label: "Name", placeholder: "lan" },
-    { key: "device", label: "Device", type: "select", options: () => devices.filter(d => !d.kernel).map(d => [d.name, d.driver ? `${d.name} (${d.driver})` : d.name]) },
-    { key: "address", label: "Address / prefix", placeholder: "10.0.0.1/24 or dhcp" },
-    { key: "role", label: "Role", type: "select", options: [["inside", "inside"], ["outside", "outside"]], empty: "inside" },
-    { key: "allow_new_sessions", label: "New sessions", type: "select", bool: true,
-      options: [["", "default for role"], ["true", "allowed"], ["false", "replies only"]] },
-    { key: "mss_adjust", label: "MSS adjust", type: "number", min: 536, optional: true, placeholder: "off" },
-    { key: "gateway", label: "Gateway", optional: true, placeholder: "ISP router (static WAN)" },
-  ], () => ({ name: "", device: unusedNics()[0]?.name || "", address: "", role: "inside", allow_new_sessions: null, mss_adjust: null, gateway: null, dhcp: null }), "Add interface");
+  renderIfaces();
   renderNics();
   renderDhcpCfg();
-  renderWanCfg();
   renderSdwanCfg();
 
   formTable($("f-routes"), cfg.route, [

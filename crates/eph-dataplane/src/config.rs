@@ -31,6 +31,13 @@ pub struct Port {
     pub gateway: Option<Ipv4Addr>,
     /// PPPoE on this link (the ISP side of a DSL/fibre line).
     pub pppoe: Pppoe,
+    /// Addresses outside `subnet` that are still neighbours on this link:
+    /// a gateway outside a /32 DHCP lease, routes the DHCP server said are
+    /// on-link, a PPPoE link's far end. Connected routes, like `subnet`.
+    pub onlink: Vec<Prefix>,
+    /// Largest IP packet this link carries (1500 on Ethernet, 1492 over
+    /// PPPoE). Bigger ones get "fragmentation needed" (or are dropped).
+    pub mtu: u16,
 }
 
 /// A port's PPPoE state.
@@ -57,11 +64,28 @@ impl Port {
         }
     }
 
-    /// Can `ip` be reached directly on this link? On a PPPoE link the far
-    /// end (`gateway`) is the only neighbour, outside the router's /32.
+    /// Largest IP packet out of this port right now.
+    pub fn ip_mtu(&self) -> u16 {
+        self.pppoe_up()
+            .map_or(self.mtu, |(_, _, m)| m.min(self.mtu))
+    }
+
+    /// Can `ip` be reached directly on this link: in its subnet, or one of
+    /// its on-link prefixes? Never while the port has no address.
     pub fn reaches(&self, ip: Ipv4Addr) -> bool {
-        !self.addr.is_unspecified()
-            && (self.subnet.contains(ip) || (self.pppoe_up().is_some() && self.gateway == Some(ip)))
+        self.connected_len(ip).is_some()
+    }
+
+    /// The length of the longest connected prefix on this port holding `ip`.
+    pub fn connected_len(&self, ip: Ipv4Addr) -> Option<u8> {
+        if self.addr.is_unspecified() {
+            return None;
+        }
+        std::iter::once(&self.subnet)
+            .chain(&self.onlink)
+            .filter(|p| p.contains(ip))
+            .map(|p| p.len())
+            .max()
     }
 }
 
@@ -140,17 +164,14 @@ pub fn build_fib(
 ) -> Result<Fib<NextHop>, String> {
     let mut routes = Vec::new();
     for p in ports {
-        routes.push((
-            p.subnet,
-            NextHop::Ip {
-                port: p.id,
-                gateway: None,
-            },
-        ));
-        // A PPPoE link's far end is connected too, though not in our /32.
-        if let (Some(_), Some(peer)) = (p.pppoe_up(), p.gateway) {
+        // A port still waiting for its address (DHCP, PPPoE) has no
+        // connected network yet: nothing to route to it.
+        if p.addr.is_unspecified() {
+            continue;
+        }
+        for &prefix in std::iter::once(&p.subnet).chain(&p.onlink) {
             routes.push((
-                Prefix::new(peer, 32).expect("a /32"),
+                prefix,
                 NextHop::Ip {
                     port: p.id,
                     gateway: None,
@@ -164,10 +185,9 @@ pub fn build_fib(
     for r in statics {
         let port = ports
             .iter()
-            .filter(|p| {
-                p.subnet.contains(r.via) || (p.pppoe_up().is_some() && p.gateway == Some(r.via))
-            })
-            .max_by_key(|p| p.subnet.len())
+            .filter_map(|p| Some((p, p.connected_len(r.via)?)))
+            .max_by_key(|(_, len)| *len)
+            .map(|(p, _)| p)
             .ok_or_else(|| {
                 format!(
                     "route {} via {}: gateway is not on any connected subnet",

@@ -134,6 +134,8 @@ fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
         dhcp: crate::config::Dhcp::Off,
         gateway: None,
         pppoe: crate::config::Pppoe::Off,
+        onlink: vec![],
+        mtu: 1500,
     }
 }
 

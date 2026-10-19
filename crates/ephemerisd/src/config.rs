@@ -219,6 +219,10 @@ pub struct InterfaceCfg {
     /// announce to at most this value (e.g. 1452 for PPPoE). Unset: no change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mss_adjust: Option<u16>,
+    /// Largest IP packet on this link, 576-1500 (default 1500; PPPoE: at
+    /// most and by default 1492). Bigger packets get "fragmentation needed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
     /// The next router on this link towards everything else (an ISP's
     /// gateway), for a statically addressed outside interface. SD-WAN
     /// tethers leaving here use it. With `address = "dhcp"` it comes from
@@ -241,7 +245,16 @@ pub struct InterfaceCfg {
     /// renewals keep reaching the client.
     #[serde(skip)]
     pub addr_now: Option<(Ipv4Addr, u8)>,
+    /// Neighbours outside the subnet (`with_links`; never in the file): a
+    /// DHCP gateway outside a /32 lease, on-link routes from the DHCP
+    /// server, a PPPoE link's far end.
+    #[serde(skip)]
+    pub onlink: Vec<Prefix>,
 }
+
+/// The largest IP packet on plain Ethernet, and the most an interface may
+/// carry (bigger "jumbo" frames would need larger packet buffers).
+pub const ETHERNET_MTU: u16 = 1500;
 
 /// PPPoE login for an outside interface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,15 +265,10 @@ pub struct PppoeCfg {
     /// Service-Name to ask for (some ISPs need one); empty: any.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service: String,
-    /// Largest IP packet on the link (default 1492: Ethernet minus PPPoE).
+    /// Older place for the link's MTU; the interface's `mtu` is preferred
+    /// (and wins when both are set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
-}
-
-impl PppoeCfg {
-    pub fn mtu(&self) -> u16 {
-        self.mtu.unwrap_or(eph_packet::pppoe::DEFAULT_MTU)
-    }
 }
 
 /// DHCP server settings for one interface.
@@ -393,6 +401,17 @@ impl InterfaceCfg {
     /// Does this interface dial its ISP over PPPoE?
     pub fn is_pppoe(&self) -> bool {
         self.address.eq_ignore_ascii_case("pppoe")
+    }
+    /// The largest IP packet on this link: `mtu`, else (PPPoE) the older
+    /// `pppoe.mtu`, else 1500 (PPPoE: 1492).
+    pub fn ip_mtu(&self) -> u16 {
+        if self.is_pppoe() {
+            self.mtu
+                .or(self.pppoe.as_ref().and_then(|p| p.mtu))
+                .unwrap_or(eph_packet::pppoe::DEFAULT_MTU)
+        } else {
+            self.mtu.unwrap_or(ETHERNET_MTU)
+        }
     }
     /// Is the address handed out by someone else (DHCP or PPPoE)?
     pub fn has_dynamic_address(&self) -> bool {
@@ -726,6 +745,12 @@ impl Config {
                     bail!("two interfaces are named {}", a.name);
                 }
             }
+            if !(576..=ETHERNET_MTU).contains(&a.ip_mtu()) {
+                bail!(
+                    "interface {}: mtu must be between 576 and {ETHERNET_MTU}",
+                    a.name
+                );
+            }
             if a.is_pppoe() {
                 let Some(p) = &a.pppoe else {
                     bail!("interface {}: address = \"pppoe\" needs an [interface.pppoe] section (username, password)", a.name);
@@ -733,9 +758,9 @@ impl Config {
                 if p.username.is_empty() {
                     bail!("interface {}: PPPoE needs a username", a.name);
                 }
-                if !(576..=eph_packet::pppoe::DEFAULT_MTU).contains(&p.mtu()) {
+                if !(576..=eph_packet::pppoe::DEFAULT_MTU).contains(&a.ip_mtu()) {
                     bail!(
-                        "interface {}: PPPoE mtu must be between 576 and 1492",
+                        "interface {}: mtu over PPPoE must be between 576 and 1492",
                         a.name
                     );
                 }
@@ -829,6 +854,40 @@ impl Config {
                 continue;
             };
             i.addr_now = Some((l.addr, l.prefix_len));
+            // Gateways outside the subnet (a /32 lease, say) are still on
+            // this link: reachable directly, like a PPPoE link's far end.
+            let subnet = Prefix::new(l.addr, l.prefix_len);
+            let mut onlink = |ip: Ipv4Addr, len: u8| {
+                if let Some(p) = Prefix::new(ip, len) {
+                    if !subnet.is_some_and(|s| s.contains(ip) && s.len() <= len)
+                        && !i.onlink.contains(&p)
+                    {
+                        i.onlink.push(p);
+                    }
+                }
+            };
+            if let Some(r) = l.router {
+                onlink(r, 32);
+            }
+            // Routes from the server (option 121): on-link ones are
+            // connected, the rest go via their router. A static route for
+            // the same prefix wins.
+            for r in &l.routes {
+                if r.via.is_unspecified() {
+                    onlink(r.dest, r.len);
+                    continue;
+                }
+                onlink(r.via, 32);
+                let prefix = format!("{}/{}", r.dest, r.len);
+                let mine =
+                    |x: &RouteCfg| x.prefix.parse::<Prefix>().ok() == prefix.parse::<Prefix>().ok();
+                if !self.routes.iter().any(mine) && !c.routes.iter().any(mine) {
+                    c.routes.push(RouteCfg {
+                        prefix,
+                        via: r.via.to_string(),
+                    });
+                }
+            }
             if let Some(r) = l.router {
                 i.gateway = Some(r.to_string());
                 if !default_set {
@@ -864,6 +923,9 @@ impl Config {
             i.addr_now = Some((l.addr, 32));
             i.gateway = Some(l.peer.to_string());
             i.pppoe_session = Some((l.session, l.ac_mac, l.mtu));
+            if !l.peer.is_unspecified() {
+                i.onlink.push(Prefix::new(l.peer, 32).expect("a /32"));
+            }
             if !default_set && !l.peer.is_unspecified() {
                 c.routes.push(RouteCfg {
                     prefix: "0.0.0.0/0".into(),
@@ -941,15 +1003,10 @@ impl Config {
                     subnet,
                     allow_new_sessions: i.allows_new_sessions(),
                     role: i.role(),
-                    // Over PPPoE, TCP segments must fit its smaller MTU.
-                    mss_adjust: i.mss_adjust.or_else(|| {
-                        i.is_pppoe().then(|| {
-                            i.pppoe
-                                .as_ref()
-                                .map_or(eph_packet::pppoe::DEFAULT_MTU, |p| p.mtu())
-                                - 40
-                        })
-                    }),
+                    // TCP segments must fit a smaller MTU (PPPoE, or set).
+                    mss_adjust: i
+                        .mss_adjust
+                        .or_else(|| (i.ip_mtu() < ETHERNET_MTU).then(|| i.ip_mtu() - 40)),
                     dhcp: if i.is_dhcp_client() {
                         eph_dataplane::Dhcp::Client
                     } else if i.dhcp.is_some() {
@@ -958,6 +1015,8 @@ impl Config {
                         eph_dataplane::Dhcp::Off
                     },
                     gateway: i.gateway.as_deref().and_then(|g| g.parse().ok()),
+                    onlink: i.onlink.clone(),
+                    mtu: i.ip_mtu(),
                     pppoe: match (i.is_pppoe(), i.pppoe_session) {
                         (false, _) => eph_dataplane::Pppoe::Off,
                         (true, None) => eph_dataplane::Pppoe::Dialing,
@@ -1580,6 +1639,7 @@ role = "outside"
                 addr: "203.0.113.50".parse().unwrap(),
                 prefix_len: 24,
                 router: None,
+                routes: vec![],
                 dns: vec![],
                 server: "203.0.113.1".parse().unwrap(),
                 server_mac: [0; 6],
@@ -1728,6 +1788,118 @@ password = "s3cret"
         assert!(parse(&both).unwrap_err().to_string().contains("both"));
     }
 
+    fn isp_lease(
+        addr: &str,
+        len: u8,
+        router: Option<&str>,
+        routes: Vec<crate::dhcp::client::LeaseRoute>,
+    ) -> std::collections::HashMap<String, crate::dhcp::client::ClientLease> {
+        let mut leases = std::collections::HashMap::new();
+        leases.insert(
+            "wan".to_string(),
+            crate::dhcp::client::ClientLease {
+                addr: addr.parse().unwrap(),
+                prefix_len: len,
+                router: router.map(|r| r.parse().unwrap()),
+                routes,
+                dns: vec![],
+                server: "100.64.0.1".parse().unwrap(),
+                server_mac: [0; 6],
+                obtained_unix: 0,
+                lease_secs: 3600,
+                t1_secs: 1800,
+                t2_secs: 3150,
+            },
+        );
+        leases
+    }
+
+    /// The 0.9.0 bug: a /32 lease (gateway outside it) couldn't be applied,
+    /// so the WAN kept no address and a 0.0.0.0/32 "connected" route.
+    #[test]
+    fn a_slash_32_lease_with_its_gateway_outside_works() {
+        let c = parse(DHCP_CFG).unwrap();
+        // Before the lease: the WAN contributes no route at all.
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        let fib = c.fib(&ports).unwrap();
+        assert!(
+            !fib.routes()
+                .iter()
+                .any(|(p, _)| p.addr().is_unspecified() && p.len() == 32),
+            "no 0.0.0.0/32 placeholder route"
+        );
+        // With it: address, on-link gateway, default route through it.
+        let e = c.with_leases(&isp_lease("100.64.12.34", 32, Some("100.64.0.1"), vec![]));
+        let ports = e.ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!(ports[1].onlink, vec!["100.64.0.1/32".parse().unwrap()]);
+        let fib = e.fib(&ports).expect("the lease applies");
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(
+            fib.lookup(ip("8.8.8.8")),
+            Some(&NextHop::Ip {
+                port: 1,
+                gateway: Some(ip("100.64.0.1"))
+            })
+        );
+        // A gateway inside an ordinary subnet needs no extra entry.
+        let e = c.with_leases(&isp_lease("203.0.113.50", 24, Some("203.0.113.1"), vec![]));
+        assert!(e.ports(|_| Ok([0; 6])).unwrap()[1].onlink.is_empty());
+    }
+
+    #[test]
+    fn classless_routes_from_the_lease() {
+        use crate::dhcp::client::LeaseRoute;
+        let c = parse(DHCP_CFG).unwrap();
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let routes = vec![
+            LeaseRoute {
+                dest: ip("172.16.0.0"),
+                len: 12,
+                via: ip("100.64.0.2"),
+            },
+            LeaseRoute {
+                dest: ip("192.0.2.0"),
+                len: 24,
+                via: ip("0.0.0.0"),
+            },
+        ];
+        let e = c.with_leases(&isp_lease("100.64.12.34", 32, Some("100.64.0.1"), routes));
+        let ports = e.ports(|_| Ok([0; 6])).unwrap();
+        let fib = e.fib(&ports).unwrap();
+        assert_eq!(
+            fib.lookup(ip("172.16.5.5")),
+            Some(&NextHop::Ip {
+                port: 1,
+                gateway: Some(ip("100.64.0.2"))
+            })
+        );
+        assert_eq!(
+            fib.lookup(ip("192.0.2.9")),
+            Some(&NextHop::Ip {
+                port: 1,
+                gateway: None
+            }),
+            "on-link: straight to the host"
+        );
+    }
+
+    #[test]
+    fn interface_mtu() {
+        let with = |extra: &str| {
+            parse(&DHCP_CFG.replacen(
+                "address = \"10.10.1.1/24\"",
+                &format!("address = \"10.10.1.1/24\"\n{extra}"),
+                1,
+            ))
+        };
+        let c = with("mtu = 1400").unwrap();
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        assert_eq!((ports[0].mtu, ports[0].mss_adjust), (1400, Some(1360)));
+        assert_eq!(ports[1].mtu, 1500);
+        assert!(with("mtu = 9000").unwrap_err().to_string().contains("mtu"));
+        assert!(with("mtu = 500").unwrap_err().to_string().contains("mtu"));
+    }
+
     #[test]
     fn a_lease_becomes_the_address_and_default_route() {
         use crate::dhcp::client::ClientLease;
@@ -1739,6 +1911,7 @@ password = "s3cret"
                 addr: "203.0.113.50".parse().unwrap(),
                 prefix_len: 24,
                 router: Some("203.0.113.1".parse().unwrap()),
+                routes: vec![],
                 dns: vec![],
                 server: "203.0.113.1".parse().unwrap(),
                 server_mac: [0; 6],

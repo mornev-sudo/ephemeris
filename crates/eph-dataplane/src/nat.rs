@@ -343,6 +343,8 @@ mod tests {
             dhcp: crate::config::Dhcp::Off,
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
+            onlink: vec![],
+            mtu: 1500,
         }
     }
 

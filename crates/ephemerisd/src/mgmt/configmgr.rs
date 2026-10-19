@@ -799,11 +799,13 @@ address = "10.10.2.1/24"
                 role: Default::default(),
                 allow_new_sessions: None,
                 mss_adjust: None,
+                mtu: None,
                 gateway: None,
                 dhcp: None,
                 pppoe: None,
                 pppoe_session: None,
                 addr_now: None,
+                onlink: vec![],
             });
             m.text_from_model(&cfg).unwrap()
         };

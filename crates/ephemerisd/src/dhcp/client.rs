@@ -17,12 +17,27 @@ const BACKOFF_MAX_SECS: u64 = 64;
 /// tiny lease would otherwise make us renew constantly).
 const MIN_LEASE_SECS: u32 = 60;
 
+/// A route the server handed out (RFC 3442 classless static routes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRoute {
+    pub dest: Ipv4Addr,
+    pub len: u8,
+    /// 0.0.0.0: the destination is on this link (no router).
+    pub via: Ipv4Addr,
+}
+
 /// What the server gave us.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientLease {
     pub addr: Ipv4Addr,
+    /// The subnet as the server gave it: /32 is common at ISPs and cloud
+    /// providers, with the gateway outside it but reachable on the link.
     pub prefix_len: u8,
+    /// The default gateway.
     pub router: Option<Ipv4Addr>,
+    /// Other routes from the server (option 121), never the default route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<LeaseRoute>,
     pub dns: Vec<Ipv4Addr>,
     pub server: Ipv4Addr,
     #[serde(with = "super::server::mac_text")]
@@ -42,6 +57,7 @@ impl ClientLease {
         self.addr == o.addr
             && self.prefix_len == o.prefix_len
             && self.router == o.router
+            && self.routes == o.routes
             && self.dns == o.dns
     }
 }
@@ -260,12 +276,14 @@ impl Client {
                 dhcp::OPT_PARAM_LIST,
                 vec![
                     dhcp::OPT_SUBNET_MASK,
+                    dhcp::OPT_CLASSLESS_ROUTES,
                     dhcp::OPT_ROUTER,
                     dhcp::OPT_DNS,
                     dhcp::OPT_DOMAIN,
                     dhcp::OPT_LEASE_TIME,
                     dhcp::OPT_RENEWAL_TIME,
                     dhcp::OPT_REBINDING_TIME,
+                    dhcp::OPT_MS_CLASSLESS_ROUTES,
                 ],
             );
             if let Some(h) = &self.hostname {
@@ -331,7 +349,47 @@ fn lease_from(m: &Message, server_mac: Mac, now: u64) -> Option<ClientLease> {
     if addr.is_unspecified() || addr.is_broadcast() || addr.is_loopback() || addr.is_multicast() {
         return None;
     }
-    let prefix_len = m.prefix_len().unwrap_or(24).clamp(8, 30);
+    // The mask as given, /31 and /32 included (RFC 3021; ISPs and clouds
+    // hand out /32s with the gateway outside, reached on the link). No or a
+    // nonsensical mask: assume nothing about neighbours, /32.
+    let prefix_len = m
+        .prefix_len()
+        .filter(|l| (8..=32).contains(l))
+        .unwrap_or(32);
+    let usable = |ip: Ipv4Addr| {
+        !(ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_loopback()
+            || ip.is_multicast()
+            || ip == addr)
+    };
+    // RFC 3442: with classless routes, the Router option MUST be ignored;
+    // their 0.0.0.0/0 entry, if any, is the default gateway.
+    let classless = m
+        .classless_routes(dhcp::OPT_CLASSLESS_ROUTES)
+        .or_else(|| m.classless_routes(dhcp::OPT_MS_CLASSLESS_ROUTES));
+    let (router, routes) = match classless {
+        Some(all) => {
+            let router = all
+                .iter()
+                .find(|(_, len, via)| *len == 0 && usable(*via))
+                .map(|r| r.2);
+            let routes = all
+                .into_iter()
+                .filter(|(dest, len, via)| {
+                    *len > 0 && !dest.is_multicast() && (via.is_unspecified() || usable(*via))
+                })
+                .map(|(dest, len, via)| LeaseRoute { dest, len, via })
+                .collect();
+            (router, routes)
+        }
+        // The first usable address of the Router option (some servers send
+        // 0.0.0.0 to mean "none").
+        None => (
+            m.ips(dhcp::OPT_ROUTER).into_iter().find(|r| usable(*r)),
+            vec![],
+        ),
+    };
     let lease_secs = m
         .u32(dhcp::OPT_LEASE_TIME)
         .unwrap_or(3600)
@@ -349,7 +407,8 @@ fn lease_from(m: &Message, server_mac: Mac, now: u64) -> Option<ClientLease> {
     Some(ClientLease {
         addr,
         prefix_len,
-        router: m.ips(dhcp::OPT_ROUTER).into_iter().next(),
+        router,
+        routes,
         dns: m.ips(dhcp::OPT_DNS),
         server: m.ip(dhcp::OPT_SERVER_ID).unwrap_or(Ipv4Addr::UNSPECIFIED),
         server_mac,
@@ -422,6 +481,76 @@ mod tests {
         assert_eq!((l.t1_secs, l.t2_secs), (1800, 3150));
         assert_eq!(c.phase, Phase::Bound);
         assert_eq!(s.leases[0].hostname.as_deref(), Some("eph"));
+    }
+
+    /// An ACK with these options, for `lease_from`.
+    fn ack(opts: &[(u8, Vec<u8>)]) -> Message {
+        let mut m = Message::new(dhcp::OP_REPLY, 1, ME);
+        m.yiaddr = ip("100.64.12.34");
+        m.set(dhcp::OPT_MSG_TYPE, vec![dhcp::ACK]);
+        for (c, v) in opts {
+            m.set(*c, v.clone());
+        }
+        m
+    }
+
+    #[test]
+    fn a_slash_32_lease_keeps_its_mask_and_off_subnet_gateway() {
+        let m = ack(&[
+            (dhcp::OPT_SUBNET_MASK, vec![255, 255, 255, 255]),
+            (dhcp::OPT_ROUTER, vec![100, 64, 0, 1]),
+        ]);
+        let l = lease_from(&m, ROUTER, 0).unwrap();
+        assert_eq!(l.prefix_len, 32, "not widened to /30");
+        assert_eq!(l.router, Some(ip("100.64.0.1")));
+        // No mask at all: /32 too, rather than guessing a /24.
+        let l = lease_from(&ack(&[(dhcp::OPT_ROUTER, vec![100, 64, 0, 1])]), ROUTER, 0).unwrap();
+        assert_eq!(l.prefix_len, 32);
+    }
+
+    #[test]
+    fn unusable_routers_are_skipped() {
+        let m = ack(&[(dhcp::OPT_ROUTER, vec![0, 0, 0, 0, 100, 64, 0, 1])]);
+        assert_eq!(
+            lease_from(&m, ROUTER, 0).unwrap().router,
+            Some(ip("100.64.0.1"))
+        );
+        let m = ack(&[(dhcp::OPT_ROUTER, vec![0, 0, 0, 0])]);
+        assert_eq!(lease_from(&m, ROUTER, 0).unwrap().router, None);
+    }
+
+    #[test]
+    fn classless_routes_replace_the_router_option() {
+        let m = ack(&[
+            (dhcp::OPT_ROUTER, vec![100, 64, 0, 99]),
+            (
+                dhcp::OPT_CLASSLESS_ROUTES,
+                vec![
+                    0, 100, 64, 0, 1, 8, 10, 100, 64, 0, 2, 32, 192, 0, 2, 1, 0, 0, 0, 0,
+                ],
+            ),
+        ]);
+        let l = lease_from(&m, ROUTER, 0).unwrap();
+        assert_eq!(
+            l.router,
+            Some(ip("100.64.0.1")),
+            "the Router option is ignored"
+        );
+        assert_eq!(
+            l.routes,
+            vec![
+                LeaseRoute {
+                    dest: ip("10.0.0.0"),
+                    len: 8,
+                    via: ip("100.64.0.2")
+                },
+                LeaseRoute {
+                    dest: ip("192.0.2.1"),
+                    len: 32,
+                    via: ip("0.0.0.0")
+                },
+            ]
+        );
     }
 
     #[test]

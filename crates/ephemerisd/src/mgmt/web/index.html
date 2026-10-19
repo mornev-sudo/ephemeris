@@ -72,6 +72,9 @@
   .subnav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 8px 10px; cursor: pointer; font: inherit; }
   .subnav button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
   .cfgsec td input, .cfgsec td select { width: 100%; min-width: 7em; }
+  .card.iface > .row:first-child { justify-content: space-between; margin-bottom: 10px; }
+  .card.iface > .row:first-child h3 { font-size: 14px; font-weight: 600; color: inherit; margin: 0; }
+  .card.iface > div + div { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
   .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 20px; }
   .field { display: flex; flex-direction: column; gap: 4px; }
   .field:has(input[type=checkbox]) { flex-direction: row-reverse; justify-content: flex-end; align-items: center; gap: 8px; }
@@ -194,7 +197,6 @@
 
     <nav class="subnav" id="cfgnav">
       <button data-sec="ifaces" class="on">Interfaces</button>
-      <button data-sec="wan">Internet connection</button>
       <button data-sec="dhcp">DHCP server</button>
       <button data-sec="routing">Static routes</button>
       <button data-sec="sdwan">SD-WAN</button>
@@ -207,17 +209,15 @@
     </nav>
 
     <section class="cfgsec" id="sec-ifaces">
-      <p class="s"><b>Inside</b> interfaces face your networks. <b>Outside</b> interfaces face the internet: by default they
-        only let replies in, and traffic leaving through them is source-NATed (see NAT).</p>
-      <div class="tablewrap" id="f-ifaces"></div>
+      <p class="s">Everything about each interface in one place: its network card, which side it faces, how it gets its
+        address (fixed, from a DHCP server, or by dialling PPPoE), and its MTU.
+        <b>Inside</b> interfaces face your networks. <b>Outside</b> interfaces face the internet: by default they
+        only let replies in, and traffic leaving through them is source-NATed (see NAT). DHCP and PPPoE bring the
+        gateway, default route and DNS servers with them, applied without a restart.</p>
+      <div id="f-ifaces"></div>
       <h3>Network cards not in use</h3>
       <p class="s">Cards the router found that no interface uses yet. After adding or removing one, the data plane needs a restart.</p>
       <div class="tablewrap" id="f-nics"></div>
-    </section>
-    <section class="cfgsec hidden" id="sec-wan">
-      <p class="s">How each outside interface gets its address: fixed by you, from the ISP's DHCP server, or by dialling PPPoE
-        (DSL and many fibre lines). DHCP and PPPoE also bring the gateway, the default route and DNS servers, applied without a restart.</p>
-      <div id="f-wan"></div>
     </section>
     <section class="cfgsec hidden" id="sec-dhcp">
       <p class="s">Lease addresses to devices on an interface. Interfaces whose own address comes from DHCP can't serve it.

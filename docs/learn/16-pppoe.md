@@ -22,16 +22,20 @@ name = "wan"
 device = "ens20"
 address = "pppoe"
 role = "outside"
+# mtu = 1492             # the default over PPPoE, and the most it allows
 
 [interface.pppoe]
 username = "you@isp"
 password = "secret"
 # service = "internet"   # only if your ISP asks for a Service-Name
-# mtu = 1492             # the default
 ```
 
-In the portal: Configuration → **Internet connection**, then choose
-PPPoE.
+(Configs from before 0.9.1 may set `mtu` under `[interface.pppoe]`; that
+still works, and the interface's own `mtu` wins if both are set.)
+
+In the portal: Configuration → **Interfaces**, then set the interface's
+**Address** to PPPoE. Everything about an interface (card, role,
+addressing, MTU, MSS) is edited in that one card.
 
 ## Two stages
 

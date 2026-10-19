@@ -73,18 +73,19 @@ device = "ens20"
 address = "10.10.2.1/24"       # or "dhcp", or "pppoe" (with [interface.pppoe] below)
 role = "outside"
 # gateway = "10.10.2.254"      # the ISP's router (static address): SD-WAN tethers use it
+# mtu = 1500                   # largest IP packet on this link: 576-1500 (PPPoE: 1492, the default)
+# allow_new_sessions = true   # override the role's default
+# TCP MSS adjust: SYNs through this interface announce at most this MSS,
+# so TCP segments fit a smaller link without fragmenting. Set
+# automatically to the MTU minus 40 when the MTU is below 1500 (1452 over
+# PPPoE); 536-1460. Applies in both directions: outgoing SYNs and the
+# SYN-ACKs that come back in.
+# mss_adjust = 1452
 # With address = "pppoe" (docs/learn/16-pppoe.md):
 # [interface.pppoe]
 # username = "you@isp"
 # password = "secret"
 # service = ""                 # only if the ISP asks for a Service-Name
-# mtu = 1492
-# allow_new_sessions = true   # override the role's default
-# TCP MSS adjust: SYNs through this interface announce at most this MSS,
-# so TCP segments fit a smaller link without fragmenting. 1452 suits PPPoE
-# (1492-byte MTU); 536-1460. Applies in both directions: outgoing SYNs and
-# the SYN-ACKs that come back in.
-# mss_adjust = 1452
 
 # Static routes. The gateway must sit on one of the subnets above.
 # [[route]]

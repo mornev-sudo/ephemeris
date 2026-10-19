@@ -112,7 +112,7 @@ Plain-language explanations of everything in here, in reading order:
   - [ ] later: TPM measured boot / remote attestation
 - [x] **Edge router basics:** inside/outside interface roles, source NAT (PAT to the interface, pools, rules), form-based configuration in the portal
 - [x] **Hardening:** Common Criteria baseline packet filter (martian and spoofed sources, source-route/record-route options, invalid fragments), per-interface TCP MSS adjust
-- [x] **DHCP:** server on inside interfaces (ranges, reservations, persistent leases, DNS passed on from the WAN), client on outside interfaces (address, gateway and default route applied live)
+- [x] **DHCP:** server on inside interfaces (ranges, reservations, persistent leases, DNS passed on from the WAN), client on outside interfaces (address, gateway and default route applied live; /32 leases with an on-link gateway, classless static routes from option 121)
 - [x] **PPPoE:** outside interfaces dial their ISP (RFC 2516 discovery, LCP with keepalives, PAP / CHAP-MD5, IPCP with DNS), 1492 MTU and MSS handled, applied live
 - [x] **Reporting:** open sessions, packets/s, throughput and drops sampled every 5 s; live graphs in the portal (last hour), the same numbers on the dashboard and in `ephctl status`
 - [x] **Resources and capacity:** CPU (per core, per thread), memory and huge pages, disk, worker busy %, and every table's usage against its limit (FIB, sessions, neighbours, NAT, DHCP pools, tethers)

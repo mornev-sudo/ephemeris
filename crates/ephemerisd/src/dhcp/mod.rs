@@ -24,6 +24,9 @@ pub struct DhcpState {
     pub leases: HashMap<String, Vec<server::Lease>>,
     /// PPPoE connections, by interface name.
     pub pppoe: HashMap<String, PppoeStatus>,
+    /// Why the current leases / sessions couldn't be put into effect (the
+    /// data plane still runs the previous settings). Retried every 10 s.
+    pub apply_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

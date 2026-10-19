@@ -823,7 +823,7 @@ async fn wan_status(State(s): St) -> Json<Value> {
                 let ps = st.pppoe.get(&i.name);
                 let l = ps.and_then(|x| x.link.as_ref());
                 json!({
-                    "interface": i.name, "mode": "pppoe",
+                    "interface": i.name, "mode": "pppoe", "apply_error": st.apply_error,
                     "state": ps.map(|x| x.phase), "address": addr, "gateway": gw,
                     "dns": l.map(|l| l.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
                     "pppoe": {
@@ -839,7 +839,7 @@ async fn wan_status(State(s): St) -> Json<Value> {
                 let c = st.clients.get(&i.name);
                 let l = c.and_then(|c| c.lease.as_ref());
                 json!({
-                    "interface": i.name, "mode": "dhcp",
+                    "interface": i.name, "mode": "dhcp", "apply_error": st.apply_error,
                     "state": c.map(|c| c.phase), "address": addr, "gateway": gw,
                     "dns": l.map(|l| l.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
                     "dhcp": {

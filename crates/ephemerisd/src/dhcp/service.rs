@@ -40,6 +40,7 @@ pub fn run(shared: &Shared, punts: Receiver<Punt>, stop: &AtomicBool, state_dir:
         dialers: HashMap::new(),
         seen: None,
         learned_dns: vec![],
+        retry_apply: None,
     };
     let mut last_tick = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -79,6 +80,8 @@ struct Service<'a> {
     seen: Option<Config>,
     /// DNS servers last handed to servers without their own.
     learned_dns: Vec<std::net::Ipv4Addr>,
+    /// When to try again to apply leases / sessions that failed to apply.
+    retry_apply: Option<u64>,
 }
 
 impl Service<'_> {
@@ -116,7 +119,35 @@ impl Service<'_> {
         }
     }
 
+    /// Put the current leases and PPPoE sessions into effect. If that fails
+    /// (say, a lease whose gateway can't be reached), say why in the status
+    /// rather than only the log, and try again in 10 s.
+    fn apply(&mut self, now: u64) {
+        let running = self.shared.config.lock().unwrap().running().clone();
+        let result = self.shared.apply_live(&running);
+        let mut st = self.shared.dhcp.lock().unwrap();
+        match result {
+            Ok(()) => {
+                if st.apply_error.take().is_some() {
+                    info!("DHCP/PPPoE: addresses applied");
+                }
+                self.retry_apply = None;
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                if st.apply_error.as_deref() != Some(e.as_str()) {
+                    warn!("DHCP/PPPoE: can't apply the new address: {e}");
+                }
+                st.apply_error = Some(e);
+                self.retry_apply = Some(now + 10);
+            }
+        }
+    }
+
     fn tick(&mut self, now: u64) {
+        if self.retry_apply.is_some_and(|t| now >= t) {
+            self.apply(now);
+        }
         let ports: Vec<PortId> = self.clients.keys().copied().collect();
         for port in ports {
             let c = self.clients.get_mut(&port).unwrap();
@@ -167,10 +198,7 @@ impl Service<'_> {
         }
         self.publish();
         // Apply the new address / gateway / default route to the data plane.
-        let running = self.shared.config.lock().unwrap().running().clone();
-        if let Err(e) = self.shared.apply_live(&running) {
-            warn!("DHCP: applying the new lease: {e:#}");
-        }
+        self.apply(now_unix());
         // LANs that use learned DNS servers hear about new ones.
         self.seen = None;
     }
@@ -188,10 +216,7 @@ impl Service<'_> {
             ppp::Event::Down(why) => warn!("PPPoE: {} down: {why}", d.cfg.interface),
         }
         self.publish();
-        let running = self.shared.config.lock().unwrap().running().clone();
-        if let Err(e) = self.shared.apply_live(&running) {
-            warn!("PPPoE: applying the session: {e:#}");
-        }
+        self.apply(now_unix());
         self.seen = None; // LANs using learned DNS hear about the ISP's
     }
 
@@ -328,7 +353,7 @@ impl Service<'_> {
                 username: p.username.clone(),
                 password: p.password.clone(),
                 service: p.service.clone(),
-                mtu: p.mtu(),
+                mtu: i.ip_mtu(),
             };
             let d = match self.dialers.remove(&port) {
                 Some(d) if d.cfg == settings => d,

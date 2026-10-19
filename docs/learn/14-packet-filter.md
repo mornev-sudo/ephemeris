@@ -102,6 +102,13 @@ role = "outside"
 mss_adjust = 1452       # PPPoE: 1492 - 40
 ```
 
+An interface with a smaller **MTU** gets this automatically: set
+`mtu = 1400` (576-1500; PPPoE's default is 1492), and unless you set
+`mss_adjust` yourself it becomes the MTU minus 40. Packets too big for the
+interface's MTU get ICMP "fragmentation needed" (with DF) or are dropped
+(the router doesn't fragment). MTUs above 1500 (jumbo frames) aren't
+supported yet: they need bigger packet buffers and the NIC's own MTU raised.
+
 Any TCP SYN going **out** of that interface, and any SYN-ACK coming back
 **in** through it, has its MSS option lowered to 1452 if it was higher.
 Both directions matter. The SYN tells the server how much the client can

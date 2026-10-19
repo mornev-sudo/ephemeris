@@ -11,7 +11,8 @@
 #   [netns ci-hb] 10.10.2.10 ─ veth ─ bridge ─ tap ─ enp0s20 ┘
 #
 # lan-a serves DHCP; lan-b gets its own address by DHCP from a dnsmasq in
-# ci-hb (always 10.10.2.1, reserved for its MAC; no gateway, one DNS server).
+# ci-hb (always 10.10.2.1, reserved for its MAC; no gateway, one DNS server,
+# and one classless static route (option 121): 10.10.98.0/24 via host B).
 #
 # usage: sudo ci/e2e.sh <image.qcow2> <expected-version> [<update-dir> <update-version>]
 set -euo pipefail
@@ -126,6 +127,7 @@ ip netns exec ci-hb dnsmasq --keep-in-foreground --no-resolv --port=0 --user=roo
     --interface=eth0 --bind-interfaces --dhcp-authoritative \
     --dhcp-range=10.10.2.100,10.10.2.200,255.255.255.0,1h \
     --dhcp-host=52:54:00:12:34:58,10.10.2.1 --dhcp-option=3 --dhcp-option=6,10.10.2.53 \
+    --dhcp-option=121,10.10.98.0/24,10.10.2.10 \
     --dhcp-leasefile="$WORK/dnsmasq.leases" --log-dhcp --log-facility="$LOGS/dnsmasq.log" &
 DNSMASQ_PID=$!
 
@@ -187,6 +189,7 @@ check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="
 # ------------------------------------------------------------ forwarding
 echo "DHCP:"
 check "lan-b gets its address by DHCP"     wait_for 90 "a lease on lan-b" on_router "ephctl dhcp | grep 'lan-b' | grep 'bound' | grep -q '10.10.2.1/24'"
+check "option 121 route from the lease"    wait_for 30 "the lease's route" on_router "ephctl routes | grep '10.10.98.0/24' | grep -q '10.10.2.10'"
 check "DNS server learned from the lease"  sh -c "${SSH[*]} ephctl --json dhcp | grep -q 10.10.2.53"
 # A LAN host asks for an address; the script only records what it was told
 # (ci-ha keeps its static address for the tests below).

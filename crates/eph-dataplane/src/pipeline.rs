@@ -103,6 +103,8 @@ fn seeded() -> FxSeededState {
 /// Per-worker forwarding state.
 pub struct Pipeline {
     ports: Arc<[Port]>,
+    /// The smallest MTU of any port: packets up to this size skip the check.
+    min_mtu: usize,
     fib: Arc<Fib<NextHop>>,
     /// Bumped whenever the FIB is replaced, invalidating next hops cached
     /// in sessions.
@@ -159,6 +161,7 @@ impl Pipeline {
         let replay = Arc::new(ReplayGuard::new(overlay.sites.len()));
         let endpoints = Arc::new(Endpoints::new(overlay.tethers.len()));
         Pipeline {
+            min_mtu: min_mtu(&ports),
             ports,
             fib,
             fib_gen: 1,
@@ -235,6 +238,7 @@ impl Pipeline {
 
     pub fn set_ports(&mut self, ports: Arc<[Port]>) {
         debug_assert_eq!(ports.len(), self.ports.len());
+        self.min_mtu = min_mtu(&ports);
         self.ports = ports;
     }
 
@@ -484,15 +488,14 @@ impl Pipeline {
         }
     }
 
-    /// The MTU of the PPPoE link `dst` is routed out of, if it is one.
-    fn pppoe_mtu_towards(&self, dst: Ipv4Addr) -> Option<usize> {
-        if !self.ports.iter().any(|p| p.pppoe_up().is_some()) {
-            return None; // the common case: one cheap check, no lookup
+    /// The MTU of the port `dst` is routed out of, if a packet of `len`
+    /// bytes might not fit it. (The overlay checks its own MTU.)
+    fn mtu_towards(&self, dst: Ipv4Addr, len: usize) -> Option<usize> {
+        if len <= self.min_mtu {
+            return None; // the common case: fits every port, no lookup
         }
         match self.fib.lookup(dst)? {
-            NextHop::Ip { port, .. } => self.ports[*port as usize]
-                .pppoe_up()
-                .map(|(_, _, m)| m as usize),
+            NextHop::Ip { port, .. } => Some(self.ports[*port as usize].ip_mtu() as usize),
             NextHop::Site(_) => None,
         }
     }
@@ -535,14 +538,15 @@ impl Pipeline {
             return Verdict::Drop(DropReason::Malformed);
         };
         let port = &self.ports[ingress as usize];
-        let (my_mac, my_ip, subnet) = (port.mac, port.addr, port.subnet);
+        let (my_mac, my_ip) = (port.mac, port.addr);
 
         // RFC 826 "merge": if we already know the sender, refresh it; if the
-        // packet is aimed at us, add it. Only accept senders on this subnet.
+        // packet is aimed at us, add it. Only accept senders on this link
+        // (its subnet, or an on-link gateway outside it).
         // Ours: the port's address, or (on an outside port) a NAT pool
         // address, which nothing else on that link would answer for.
         let for_us = a.tpa == my_ip || (port.role == Role::Outside && self.nat.owns(a.tpa));
-        if subnet.contains(a.spa)
+        if port.reaches(a.spa)
             && a.spa != my_ip
             && !eth::is_multicast(&a.sha)
             && (for_us || self.neighbors.contains_key(&(ingress, a.spa)))
@@ -708,9 +712,9 @@ impl Pipeline {
             );
         }
 
-        // A PPPoE link carries 8 bytes less than Ethernet (1492). Checked
-        // before NAT, so the "too big" error goes to the real sender.
-        if let Some(mtu) = self.pppoe_mtu_towards(h.dst) {
+        // The way out may carry less (PPPoE: 1492, or a configured MTU).
+        // Checked before NAT, so the "too big" error goes to the real sender.
+        if let Some(mtu) = self.mtu_towards(h.dst, h.total_len) {
             if h.total_len > mtu {
                 if frame[off + ETH + 6] & 0x40 == 0 {
                     return Verdict::Drop(DropReason::TooBig); // fragmentation not implemented
@@ -1418,7 +1422,7 @@ impl Pipeline {
         // the link's gateway (configured, or from DHCP).
         let next_hop = t
             .gateway
-            .or_else(|| (!p.subnet.contains(remote)).then_some(p.gateway).flatten())
+            .or_else(|| (!p.reaches(remote)).then_some(p.gateway).flatten())
             .unwrap_or(remote);
         Some((t.port, remote, dport, next_hop))
     }
@@ -1820,4 +1824,13 @@ fn related_key(quoted: &[u8]) -> Option<(FlowKey, Ipv4Addr)> {
         _ => (0, 0),
     };
     Some((FlowKey::new(src, sp, dst, dp, proto).0, src))
+}
+
+/// The smallest MTU of any port (a PPPoE session's own MTU while it's up).
+fn min_mtu(ports: &[Port]) -> usize {
+    ports
+        .iter()
+        .map(|p| p.ip_mtu() as usize)
+        .min()
+        .unwrap_or(1500)
 }

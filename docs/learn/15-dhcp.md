@@ -133,6 +133,34 @@ When it's bound, three things happen live, without a restart:
   route**, unless you've configured a static one, which always wins;
 - NAT starts translating to the new address.
 
+### Gateways outside the subnet: /32 leases and option 121
+
+Not every lease looks like a home LAN's `/24`. ISPs (especially with
+carrier-grade NAT) and cloud providers often hand out a **/32**, a subnet
+of one address, with a gateway *outside* it, e.g. `100.64.12.34/32` and
+gateway `100.64.0.1`. The gateway is still on the same link: the router can
+ARP for it directly. It just isn't in the subnet.
+
+The client keeps the mask exactly as given (/31 and /32 included; no mask
+at all also means /32, rather than guessing). A gateway outside the subnet
+is recorded as **on-link**: a connected /32 route to it on that interface,
+the same way a PPPoE link's far end is handled (chapter 16). Then the
+default route through it resolves like any other.
+
+Servers can also send **classless static routes** (option 121, RFC 3442;
+Microsoft's older servers use 249): extra routes, each with its own gateway,
+or `0.0.0.0` for "on this link". The router asks for them. As the RFC
+requires, when they're present the plain Router option is ignored, and the
+default route comes from their `0.0.0.0/0` entry. A static route you
+configure for the same prefix wins.
+
+If a lease still can't be put into effect, the WAN status says so
+(`ephctl wan`: `NOT APPLIED: <reason>`; the dashboard: "not applied"),
+and the router tries again every 10 seconds. Before 0.9.1 that only went
+to the log, and the interface quietly kept no address.
+
+### A view, not a rewrite
+
 The new settings are a *view* of the config, `Config::with_leases`. The
 config file itself is never rewritten by DHCP, and every commit is applied
 with the current lease folded in.

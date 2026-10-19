@@ -108,6 +108,18 @@ try {
     await page.click("#cfgdiscard");
     await page.waitForSelector("#cfgstate:has-text('Running configuration')");
   });
+  await step("interfaces are edited in one card each", async () => {
+    await page.click("#cfgnav button[data-sec=ifaces]");
+    await page.waitForSelector("#f-ifaces .card.iface select[data-field=addressing]");
+    await page.waitForSelector("#f-ifaces .card.iface input[data-field=mtu]", { state: "attached" });
+    if (await page.locator("#cfgnav button:has-text('Internet connection')").count()) throw new Error("the separate Internet connection tab is back");
+    // Switching an interface to PPPoE shows its login fields in the same card.
+    const last = page.locator("#f-ifaces .card.iface").last();
+    await last.locator("select[data-field=addressing]").selectOption("pppoe");
+    await page.waitForSelector("#f-ifaces .card.iface input[data-field=username]", { state: "attached" });
+    await page.click("#cfgdiscard");
+    await page.waitForSelector("#cfgstate:has-text('Running configuration')");
+  });
   await step("an interface without a name or card is refused", async () => {
     await page.click("#cfgnav button[data-sec=ifaces]");
     await page.click("#f-ifaces button:has-text('Add interface')");
