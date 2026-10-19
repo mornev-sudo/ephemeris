@@ -83,6 +83,8 @@ impl Service<'_> {
             }
             if changed {
                 self.save_leases(p.port);
+                // Show it straight away (the API reads what's published).
+                self.publish();
             }
         } else if let Some(c) = self.clients.get_mut(&p.port) {
             let (send, event) = c.handle(&rx, now);
