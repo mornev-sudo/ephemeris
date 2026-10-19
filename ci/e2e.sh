@@ -29,7 +29,9 @@ QEMU_PID= HTTP_PID= DNSMASQ_PID=
 cleanup() {
     [[ -n $QEMU_PID ]] && kill "$QEMU_PID" 2>/dev/null || true
     [[ -n $HTTP_PID ]] && kill "$HTTP_PID" 2>/dev/null || true
-    [[ -n $DNSMASQ_PID ]] && kill "$DNSMASQ_PID" 2>/dev/null || true
+    [[ -n $DNSMASQ_PID ]] && { kill "$DNSMASQ_PID" 2>/dev/null; wait "$DNSMASQ_PID" 2>/dev/null; } || true
+    # This runs as root; the workflow uploads the logs as a normal user.
+    chmod -R a+rX "$LOGS" 2>/dev/null || true
     ip netns del ci-ha 2>/dev/null || true
     ip netns del ci-hb 2>/dev/null || true
     for l in ephtap-a ephtap-b ephbr-a ephbr-b; do ip link del "$l" 2>/dev/null || true; done
