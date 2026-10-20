@@ -53,6 +53,52 @@ config ──▶ │ config.rs ──▶ FIB (DIR-24-8) ──▶ shared, read-o
 | [`ephctl`](crates/ephctl) | CLI client of the management API | anywhere |
 | [`image/`](image) | mkosi definition of Ephemeris OS, the bootable router image | built on Linux / CI |
 
+## Hardware requirements
+
+| | Minimum | Recommended |
+|---|---|---|
+| **CPU** | x86-64, 2 cores | 2-4 cores; one more per extra worker |
+| **RAM** | 2 GB | 4 GB |
+| **Disk** | 8 GB | 16 GB |
+| **Firmware** | UEFI (Secure Boot supported, keys enrolled automatically) | UEFI with Secure Boot |
+| **Network** | 3 NICs: management, inside, outside | NICs with native XDP (see below), multi-queue for more than one worker |
+
+The minimum is what CI boot-tests every build on: a 2-core, 2 GB VM.
+
+- **CPU:** x86-64 only, no ARM build yet. A packet worker can spin at 100%
+  (`busy_poll`, or under load), so it needs a core to itself. The other core
+  runs the portal, DHCP and PPPoE, SD-WAN probing and the OS. Each extra
+  worker needs another core and another NIC queue.
+- **RAM:** the tables are reserved at start-up:
+  - per worker, about 40 MB of session table (262,144 sessions by default)
+    and about 32 MB of packet buffers;
+  - shared, the forwarding table: 32-48 MiB;
+  - plus the OS, nginx and ephemerisd.
+
+  One worker with default settings fits in about 1 GB, but that isn't
+  tested. Table sizes are fixed by the config (`sessions.max_per_worker`),
+  not sized from the machine's RAM yet.
+- **Disk:** the layout is fixed:
+  - EFI system partition: 512 MB;
+  - two root slots for A/B updates: 1.5 GB each, plus 64 MB of verity data
+    each;
+  - `/var`: at least 2 GB. It grows into the rest of the disk on first
+    boot, and holds config history, leases, the journal (capped at
+    256 MiB) and update downloads.
+- **Network:** the management NIC stays with Linux (SSH, the portal over
+  HTTPS). The others belong to the data plane.
+  - **Any NIC works:** without native XDP the router falls back to generic
+    XDP in copy mode, which is slower but correct.
+  - **Native XDP with zero-copy is the fast path:** virtio_net (Proxmox),
+    Intel i40e, ice, ixgbe and igc, and Mellanox mlx5.
+  - **Several workers need several NIC queues:** `ethtool -L <dev>
+    combined N`, or `queues=N` on Proxmox virtio NICs.
+- **Huge pages:** optional. Packet buffers use them when `vm.nr_hugepages`
+  reserves some.
+
+`lab/proxmox/deploy-image.sh` creates a VM that meets these: 4 cores,
+2 GB of RAM and an 8 GB disk by default, 3 virtio NICs, and UEFI (OVMF).
+
 ## Quick start
 
 On macOS, Linux or any other machine (unit tests plus config validation):
