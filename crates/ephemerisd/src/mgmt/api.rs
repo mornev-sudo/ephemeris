@@ -35,6 +35,7 @@
 //! | POST   | /system/update/check      | list installed + available versions         |
 //! | POST   | /system/update            | install newest version into inactive slot   |
 //! | POST   | /system/reboot            | reboot (into the newest installed version)  |
+//! | ...    | /logs, /logging           | log lines and levels: see [`super::logapi`] |
 //!
 //! ephemerisd serves plain HTTP on loopback only; nginx in front terminates
 //! HTTPS for the network (see image/) and passes the client's address in
@@ -74,7 +75,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CONFIRM_SECS: u64 = 3600;
 
 /// Errors become `{"error": "..."}` with a status code.
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -131,6 +132,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/system/password", post(change_password))
         .route("/whoami", get(whoami))
         .route("/logout", post(logout))
+        .merge(super::logapi::routes())
         // Everything above needs a login (checked first), and every change
         // is written to the audit log; the routes below don't.
         .route_layer(middleware::from_fn(audit))
@@ -148,7 +150,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
 pub async fn serve(shared: Arc<Shared>, listen: SocketAddr) -> anyhow::Result<()> {
     let stop = shared.stop;
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!("management API on http://{listen}/");
+    tracing::info!(target: crate::logging::cat::MGMT, "management API on http://{listen}/");
     axum::serve(
         listener,
         router(shared).into_make_service_with_connect_info::<SocketAddr>(),
@@ -199,7 +201,7 @@ async fn front(State(s): St, mut req: Request, next: Next) -> Response {
         .hostnames
         .clone();
     if !host_allowed(req.headers(), &hostnames) {
-        tracing::warn!("refused a request for an unknown Host from {}", client.ip);
+        tracing::warn!(target: crate::logging::cat::MGMT, "refused a request for an unknown Host from {}", client.ip);
         return ApiError(
             StatusCode::MISDIRECTED_REQUEST,
             "unknown host name: use the router's address, or add the name to \
@@ -410,7 +412,7 @@ async fn login(
     Json(r): Json<LoginReq>,
 ) -> Response {
     if let Err(wait) = s.auth.throttle.check(client.ip) {
-        tracing::warn!(
+        tracing::warn!(target: crate::logging::cat::AUDIT,
             "web login from {} refused: too many wrong passwords",
             client.ip
         );
@@ -437,7 +439,7 @@ async fn login(
         // Slow down password guessing.
         tokio::time::sleep(Duration::from_secs(1)).await;
         let user: String = r.username.chars().take(64).collect();
-        tracing::warn!(
+        tracing::warn!(target: crate::logging::cat::AUDIT,
             "failed web login for {user:?} from {}{}",
             client.ip,
             if locked {
@@ -1230,20 +1232,24 @@ fn finish_commit(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>) -> Api
             let expired = s.config.lock().unwrap().expire_pending(id);
             match expired {
                 Some(Ok(back)) => {
-                    tracing::warn!("commit {id} not confirmed within {secs}s: rolled back");
+                    tracing::warn!(target: crate::logging::cat::CONFIG, "commit {id} not confirmed within {secs}s: rolled back");
                     if back.apply == Apply::Live {
                         match s.apply_live(&back.config) {
                             Ok(()) => remember_good(&s),
-                            Err(e) => tracing::error!("applying rollback: {e:#}"),
+                            Err(e) => {
+                                tracing::error!(target: crate::logging::cat::CONFIG, "applying rollback: {e:#}")
+                            }
                         }
                     }
                 }
-                Some(Err(e)) => tracing::error!("automatic rollback failed: {e:#}"),
+                Some(Err(e)) => {
+                    tracing::error!(target: crate::logging::cat::CONFIG, "automatic rollback failed: {e:#}")
+                }
                 None => {}
             }
         });
     }
-    tracing::info!("config committed ({:?})", c.apply);
+    tracing::info!(target: crate::logging::cat::CONFIG, "config committed ({:?})", c.apply);
     Ok(Json(json!({
         "applied": c.apply,
         "diff": c.diff,
@@ -1256,7 +1262,7 @@ fn finish_commit(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>) -> Api
 fn remember_good(s: &Shared) {
     let cfg = s.config.lock().unwrap();
     if let Err(e) = crate::startup::mark_good(cfg.path(), cfg.running_text()) {
-        tracing::warn!("could not save the last good config: {e:#}");
+        tracing::warn!(target: crate::logging::cat::CONFIG, "could not save the last good config: {e:#}");
     }
 }
 
@@ -1317,7 +1323,7 @@ async fn del_route(State(s): St, Query(q): Query<PrefixQuery>) -> ApiResult {
 }
 
 async fn restart(State(s): St) -> Json<Value> {
-    tracing::warn!("restart requested via API");
+    tracing::warn!(target: crate::logging::cat::SYSTEM, "restart requested via API");
     s.stop.store(true, Ordering::Relaxed);
     Json(json!({ "ok": true, "note": "ephemerisd is exiting; systemd restarts it in ~2 s" }))
 }
@@ -1500,7 +1506,7 @@ async fn update_start(State(s): St) -> ApiResult {
 }
 
 async fn reboot() -> ApiResult {
-    tracing::warn!("reboot requested via API");
+    tracing::warn!(target: crate::logging::cat::SYSTEM, "reboot requested via API");
     systemctl(&["reboot", "--no-block"])?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -1637,6 +1643,72 @@ address = "10.10.2.1/24"
             Some("0.7.0.9")
         );
         assert_eq!(entry_version("auto-windows"), None);
+    }
+
+    #[tokio::test]
+    async fn log_levels_change_at_run_time() {
+        let (s, _) = shared("logging");
+        let json = |v: Value| Body::from(v.to_string());
+        let put = |b: Value| call(&s, "PUT", "/api/v1/logging", "secret", json(b), true);
+        let (code, _) = call(&s, "GET", "/api/v1/logging", "", Body::empty(), false).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "behind login like the rest");
+        let (code, v) = put(json!({"category": "nope", "level": "debug"})).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("no log category"));
+        let (code, _) = put(json!({"category": "update", "level": "loud"})).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, _) = put(json!({"category": "update", "level": "debug", "for": "soon"})).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        let (code, v) = put(json!({"category": "update", "level": "trace", "for": "5m"})).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["expires_in_secs"], 300);
+        let (_, v) = call(&s, "GET", "/api/v1/logging", "secret", Body::empty(), false).await;
+        let update = v["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "update")
+            .unwrap();
+        assert_eq!(
+            (update["level"].as_str(), update["overridden"].as_bool()),
+            (Some("trace"), Some(true))
+        );
+
+        let host = |h: Value| {
+            call(
+                &s,
+                "PUT",
+                "/api/v1/logging/host",
+                "secret",
+                json(json!({"host": h})),
+                true,
+            )
+        };
+        assert_eq!(host("10.0.0.5".into()).await.1["host"], "10.0.0.5/32");
+        assert_eq!(host("bad".into()).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(host("off".into()).await.1["host"], Value::Null);
+
+        let (code, _) = call(
+            &s,
+            "DELETE",
+            "/api/v1/logging",
+            "secret",
+            Body::empty(),
+            false,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, v) = call(
+            &s,
+            "GET",
+            "/api/v1/logs?level=nope",
+            "secret",
+            Body::empty(),
+            false,
+        )
+        .await;
+        assert!(v["error"].as_str().unwrap().contains("no log level"));
     }
 
     #[tokio::test]

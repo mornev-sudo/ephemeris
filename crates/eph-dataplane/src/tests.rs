@@ -1295,3 +1295,90 @@ fn pppoe_mtu_and_control_traffic() {
     ));
     assert!(r.emits.is_empty(), "no ARP request on a PPPoE link");
 }
+
+/// Packet tracing: switched-on categories record what happened to a
+/// packet, only for the filtered host, and nothing at all when off.
+#[test]
+fn tracing_records_what_happened_to_packets() {
+    use crate::trace::{TraceCat, TraceConfig, TraceKind};
+    let mut r = router();
+    // Known, so the ICMP errors back to A go straight out.
+    learn(&mut r, 0, HOST_A, "10.10.1.10");
+    let kinds = |r: &mut Pipeline| -> Vec<(TraceCat, TraceKind)> {
+        r.tracer
+            .events
+            .drain(..)
+            .map(|e| (e.cat(), e.kind))
+            .collect()
+    };
+    // Off: nothing recorded.
+    let (mut f, n) = ping(R0, HOST_A, "10.10.1.10", "8.8.8.8", 64);
+    r.process(0, &mut f, 0, n);
+    assert!(r.tracer.events.is_empty());
+
+    let all = [
+        TraceCat::Route,
+        TraceCat::Icmp,
+        TraceCat::Arp,
+        TraceCat::Session,
+    ]
+    .iter()
+    .fold(0, |m, c| m | c.bit());
+    r.set_trace(TraceConfig {
+        mask: all,
+        host: Some("10.10.1.10/32".parse().unwrap()),
+        per_sec: 100,
+    });
+    // No route to 8.8.8.8: the drop, and the ICMP error sent instead.
+    let (mut f, n) = ping(R0, HOST_A, "10.10.1.10", "8.8.8.8", 64);
+    r.process(0, &mut f, 0, n);
+    assert_eq!(
+        kinds(&mut r),
+        [
+            (TraceCat::Route, TraceKind::Drop(DropReason::NoRoute)),
+            (
+                TraceCat::Icmp,
+                TraceKind::IcmpSent {
+                    kind: icmp::DEST_UNREACHABLE,
+                    code: 0
+                }
+            ),
+        ]
+    );
+    // To host B, not yet resolved: a new session, then an ARP request for B
+    // and the drop waiting for it.
+    let (mut f, n) = ping(R0, HOST_A, "10.10.1.10", "10.10.2.10", 64);
+    r.process(0, &mut f, 0, n);
+    let k = kinds(&mut r);
+    assert!(
+        k.contains(&(TraceCat::Session, TraceKind::SessionNew)),
+        "{k:?}"
+    );
+    assert!(
+        k.contains(&(TraceCat::Arp, TraceKind::Drop(DropReason::NeighborMiss))),
+        "{k:?}"
+    );
+    // The ARP request has no host in it the filter matches (it's for B).
+    // Another host's traffic isn't traced at all.
+    let (mut f, n) = ping(R0, [0x52, 0x54, 0, 0, 0, 0x99], "10.10.1.99", "8.8.8.8", 64);
+    r.process(0, &mut f, 0, n);
+    assert!(r.tracer.events.is_empty());
+    // The flow is the packet's.
+    r.set_trace(TraceConfig {
+        mask: all,
+        host: None,
+        per_sec: 100,
+    });
+    let (mut f, n) = ping(R0, HOST_A, "10.10.1.10", "8.8.8.8", 64);
+    r.process(0, &mut f, 0, n);
+    let e = r.tracer.events[0];
+    assert_eq!(
+        (e.port, e.flow.proto, e.flow.src, e.flow.dst),
+        (0, 1, ip("10.10.1.10"), ip("8.8.8.8"))
+    );
+    assert_eq!(
+        (e.flow.sport, e.flow.dport),
+        (icmp::ECHO_REQUEST as u16, 0),
+        "ICMP type/code"
+    );
+}

@@ -19,6 +19,9 @@ pub struct Config {
     pub sessions: SessionsCfg,
     #[serde(default)]
     pub management: ManagementCfg,
+    /// Log levels per category, and the log files (see `logging`).
+    #[serde(default)]
+    pub logging: crate::logging::LoggingCfg,
     #[serde(rename = "interface")]
     pub interfaces: Vec<InterfaceCfg>,
     #[serde(default, rename = "route")]
@@ -587,7 +590,7 @@ impl SessionsCfg {
     pub fn to_config(&self, max_sessions: u32) -> SessionConfig {
         let cap = |name: &str, v: u64| {
             if v > eph_dataplane::MAX_IDLE_SECS {
-                tracing::warn!(
+                tracing::warn!(target: crate::logging::cat::CONFIG,
                     "sessions.{name} = {v}: using {}, the most a session may stay idle",
                     eph_dataplane::MAX_IDLE_SECS
                 );
@@ -791,6 +794,7 @@ impl Config {
                 bail!("management.hostnames: {h:?} isn't a host name");
             }
         }
+        self.logging.validate()?;
         if self.interfaces.is_empty() {
             bail!("at least one [[interface]] is required");
         }

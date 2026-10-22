@@ -28,3 +28,5 @@ tower.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eph-xdp.workspace = true
+# Structured journal entries (fields, priorities) instead of text on stderr.
+tracing-journald = "0.3"

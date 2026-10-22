@@ -22,6 +22,8 @@ pub enum Control {
     SetPaths(Arc<PathTable>),
     /// New source-NAT rules (existing sessions keep their translation).
     SetNat(Arc<NatConfig>),
+    /// What to trace (debug logging of packets).
+    SetTrace(eph_dataplane::trace::TraceConfig),
     /// Send this frame out of `port` (DHCP replies and requests).
     Transmit { port: PortId, frame: Vec<u8> },
 }

@@ -148,6 +148,7 @@ Plain-language explanations of everything in here, in reading order:
 15. [DHCP: handing out addresses, and getting one](docs/learn/15-dhcp.md)
 16. [PPPoE: dialling the ISP](docs/learn/16-pppoe.md)
 17. [VLANs: many networks on one cable](docs/learn/17-vlans.md)
+18. [Logging: what the router says, and how to make it say more](docs/learn/18-logging.md)
 
 ## Roadmap
 
@@ -168,6 +169,7 @@ Plain-language explanations of everything in here, in reading order:
 - [x] **Resources and capacity:** CPU (per core, per thread), memory and huge pages, disk, worker busy %, and every table's usage against its limit (FIB, sessions, neighbours, NAT, DHCP pools, tethers)
 - [x] **Bounded resources:** every session expires (idle limit of an hour, closed within 10 minutes), session views show the newest 1000 and are gathered only while viewed, a bounded control-plane queue, a capped journal and history, management at lower CPU priority
 - [x] **VLANs (802.1Q):** several interfaces per card, each with its own tag (and at most one untagged), PPPoE over a VLAN, tag stripping and VLAN filtering handled on the NIC
+- [x] **Logging:** a category per subsystem (17) with its own level, raised at run time with a timer; packet tracing in the data plane filtered by host and rate-limited; the journal (info and up, 90 days), a capped debug.log and audit.log in /var/log/ephemeris, `ephctl log`
 - [ ] **Next for the edge:** destination NAT / port forwarding, `ephsh` router CLI
 - [ ] **Performance and capacity:**
   - [ ] Benchmarks: a microbenchmark of the per-packet pipeline (CPU ceiling per core, no NIC), and a lab test with a traffic generator (pktgen / TRex) for real packets per second on Proxmox and on hardware NICs

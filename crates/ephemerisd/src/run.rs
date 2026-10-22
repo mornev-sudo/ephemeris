@@ -45,7 +45,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         ..Default::default()
     };
     if let Some(f) = &startup.fallback {
-        warn!(
+        warn!(target: crate::logging::cat::CONFIG,
             "started with the last configuration that worked: the newer one failed ({}); it was kept as {}",
             f.error, f.failed_file
         );
@@ -60,11 +60,12 @@ pub fn run(config_path: &Path) -> Result<()> {
         Err(e) => return Err(fall_back(config_path, &text, e)),
     };
     let cfg = manager.running().clone();
+    crate::logging::control().apply_config(&cfg.logging);
     let state_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let dp = match start_dataplane(&cfg, &state_dir) {
         Ok(dp) => {
             if let Err(e) = startup::mark_good(config_path, &text) {
-                warn!("could not save this config as the last good one: {e:#}");
+                warn!(target: crate::logging::cat::CONFIG, "could not save this config as the last good one: {e:#}");
             }
             dp
         }
@@ -73,7 +74,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             if e.to_string().starts_with(RESTARTING) {
                 return Err(e);
             }
-            error!("data plane not started: {e:#}. Running the management plane only: fix the configuration, then restart.");
+            error!(target: crate::logging::cat::CONFIG, "data plane not started: {e:#}. Running the management plane only: fix the configuration, then restart.");
             startup.dataplane_error = Some(format!("{e:#}"));
             Dataplane::none(&cfg)?
         }
@@ -117,7 +118,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         // and run without API token auth (logins still work).
         token: if m.enabled {
             load_or_create_token(&m.token_file).unwrap_or_else(|e| {
-                error!("API token unavailable ({e:#}); token authentication disabled");
+                error!(target: crate::logging::cat::MGMT, "API token unavailable ({e:#}); token authentication disabled");
                 String::new()
             })
         } else {
@@ -142,14 +143,14 @@ pub fn run(config_path: &Path) -> Result<()> {
         let shared = shared.clone();
         let (listen, moved) = m.bind_addr();
         if moved {
-            warn!(
+            warn!(target: crate::logging::cat::MGMT,
                 "management.listen {} is not a loopback address: plain HTTP stays on {listen}, \
                  and the portal is served over HTTPS by nginx (https://<router>:8443/). \
                  Set management.insecure_remote_http = true to serve plain HTTP on the network.",
                 m.listen
             );
         } else if !listen.ip().is_loopback() {
-            warn!("management API on {listen} over plain HTTP: passwords cross the network unencrypted");
+            warn!(target: crate::logging::cat::MGMT, "management API on {listen} over plain HTTP: passwords cross the network unencrypted");
         }
         std::thread::Builder::new()
             .name("eph-mgmt".into())
@@ -162,7 +163,7 @@ pub fn run(config_path: &Path) -> Result<()> {
                     .expect("tokio runtime");
                 // A broken management plane must never take the data plane down.
                 if let Err(e) = rt.block_on(api::serve(shared, listen)) {
-                    error!("management API stopped: {e:#}");
+                    error!(target: crate::logging::cat::MGMT, "management API stopped: {e:#}");
                 }
             })
             .expect("spawning management thread")
@@ -185,7 +186,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     // ---- SD-WAN control loop
     let selector = (overlay.enabled() && workers > 0).then(|| {
         let shared = shared.clone();
-        info!(
+        info!(target: crate::logging::cat::SDWAN,
             "SD-WAN: site {}, {} tether(s) to {} site(s)",
             overlay.site_id,
             overlay.tethers.len(),
@@ -204,8 +205,22 @@ pub fn run(config_path: &Path) -> Result<()> {
     let mut next_sample = Instant::now();
     let started = Instant::now();
     let mut sysinfo = crate::mgmt::sysinfo::Sampler::default();
+    let mut trace_seen = crate::logging::control().trace_version();
     while !STOP.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
+        // Temporary log levels that ran out; the workers follow any change
+        // to what's traced.
+        let log = crate::logging::control();
+        for c in log.expire(Instant::now()) {
+            info!(target: "system", "log category {c}: back to its configured level");
+        }
+        if log.trace_version() != trace_seen {
+            trace_seen = log.trace_version();
+            let t = log.trace_config();
+            for tx in shared.control.lock().unwrap().iter() {
+                let _ = tx.send(Control::SetTrace(t));
+            }
+        }
         if Instant::now() >= next_sample {
             next_sample += sample_every;
             let unix = std::time::SystemTime::now()
@@ -236,7 +251,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             print_stats(&shared, d.show_sessions);
         }
     }
-    info!("stopping");
+    info!(target: crate::logging::cat::SYSTEM, "stopping");
     for h in handles {
         let _ = h.join();
     }
@@ -284,7 +299,7 @@ fn fall_back(config_path: &Path, text: &str, e: anyhow::Error) -> anyhow::Error 
         .unwrap_or(0);
     match startup::fall_back(config_path, text, &format!("{e:#}"), now) {
         Ok(true) => {
-            error!("configuration failed: {e:#}");
+            error!(target: crate::logging::cat::CONFIG, "configuration failed: {e:#}");
             anyhow::anyhow!("{RESTARTING} (the failed one was kept next to it)")
         }
         Ok(false) => e,
@@ -402,7 +417,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             );
         }
         if queues > workers {
-            warn!(
+            warn!(target: crate::logging::cat::INTERFACE,
                 "device {dev} has {queues} RX queues but only {workers} worker(s): traffic hashed to \
                  queues {workers}..{} will be dropped. Fix: ethtool -L {dev} combined {workers}",
                 queues - 1
@@ -411,9 +426,11 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         // Tags must reach the data plane as they are on the wire: a card
         // that strips them would make every VLAN look untagged.
         match iface::disable_vlan_stripping(dev) {
-            Ok(true) => info!("{dev}: VLAN stripping turned off"),
+            Ok(true) => {
+                info!(target: crate::logging::cat::INTERFACE, "{dev}: VLAN stripping turned off")
+            }
             Ok(false) => {}
-            Err(e) => warn!(
+            Err(e) => warn!(target: crate::logging::cat::INTERFACE,
                 "{dev}: could not turn VLAN stripping off ({e}); tagged frames may arrive \
                  untagged. Try: ethtool -K {dev} rxvlan off"
             ),
@@ -427,7 +444,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
                 Promisc::enable(idx)
                     .with_context(|| format!("{dev}: promiscuous mode (needed for its VLANs)"))?,
             );
-            info!("{dev}: carries VLANs ({}); promiscuous mode on", users());
+            info!(target: crate::logging::cat::INTERFACE, "{dev}: carries VLANs ({}); promiscuous mode on", users());
         }
         ifindexes.push(idx);
     }
@@ -446,7 +463,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         match overlay_state::claim_run(state_dir) {
             Ok(run) => run,
             Err(e) => {
-                error!("SD-WAN tethers disabled: {e:#}");
+                error!(target: crate::logging::cat::SDWAN, "SD-WAN tethers disabled: {e:#}");
                 for t in &mut overlay.tethers {
                     t.key = None;
                 }
@@ -457,10 +474,10 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         0
     };
     for t in overlay.tethers.iter().filter(|t| t.key.is_none()) {
-        warn!("tether {} has no key: it stays down", t.name);
+        warn!(target: crate::logging::cat::SDWAN, "tether {} has no key: it stays down", t.name);
     }
     if overlay.enabled() && overlay.mtu > DEFAULT_MTU {
-        warn!(
+        warn!(target: crate::logging::cat::SDWAN,
             "overlay MTU {} needs an underlay MTU of at least {} on every WAN path",
             overlay.mtu,
             overlay.mtu as usize + 60
@@ -478,7 +495,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     let overlay = Arc::new(overlay);
     let nat = Arc::new(cfg.nat()?);
     for p in ports.iter() {
-        info!(
+        info!(target: crate::logging::cat::INTERFACE,
             "port {} {} dev {} mac {} addr {}/{}",
             p.id,
             p.name,
@@ -488,13 +505,13 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             p.subnet.len()
         );
     }
-    info!("forwarding table: {} route(s)", fib.routes().len());
+    info!(target: crate::logging::cat::ROUTE, "forwarding table: {} route(s)", fib.routes().len());
 
     // ---- memory: size "auto" session tables, and refuse what can't fit
     // (that falls back to the last config that worked) before allocating.
     let mem = crate::memory::machine();
     let plan = crate::memory::plan(cfg, fib.memory_bytes() as u64, mem.as_ref())?;
-    info!(
+    info!(target: crate::logging::cat::SYSTEM,
         "memory: {} session(s) per worker{}; reserving {} MiB (packet buffers {} MiB, session \
          tables {} MiB, forwarding table {} MiB) of {} MiB available",
         plan.sessions_per_worker,
@@ -506,7 +523,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         plan.available.map_or("?".into(), |a| (a >> 20).to_string()),
     );
     if let Some(w) = &plan.warning {
-        warn!("memory: {w}");
+        warn!(target: crate::logging::cat::SYSTEM, "memory: {w}");
     }
 
     // ---- per-worker UMEM + one socket per card on queue `w`
@@ -551,7 +568,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             maps[c].insert(w as u32, s.fd())?;
             zero_copy[c] |= s.zero_copy;
         }
-        info!(
+        info!(target: crate::logging::cat::DATAPLANE,
             "worker {w}: {frames} frames ({} MiB, huge pages: {}), zero-copy: {}",
             (frames as usize * FRAME_SIZE as usize) >> 20,
             umem.huge_pages,
@@ -579,6 +596,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         pipeline.set_nat(nat.clone());
         pipeline.set_overlay_run(run, replay.clone());
         pipeline.set_endpoints(endpoints.clone());
+        pipeline.set_trace(crate::logging::control().trace_config());
         pool.push(Worker {
             id: w,
             socks,
@@ -599,7 +617,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     for (c, &idx) in ifindexes.iter().enumerate() {
         let link = XdpRedirect::attach(idx, &maps[c], xdp_mode)
             .with_context(|| format!("attaching XDP to {}", cards[c]))?;
-        info!("XDP attached to {} in {:?} mode", cards[c], link.mode);
+        info!(target: crate::logging::cat::DATAPLANE, "XDP attached to {} in {:?} mode", cards[c], link.mode);
         links.push(link);
     }
     // What each interface ended up with is its card's.
@@ -623,7 +641,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
                 .expect("spawning worker")
         })
         .collect();
-    info!("ephemerisd running with {workers} worker(s); Ctrl-C to stop");
+    info!(target: crate::logging::cat::SYSTEM, "ephemerisd running with {workers} worker(s); Ctrl-C to stop");
     Ok(Dataplane {
         workers,
         ports,
@@ -670,7 +688,9 @@ fn path_loop(shared: &Shared, epoch: Instant, replay: &ReplayGuard, state_dir: &
             if peers != saved {
                 match overlay_state::save_peers(state_dir, &peers) {
                     Ok(()) => saved = peers,
-                    Err(e) => warn!("saving overlay peer state: {e:#}"),
+                    Err(e) => {
+                        warn!(target: crate::logging::cat::SDWAN, "saving overlay peer state: {e:#}")
+                    }
                 }
             }
         }
@@ -679,7 +699,7 @@ fn path_loop(shared: &Shared, epoch: Instant, replay: &ReplayGuard, state_dir: &
         *shared.health.write().unwrap() = health.clone();
         if let Some((table, changes)) = sel.decide(&health) {
             for c in changes {
-                info!("SD-WAN path change: {c}");
+                info!(target: crate::logging::cat::SDWAN, "SD-WAN path change: {c}");
             }
             let table = Arc::new(table);
             for tx in shared.control.lock().unwrap().iter() {
@@ -697,7 +717,7 @@ fn lower_priority(nice: i32) {
     unsafe {
         let tid = libc::gettid() as libc::id_t;
         if libc::setpriority(libc::PRIO_PROCESS, tid, nice) != 0 {
-            warn!(
+            warn!(target: crate::logging::cat::SYSTEM,
                 "could not lower thread priority: {}",
                 std::io::Error::last_os_error()
             );
@@ -710,7 +730,7 @@ fn lower_priority(nice: i32) {
 fn print_stats(shared: &Shared, show_sessions: usize) {
     let s = Summary::collect(&shared.reports);
     let drops: Vec<String> = s.drops.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    info!(
+    info!(target: crate::logging::cat::DATAPLANE,
         "rx={} forwarded={} originated={} kernel-drops={} fill-empty={} sessions={} (created {}, expired {}) neighbors={} drops[{}]",
         s.rx,
         s.forwarded,
@@ -730,7 +750,7 @@ fn print_stats(shared: &Shared, show_sessions: usize) {
         .iter()
         .zip(s.tethers.iter().zip(&health))
     {
-        info!(
+        info!(target: crate::logging::cat::DATAPLANE,
             "  tether {:<10} {:<4} rtt {:>6.1} ms  jitter {:>5.1} ms  loss {:>5.1}%  tx {} rx {}",
             t.name,
             if h.up { "up" } else { "DOWN" },
@@ -744,6 +764,6 @@ fn print_stats(shared: &Shared, show_sessions: usize) {
     let mut newest: Vec<_> = s.sessions.iter().collect();
     newest.sort_by_key(|v| std::cmp::Reverse(v.session.created_ns));
     for v in newest.into_iter().take(show_sessions) {
-        info!("  {v}");
+        info!(target: crate::logging::cat::DATAPLANE, "  {v}");
     }
 }

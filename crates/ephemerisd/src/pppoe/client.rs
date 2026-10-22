@@ -12,10 +12,12 @@
 //! send and events come out. Time is in whole seconds; `tick` is called
 //! once a second.
 
+use crate::logging::cat::PPPOE;
 use eph_packet::pppoe::{self, Control, Frame};
 use eph_packet::{eth, Mac};
 use serde::Serialize;
 use std::net::Ipv4Addr;
+use tracing::{debug, info, trace, warn};
 
 /// Configure-Request restart timer and Max-Configure (RFC 1661 4.6).
 const RESTART_SECS: u64 = 3;
@@ -170,6 +172,9 @@ impl Client {
     }
 
     fn enter(&mut self, phase: Phase, now: u64) {
+        if self.phase != phase {
+            debug!(target: PPPOE, iface = %self.cfg.interface, "{:?} -> {phase:?}", self.phase);
+        }
         self.phase = phase;
         self.phase_since = now;
         self.attempts = 0;
@@ -188,15 +193,26 @@ impl Client {
                 // 3 s, doubling to 30 s, for as long as it takes.
                 self.next_tx = now + (RESTART_SECS << self.attempts.min(3)).min(30);
                 self.attempts += 1;
+                debug!(target: PPPOE, iface = %self.cfg.interface, attempt = self.attempts, "PADI (looking for a concentrator)");
+                // Nobody answering discovery is almost always the line, a
+                // missing VLAN tag, or the wrong port: say so once.
+                if self.attempts == 4 {
+                    warn!(target: PPPOE, iface = %self.cfg.interface,
+                        "no concentrator answered 4 PADIs: check the cable/modem, and whether the ISP needs a VLAN (vlan = ...)");
+                }
                 (vec![self.padi()], None)
             }
             Phase::Requesting if now >= self.next_tx => {
                 if self.attempts >= 3 {
+                    warn!(target: PPPOE, iface = %self.cfg.interface,
+                        "{} didn't answer 3 PADRs: back to discovery", eth::fmt_mac(&self.ac));
                     self.enter(Phase::Discovery, now);
                     return self.tick(now);
                 }
                 self.next_tx = now + RESTART_SECS;
                 self.attempts += 1;
+                debug!(target: PPPOE, iface = %self.cfg.interface, attempt = self.attempts,
+                    "PADR to {} ({})", eth::fmt_mac(&self.ac), self.ac_name);
                 (vec![self.padr()], None)
             }
             Phase::Lcp | Phase::Auth | Phase::Ipcp | Phase::Up => self.session_timers(now),
@@ -271,6 +287,8 @@ impl Client {
         }
         // Session traffic: only from our concentrator, in our session.
         if f.session != self.session || f.src != self.ac || self.session == 0 {
+            trace!(target: PPPOE, iface = %self.cfg.interface,
+                "ignored session frame: session {:#06x} from {}", f.session, eth::fmt_mac(&f.src));
             return (vec![], None);
         }
         let Some((proto, data)) = f.ppp() else {
@@ -286,6 +304,8 @@ impl Client {
             pppoe::PROTO_IPV4 => (vec![], None), // data before we're up: ignore
             other => {
                 // Anything else (IPv6CP, CCP...): Protocol-Reject (RFC 1661 5.7).
+                debug!(target: PPPOE, iface = %self.cfg.interface,
+                    "Protocol-Reject for PPP protocol {other:#06x} (not supported)");
                 let mut rej = other.to_be_bytes().to_vec();
                 rej.extend_from_slice(&data);
                 rej.truncate(self.peer_mru as usize - 8);
@@ -328,11 +348,16 @@ impl Client {
         match (self.phase, f.code) {
             (Phase::Discovery, pppoe::PADO) if ours => {
                 if let Some(e) = error_tag(f) {
+                    warn!(target: PPPOE, iface = %self.cfg.interface,
+                        "PADO from {} with an error: {e}", eth::fmt_mac(&f.src));
                     self.last_error = Some(format!("PADO error: {e}"));
                     return (vec![], None);
                 }
                 let svc = f.tag(pppoe::TAG_SERVICE_NAME).unwrap_or_default();
                 if !self.cfg.service.is_empty() && svc != self.cfg.service.as_bytes() {
+                    info!(target: PPPOE, iface = %self.cfg.interface,
+                        "PADO from {} offers service {:?}, not {:?}: ignored",
+                        eth::fmt_mac(&f.src), String::from_utf8_lossy(&svc), self.cfg.service);
                     return (vec![], None); // offers another service
                 }
                 self.ac = f.src;
@@ -340,6 +365,9 @@ impl Client {
                     String::from_utf8_lossy(&f.tag(pppoe::TAG_AC_NAME).unwrap_or_default()).into();
                 self.cookie = f.tag(pppoe::TAG_AC_COOKIE);
                 self.relay = f.tag(pppoe::TAG_RELAY_SESSION_ID);
+                debug!(target: PPPOE, iface = %self.cfg.interface,
+                    "PADO from {} ({}), service {:?}{}", eth::fmt_mac(&f.src), self.ac_name,
+                    String::from_utf8_lossy(&svc), if self.cookie.is_some() { ", with a cookie" } else { "" });
                 self.enter(Phase::Requesting, now);
                 self.tick(now)
             }
@@ -350,6 +378,8 @@ impl Client {
                     return self.down(&format!("the ISP refused the session: {e}"), now);
                 }
                 self.session = f.session;
+                info!(target: PPPOE, iface = %self.cfg.interface,
+                    "session {:#06x} with {} ({}): negotiating the link", f.session, self.ac_name, eth::fmt_mac(&self.ac));
                 self.magic = self.random();
                 self.lcp_opts = vec![
                     (pppoe::LCP_MRU, self.cfg.mtu.to_be_bytes().to_vec()),
@@ -379,6 +409,7 @@ impl Client {
         let Some(c) = Control::parse(data) else {
             return (vec![], None);
         };
+        trace!(target: PPPOE, iface = %self.cfg.interface, "LCP {} id {} in {:?}", pppoe::code_name(c.code), c.id, self.phase);
         let mut out = vec![];
         let mut event = None;
         match c.code {
@@ -576,7 +607,10 @@ impl Client {
             return (vec![], None);
         }
         match c.code {
-            2 => (self.start_ipcp(now), None),
+            2 => {
+                info!(target: PPPOE, iface = %self.cfg.interface, "PAP login accepted for {}", self.cfg.username);
+                (self.start_ipcp(now), None)
+            }
             3 => self.down(&format!("PAP login refused: {}", message(&c.data)), now),
             _ => (vec![], None),
         }
@@ -596,6 +630,7 @@ impl Client {
                 let Some(challenge) = c.data.get(1..1 + n as usize) else {
                     return (vec![], None);
                 };
+                debug!(target: PPPOE, iface = %self.cfg.interface, id = c.id, "CHAP challenge: answering as {}", self.cfg.username);
                 let mut h = Md5::new();
                 h.update([c.id]);
                 h.update(self.cfg.password.as_bytes());
@@ -616,7 +651,10 @@ impl Client {
                     None,
                 )
             }
-            3 if self.phase == Phase::Auth => (self.start_ipcp(now), None),
+            3 if self.phase == Phase::Auth => {
+                info!(target: PPPOE, iface = %self.cfg.interface, "CHAP login accepted for {}", self.cfg.username);
+                (self.start_ipcp(now), None)
+            }
             4 => self.down(
                 &format!("CHAP login refused: {}", String::from_utf8_lossy(&c.data)),
                 now,
@@ -655,6 +693,7 @@ impl Client {
         let Some(c) = Control::parse(data) else {
             return (vec![], None);
         };
+        trace!(target: PPPOE, iface = %self.cfg.interface, "IPCP {} id {} in {:?}", pppoe::code_name(c.code), c.id, self.phase);
         let mut out = vec![];
         if !matches!(self.phase, Phase::Ipcp | Phase::Up) {
             return (out, None);
@@ -761,6 +800,12 @@ impl Client {
     // ------------------------------------------------------------ plumbing
 
     fn down(&mut self, why: &str, now: u64) -> Out {
+        // Once up, the service reports the session going down; failures on
+        // the way up are said here.
+        if self.link.is_none() {
+            warn!(target: PPPOE, iface = %self.cfg.interface, "{why}; dialling again in {}s",
+                (5u64 << self.downs.min(4)).min(RETRY_MAX_SECS));
+        }
         let mut out = vec![];
         if self.session != 0 {
             out.push(self.padt());

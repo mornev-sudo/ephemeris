@@ -10,6 +10,7 @@
 mod config;
 mod dhcp;
 mod files;
+mod logging;
 mod memory;
 mod mgmt;
 mod overlay_state;
@@ -42,12 +43,8 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
     let args = Args::parse();
+    logging::sink::init();
     #[cfg(not(target_os = "linux"))]
     if args.dev_portal {
         return mgmt::dev::serve(&args.config);

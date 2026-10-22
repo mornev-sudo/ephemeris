@@ -16,6 +16,7 @@ pub mod configmgr;
 pub mod dev;
 pub mod diff;
 pub mod history;
+pub mod logapi;
 pub mod nics;
 pub mod paths;
 pub mod sysinfo;
@@ -106,12 +107,26 @@ impl Shared {
             .into();
         let fib = Arc::new(cfg.fib(&ports)?);
         let nat = Arc::new(cfg.nat()?);
+        crate::logging::control().apply_config(&cfg.logging);
         for tx in self.control.lock().unwrap().iter() {
             // A worker that has exited (shutdown) just doesn't get it.
             let _ = tx.send(Control::SetPorts(ports.clone()));
             let _ = tx.send(Control::SetFib(fib.clone()));
             let _ = tx.send(Control::SetNat(nat.clone()));
         }
+        use crate::logging::cat;
+        for (o, n) in old.iter().zip(ports.iter()) {
+            if (o.addr, o.subnet.len()) != (n.addr, n.subnet.len()) {
+                tracing::info!(target: cat::INTERFACE, iface = %n.name,
+                    "{}: address {}/{} (was {}/{})", n.name, n.addr, n.subnet.len(), o.addr, o.subnet.len());
+            }
+            if o.ip_mtu() != n.ip_mtu() || o.mss_adjust != n.mss_adjust {
+                tracing::info!(target: cat::INTERFACE, iface = %n.name,
+                    "{}: MTU {}, MSS adjust {:?}", n.name, n.ip_mtu(), n.mss_adjust);
+            }
+        }
+        let before = self.fib.read().unwrap().routes().len();
+        tracing::debug!(target: cat::ROUTE, "forwarding table rebuilt: {} route(s), was {before}", fib.routes().len());
         *self.ports.write().unwrap() = ports;
         *self.fib.write().unwrap() = fib;
         Ok(())
