@@ -29,6 +29,8 @@ const IDLE_POLL_MS: i32 = 10;
 const REPORT_EVERY: Duration = Duration::from_millis(250);
 /// Session and neighbour lists, while someone looks: at most once a second.
 const DETAIL_EVERY: Duration = Duration::from_secs(1);
+/// "N trace events not logged": at most this often.
+const SUPPRESSED_EVERY: Duration = Duration::from_secs(10);
 
 pub struct Worker {
     pub id: usize,
@@ -85,6 +87,7 @@ impl Worker {
             })
             .collect();
         let mut batch = [XdpDesc::default(); BATCH];
+        let mut last_suppressed = Instant::now();
         // Frames the control plane asked us to send.
         let mut outbox: Vec<(PortId, Vec<u8>)> = Vec::new();
 
@@ -103,6 +106,7 @@ impl Worker {
                     Control::SetPorts(ports) => self.pipeline.set_ports(ports),
                     Control::SetPaths(paths) => self.pipeline.set_paths(paths),
                     Control::SetNat(nat) => self.pipeline.set_nat(nat),
+                    Control::SetTrace(t) => self.pipeline.set_trace(t),
                     Control::Transmit { port, frame } => outbox.push((port, frame)),
                 }
             }
@@ -239,6 +243,26 @@ impl Worker {
                 }
             }
 
+            // ...and packet trace events become log lines (only while a
+            // packet category is at debug; rate-limited by the pipeline).
+            if !self.pipeline.tracer.events.is_empty() {
+                let ports = self.pipeline.ports().clone();
+                for ev in self.pipeline.tracer.events.drain(..) {
+                    crate::logging::dataplane::emit(&ev, &ports, self.id);
+                }
+            }
+            if self.pipeline.tracer.suppressed > 0 && last_suppressed.elapsed() >= SUPPRESSED_EVERY
+            {
+                last_suppressed = Instant::now();
+                let n = std::mem::take(&mut self.pipeline.tracer.suppressed);
+                tracing::info!(
+                    target: "dataplane",
+                    worker = self.id,
+                    "packet trace: {n} event(s) over the limit of {}/s were not logged",
+                    self.pipeline.tracer.cfg.per_sec
+                );
+            }
+
             // 5. Tell sibling workers about neighbours we learned.
             for n in self.pipeline.learned.drain(..) {
                 for tx in &self.siblings {
@@ -356,7 +380,7 @@ fn pin_to_cpu(cpu: usize) {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu, &mut set);
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
-            tracing::warn!(
+            tracing::warn!(target: crate::logging::cat::DATAPLANE,
                 "could not pin worker to CPU {cpu}: {}",
                 std::io::Error::last_os_error()
             );

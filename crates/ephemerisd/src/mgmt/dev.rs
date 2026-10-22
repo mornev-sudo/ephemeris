@@ -15,6 +15,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 pub fn serve(config: &Path) -> anyhow::Result<()> {
     let mgr = ConfigManager::open(config)?.check_nics(super::nics::list);
     let cfg = mgr.running().clone();
+    crate::logging::control().apply_config(&cfg.logging);
     let ports: Arc<[_]> = cfg.ports(|_| Ok([2, 0, 0, 0, 0, 1]))?.into();
     let fib = Arc::new(cfg.fib(&ports)?);
     let overlay = Arc::new(cfg.overlay()?);

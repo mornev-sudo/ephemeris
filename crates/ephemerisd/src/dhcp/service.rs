@@ -30,7 +30,7 @@ use tracing::{info, warn};
 pub fn run(shared: &Shared, punts: Receiver<Punt>, stop: &AtomicBool, state_dir: &Path) {
     let dir = state_dir.join("dhcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!("DHCP: can't create {}: {e}", dir.display());
+        warn!(target: crate::logging::cat::SYSTEM, "DHCP: can't create {}: {e}", dir.display());
     }
     let mut svc = Service {
         shared,
@@ -129,14 +129,14 @@ impl Service<'_> {
         match result {
             Ok(()) => {
                 if st.apply_error.take().is_some() {
-                    info!("DHCP/PPPoE: addresses applied");
+                    info!(target: crate::logging::cat::INTERFACE, "DHCP/PPPoE: addresses applied");
                 }
                 self.retry_apply = None;
             }
             Err(e) => {
                 let e = format!("{e:#}");
                 if st.apply_error.as_deref() != Some(e.as_str()) {
-                    warn!("DHCP/PPPoE: can't apply the new address: {e}");
+                    warn!(target: crate::logging::cat::INTERFACE, "DHCP/PPPoE: can't apply the new address: {e}");
                 }
                 st.apply_error = Some(e);
                 self.retry_apply = Some(now + 10);
@@ -184,7 +184,7 @@ impl Service<'_> {
         let c = &self.clients[&port];
         match &event {
             Event::Bound(l) => {
-                info!(
+                info!(target: crate::logging::cat::DHCP_CLIENT,
                     "DHCP: {} got {}/{} (gateway {}, lease {} s)",
                     c.interface,
                     l.addr,
@@ -194,7 +194,9 @@ impl Service<'_> {
                 );
                 let _ = save_json(&self.dir.join(format!("client-{}.json", c.interface)), l);
             }
-            Event::Lost => warn!("DHCP: {} lost its address", c.interface),
+            Event::Lost => {
+                warn!(target: crate::logging::cat::DHCP_CLIENT, "DHCP: {} lost its address", c.interface)
+            }
         }
         self.publish();
         // Apply the new address / gateway / default route to the data plane.
@@ -209,11 +211,13 @@ impl Service<'_> {
         };
         let d = &self.dialers[&port];
         match &event {
-            ppp::Event::Up(l) => info!(
+            ppp::Event::Up(l) => info!(target: crate::logging::cat::PPPOE,
                 "PPPoE: {} connected to {} (session {:#06x}): {} peer {}, MTU {}",
                 d.cfg.interface, l.ac_name, l.session, l.addr, l.peer, l.mtu
             ),
-            ppp::Event::Down(why) => warn!("PPPoE: {} down: {why}", d.cfg.interface),
+            ppp::Event::Down(why) => {
+                warn!(target: crate::logging::cat::PPPOE, "PPPoE: {} down: {why}", d.cfg.interface)
+            }
         }
         self.publish();
         self.apply(now_unix());
@@ -300,7 +304,7 @@ impl Service<'_> {
             let leases = match self.servers.remove(&port) {
                 Some(old) => old.leases,
                 None => {
-                    info!("DHCP: serving {} on {}", d.range, i.name);
+                    info!(target: crate::logging::cat::DHCP_SERVER, "DHCP: serving {} on {}", d.range, i.name);
                     load_json::<Vec<Lease>>(&self.leases_file(&i.name)).unwrap_or_default()
                 }
             };
@@ -325,7 +329,7 @@ impl Service<'_> {
                         &self.dir.join(format!("client-{}.json", i.name)),
                     )
                     .map(|l| l.addr);
-                    info!("DHCP: requesting an address on {}", i.name);
+                    info!(target: crate::logging::cat::DHCP_CLIENT, "DHCP: requesting an address on {}", i.name);
                     Client::new(i.name.clone(), mac, hostname.clone(), remembered, seed())
                 }
             };
@@ -364,7 +368,7 @@ impl Service<'_> {
                             self.shared.transmit(port, f);
                         }
                     }
-                    info!("PPPoE: dialling on {} as {}", i.name, p.username);
+                    info!(target: crate::logging::cat::PPPOE, "PPPoE: dialling on {} as {}", i.name, p.username);
                     Dialer::new(settings, seed())
                 }
             };
@@ -391,7 +395,7 @@ impl Service<'_> {
     fn save_leases(&self, port: PortId) {
         if let Some(s) = self.servers.get(&port) {
             if let Err(e) = save_json(&self.leases_file(&s.cfg.interface), &s.leases) {
-                warn!("DHCP: saving leases for {}: {e}", s.cfg.interface);
+                warn!(target: crate::logging::cat::DHCP_SERVER, "DHCP: saving leases for {}: {e}", s.cfg.interface);
             }
         }
     }

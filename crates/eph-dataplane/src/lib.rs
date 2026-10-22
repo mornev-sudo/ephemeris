@@ -18,6 +18,7 @@ pub mod overlay;
 mod pipeline;
 pub mod session;
 mod stats;
+pub mod trace;
 
 pub use config::{build_fib, Dhcp, NextHop, OverlayRoute, Port, PortId, Pppoe, Role, StaticRoute};
 pub use pipeline::{Emit, Neighbor, Pipeline, Punt, Verdict, NEIGHBOR_MAX};

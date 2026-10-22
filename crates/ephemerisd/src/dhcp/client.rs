@@ -4,10 +4,12 @@
 //! the frames it returns, and acts on its events (apply the new address and
 //! default gateway, or take them away).
 
+use crate::logging::cat::DHCP_CLIENT;
 use eph_packet::dhcp::{self, Message, Received};
 use eph_packet::{eth, Mac};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
+use tracing::{debug, info, trace, warn};
 
 /// Give up on an offer (and start over) after this many unanswered REQUESTs.
 const MAX_REQUESTS: u32 = 4;
@@ -130,18 +132,26 @@ impl Client {
                 self.new_xid();
                 self.phase = Phase::Selecting;
                 self.schedule(now);
+                debug!(target: DHCP_CLIENT, iface = %self.interface, xid = %format!("{:08x}", self.xid),
+                    "DISCOVER (broadcast){}", self.remembered.map(|a| format!(", asking for {a} again")).unwrap_or_default());
                 (Some(self.discover()), None)
             }
             Phase::Selecting if now >= self.next_tx => {
                 self.schedule(now);
+                debug!(target: DHCP_CLIENT, iface = %self.interface, attempt = self.attempts,
+                    "no OFFER yet: DISCOVER again");
                 (Some(self.discover()), None)
             }
             Phase::Requesting if now >= self.next_tx => {
                 if self.attempts >= MAX_REQUESTS {
+                    warn!(target: DHCP_CLIENT, iface = %self.interface,
+                        "no ACK after {MAX_REQUESTS} REQUESTs: starting over");
                     self.phase = Phase::Init;
                     return self.tick(now);
                 }
                 self.schedule(now);
+                debug!(target: DHCP_CLIENT, iface = %self.interface, attempt = self.attempts,
+                    "no answer yet: REQUEST again");
                 (Some(self.request_offer()), None)
             }
             Phase::Bound | Phase::Renewing | Phase::Rebinding => self.lease_timers(now),
@@ -157,6 +167,8 @@ impl Client {
         let age = now.saturating_sub(l.obtained_unix);
         if age >= l.lease_secs as u64 {
             // Expired without a renewal: the address must not be used.
+            warn!(target: DHCP_CLIENT, iface = %self.interface,
+                "lease for {} ran out: no server answered the renewals", l.addr);
             self.lease = None;
             self.phase = Phase::Init;
             return (None, Some(Event::Lost));
@@ -169,6 +181,14 @@ impl Client {
             return (None, None);
         };
         if self.phase != phase {
+            if phase == Phase::Renewing {
+                info!(target: DHCP_CLIENT, iface = %self.interface,
+                    "renewing {} with {} (half the lease has passed)", l.addr, l.server);
+            } else {
+                warn!(target: DHCP_CLIENT, iface = %self.interface,
+                    "server {} didn't renew {}: asking any server (rebinding), {}s of lease left",
+                    l.server, l.addr, (l.lease_secs as u64).saturating_sub(age));
+            }
             self.phase = phase;
             self.new_xid();
             self.next_tx = 0;
@@ -187,13 +207,21 @@ impl Client {
     pub fn handle(&mut self, rx: &Received, now: u64) -> (Option<Vec<u8>>, Option<Event>) {
         let m = &rx.msg;
         if m.op != dhcp::OP_REPLY || m.xid != self.xid || m.chaddr != self.mac {
+            trace!(target: DHCP_CLIENT, iface = %self.interface, xid = %format!("{:08x}", m.xid),
+                "ignored a reply that isn't for our transaction");
             return (None, None);
         }
+        debug!(target: DHCP_CLIENT, iface = %self.interface, from = %eph_packet::eth::fmt_mac(&rx.src_mac),
+            "{} for {} while {:?}", dhcp::type_name(m.msg_type()), m.yiaddr, self.phase);
         match (self.phase, m.msg_type()) {
             (Phase::Selecting, Some(dhcp::OFFER)) => {
                 let Some(offer) = lease_from(m, rx.src_mac, now) else {
+                    warn!(target: DHCP_CLIENT, iface = %self.interface,
+                        "unusable OFFER of {} (no lease time, bad mask or server id): ignored", m.yiaddr);
                     return (None, None);
                 };
+                debug!(target: DHCP_CLIENT, iface = %self.interface,
+                    "OFFER from {}: {}/{} for {}s: REQUEST it", offer.server, offer.addr, offer.prefix_len, offer.lease_secs);
                 self.offer = Some(offer);
                 self.phase = Phase::Requesting;
                 self.attempts = 0;
@@ -202,6 +230,8 @@ impl Client {
             }
             (Phase::Requesting | Phase::Renewing | Phase::Rebinding, Some(dhcp::ACK)) => {
                 let Some(mut new) = lease_from(m, rx.src_mac, now) else {
+                    warn!(target: DHCP_CLIENT, iface = %self.interface,
+                        "unusable ACK for {}: ignored", m.yiaddr);
                     return (None, None);
                 };
                 // An ACK may omit the server id when renewing.
@@ -217,10 +247,17 @@ impl Client {
                 self.lease = Some(new.clone());
                 self.offer = None;
                 self.remembered = Some(new.addr);
+                if !changed {
+                    debug!(target: DHCP_CLIENT, iface = %self.interface,
+                        "{} renewed for {}s, nothing changed", new.addr, new.lease_secs);
+                }
                 self.phase = Phase::Bound;
                 (None, changed.then_some(Event::Bound(new)))
             }
             (Phase::Requesting | Phase::Renewing | Phase::Rebinding, Some(dhcp::NAK)) => {
+                warn!(target: DHCP_CLIENT, iface = %self.interface,
+                    "server refused the address (NAK){}: starting over",
+                    m.text(dhcp::OPT_MESSAGE).map(|t| format!(": {t:?}")).unwrap_or_default());
                 let had = self.lease.take().is_some();
                 self.offer = None;
                 self.remembered = None;

@@ -26,6 +26,22 @@ pub const NAK: u8 = 6;
 pub const RELEASE: u8 = 7;
 pub const INFORM: u8 = 8;
 
+/// A message type's name, for logs: "DISCOVER", "ACK"...
+pub fn type_name(t: Option<u8>) -> &'static str {
+    match t {
+        Some(DISCOVER) => "DISCOVER",
+        Some(OFFER) => "OFFER",
+        Some(REQUEST) => "REQUEST",
+        Some(DECLINE) => "DECLINE",
+        Some(ACK) => "ACK",
+        Some(NAK) => "NAK",
+        Some(RELEASE) => "RELEASE",
+        Some(INFORM) => "INFORM",
+        Some(_) => "unknown type",
+        None => "BOOTP (no type)",
+    }
+}
+
 // Options (RFC 2132).
 pub const OPT_SUBNET_MASK: u8 = 1;
 pub const OPT_ROUTER: u8 = 3;
@@ -36,6 +52,8 @@ pub const OPT_REQUESTED_IP: u8 = 50;
 pub const OPT_LEASE_TIME: u8 = 51;
 pub const OPT_MSG_TYPE: u8 = 53;
 pub const OPT_SERVER_ID: u8 = 54;
+/// A text message, e.g. why a server sent a NAK.
+pub const OPT_MESSAGE: u8 = 56;
 pub const OPT_PARAM_LIST: u8 = 55;
 pub const OPT_RENEWAL_TIME: u8 = 58;
 pub const OPT_REBINDING_TIME: u8 = 59;

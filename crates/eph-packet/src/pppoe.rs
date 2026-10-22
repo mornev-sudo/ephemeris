@@ -54,6 +54,24 @@ pub const ECHO_REQ: u8 = 9;
 pub const ECHO_REPLY: u8 = 10;
 pub const DISCARD_REQ: u8 = 11;
 
+/// An LCP/IPCP code's name, for logs.
+pub fn code_name(code: u8) -> &'static str {
+    match code {
+        CONF_REQ => "Configure-Request",
+        CONF_ACK => "Configure-Ack",
+        CONF_NAK => "Configure-Nak",
+        CONF_REJ => "Configure-Reject",
+        TERM_REQ => "Terminate-Request",
+        TERM_ACK => "Terminate-Ack",
+        CODE_REJ => "Code-Reject",
+        PROTO_REJ => "Protocol-Reject",
+        ECHO_REQ => "Echo-Request",
+        ECHO_REPLY => "Echo-Reply",
+        DISCARD_REQ => "Discard-Request",
+        _ => "unknown code",
+    }
+}
+
 // LCP options.
 pub const LCP_MRU: u8 = 1;
 pub const LCP_AUTH: u8 = 3;

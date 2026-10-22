@@ -19,6 +19,11 @@ ProtectSystem=strict
 # The sandbox makes the whole file system read-only for ephemerisd, except its
 # own state: config + history, API token, admin password, sessions.
 ReadWritePaths=/var/lib/ephemeris
+# /var/log/ephemeris: debug.log and audit.log, each capped by ephemerisd
+# itself (logging.debug_file_mb / audit_file_mb). systemd creates it and
+# makes it writable inside the sandbox.
+LogsDirectory=ephemeris
+LogsDirectoryMode=0700
 ProtectHome=yes
 PrivateTmp=yes
 # Everything ephemerisd creates is private (configs can hold tether keys).

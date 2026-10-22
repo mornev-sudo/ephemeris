@@ -57,6 +57,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Logs: recent lines, the audit trail, and log levels per category.
+    Log {
+        #[command(subcommand)]
+        cmd: LogCmd,
+    },
     /// Restart ephemerisd (needed after interface or worker changes).
     Restart,
     /// OS image version and A/B updates.
@@ -89,6 +94,48 @@ enum SystemCmd {
         /// Works because ephctl, run as root on the router, uses the API token.
         #[arg(long)]
         reset: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCmd {
+    /// Recent log lines (from memory: since ephemerisd started, at most
+    /// the last 5000). Older ones: debug.log, or journalctl -u ephemerisd.
+    Show {
+        /// Only this category (see `ephctl log levels`).
+        #[arg(short, long)]
+        category: Option<String>,
+        /// Only this level and more severe: error, warn, info, debug, trace.
+        #[arg(short, long)]
+        level: Option<String>,
+        /// How many lines.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+        /// Keep printing new lines as they come (Ctrl-C to stop).
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Every category, its level, and for how long a raised one lasts.
+    Levels,
+    /// Set a category's level: ephctl log set dhcp-client debug [--for 30m].
+    /// Debug and trace switch themselves off (default 10 minutes; --for
+    /// forever to keep them). Packet categories at debug trace packets in
+    /// the data plane: narrow it with `ephctl log host`.
+    Set {
+        category: String,
+        level: String,
+        /// How long: 90s, 30m, 2h, forever.
+        #[arg(long = "for")]
+        for_: Option<String>,
+    },
+    /// Trace only packets to or from this address or prefix ("off": all).
+    Host { host: String },
+    /// Every category back to its configured level; no host filter.
+    Reset,
+    /// The audit trail: logins, changes, restarts (audit.log).
+    Audit {
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
     },
 }
 
@@ -655,10 +702,155 @@ fn run(cli: Cli) -> Result<()> {
             report_commit(&v, json);
         }
         Cmd::Config { cmd } => config(&c, cmd, json)?,
+        Cmd::Log { cmd } => log(&c, cmd, json)?,
         Cmd::System { cmd } => system(&c, cmd, json)?,
         Cmd::Restart => {
             let v = c.call("POST", "/restart", None)?;
             println!("{}", v["note"].as_str().unwrap_or("restarting"));
+        }
+    }
+    Ok(())
+}
+
+fn log(c: &Client, cmd: LogCmd, json: bool) -> Result<()> {
+    let print = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap());
+    match cmd {
+        LogCmd::Show {
+            category,
+            level,
+            lines,
+            follow,
+        } => {
+            let query = |after: u64, limit: usize| {
+                let mut q = format!("/logs?after={after}&limit={limit}");
+                if let Some(c) = &category {
+                    q += &format!("&category={c}");
+                }
+                if let Some(l) = &level {
+                    q += &format!("&level={l}");
+                }
+                q
+            };
+            let mut after = 0;
+            let mut limit = lines;
+            loop {
+                let v = c.get(&query(after, limit))?;
+                for r in v.as_array().into_iter().flatten() {
+                    if json {
+                        println!("{r}");
+                    } else {
+                        println!(
+                            "{} {:<5} {:<11} {}",
+                            str(&r["time"]),
+                            str(&r["level"]).to_uppercase(),
+                            str(&r["category"]),
+                            str(&r["message"])
+                        );
+                    }
+                    after = after.max(r["seq"].as_u64().unwrap_or(0));
+                }
+                if !follow {
+                    break;
+                }
+                std::io::stdout().flush()?;
+                limit = 5000;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        LogCmd::Levels => {
+            let v = c.get("/logging")?;
+            if json {
+                print(&v);
+                return Ok(());
+            }
+            table(
+                &["CATEGORY", "GROUP", "LEVEL", "CONFIGURED", "FOR", "COVERS"],
+                rows(&v["categories"], |k| {
+                    let level = str(&k["level"]);
+                    vec![
+                        str(&k["name"]),
+                        str(&k["group"]),
+                        if k["packets"] == true && matches!(level.as_str(), "debug" | "trace") {
+                            format!("{level} (tracing packets)")
+                        } else {
+                            level
+                        },
+                        str(&k["configured"]),
+                        match (k["overridden"].as_bool(), k["expires_in_secs"].as_u64()) {
+                            (Some(true), Some(s)) => dur(s),
+                            (Some(true), None) => "until reset".into(),
+                            _ => "".into(),
+                        },
+                        str(&k["about"]),
+                    ]
+                }),
+            );
+            if let Some(h) = v["host"].as_str() {
+                println!("\nPacket tracing only for {h}");
+            }
+            let f = &v["files"];
+            println!(
+                "\nFiles in {}: debug.log {} of {}, audit.log {} of {}",
+                str(&f["dir"]),
+                bytes(&f["debug"]["bytes"]),
+                bytes(&f["debug"]["limit"]),
+                bytes(&f["audit"]["bytes"]),
+                bytes(&f["audit"]["limit"]),
+            );
+            if let Some(e) = f["error"].as_str() {
+                println!("!! log files: {e}");
+            }
+            if v["dropped"].as_u64().unwrap_or(0) > 0 {
+                println!(
+                    "!! {} log line(s) dropped (logging fell behind)",
+                    v["dropped"]
+                );
+            }
+        }
+        LogCmd::Set {
+            category,
+            level,
+            for_,
+        } => {
+            let mut body = serde_json::json!({ "category": category, "level": level });
+            if let Some(f) = for_ {
+                body["for"] = f.into();
+            }
+            let v = c.call(
+                "PUT",
+                "/logging",
+                Some(("application/json", &body.to_string())),
+            )?;
+            if json {
+                print(&v);
+            } else {
+                match v["expires_in_secs"].as_u64() {
+                    Some(s) => println!("{category}: {} for {}", str(&v["level"]), dur_exact(s)),
+                    None => println!("{category}: {} until `ephctl log reset`", str(&v["level"])),
+                }
+            }
+        }
+        LogCmd::Host { host } => {
+            let body = serde_json::json!({ "host": host });
+            let v = c.call(
+                "PUT",
+                "/logging/host",
+                Some(("application/json", &body.to_string())),
+            )?;
+            match v["host"].as_str() {
+                Some(h) => println!("packet tracing only for {h}"),
+                None => println!("packet tracing for all hosts"),
+            }
+        }
+        LogCmd::Reset => {
+            c.call("DELETE", "/logging", None)?;
+            println!("log levels back to the configuration");
+        }
+        LogCmd::Audit { lines } => {
+            let v = c.get(&format!("/logs/audit?limit={lines}"))?;
+            for l in v.as_array().into_iter().flatten() {
+                println!("{}", str(l));
+            }
         }
     }
     Ok(())
@@ -1072,6 +1264,20 @@ fn dur(s: u64) -> String {
         3600..=86399 => format!("{}h{}m", s / 3600, s % 3600 / 60),
         _ => format!("{}d", s / 86400),
     }
+}
+
+/// 90 -> "1m30s": exact, for what was just set.
+fn dur_exact(s: u64) -> String {
+    let mut out = String::new();
+    for (v, unit) in [(s / 3600, "h"), (s % 3600 / 60, "m"), (s % 60, "s")] {
+        if v > 0 {
+            out += &format!("{v}{unit}");
+        }
+    }
+    if out.is_empty() {
+        out = "0s".into();
+    }
+    out
 }
 
 fn bytes(v: &Value) -> String {

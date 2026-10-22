@@ -8,6 +8,7 @@ use crate::session::{
     Dir, FlowKey, NatBinding, SessionConfig, SessionTable, TcpSegment, Track, OVERLAY_INGRESS,
 };
 use crate::stats::{DropReason, Stats};
+use crate::trace::{self, TraceCat, TraceConfig, TraceFlow, TraceKind, Tracer};
 use eph_fib::Fib;
 use eph_packet::{arp, checksum, eth, icmp, ipv4, l4, pppoe, Mac};
 use rustc_hash::FxSeededState;
@@ -151,6 +152,9 @@ pub struct Pipeline {
     pub learned: Vec<Neighbor>,
     /// Packets for the control plane (DHCP); the worker forwards these.
     pub punts: Vec<Punt>,
+    /// Packet tracing (debug logging), off unless asked for; the worker
+    /// drains `tracer.events`.
+    pub tracer: Tracer,
 }
 
 impl Pipeline {
@@ -199,6 +203,24 @@ impl Pipeline {
             emits: Vec::with_capacity(64),
             learned: Vec::with_capacity(16),
             punts: Vec::new(),
+            tracer: Tracer::default(),
+        }
+    }
+
+    /// What to trace (see [`trace`]).
+    pub fn set_trace(&mut self, cfg: TraceConfig) {
+        self.tracer.set(cfg);
+    }
+
+    /// Trace a drop, if its category is on.
+    #[inline]
+    fn trace_drop(&mut self, r: DropReason, port: PortId, frame: &[u8]) {
+        if let Some(cat) = TraceCat::of_drop(r) {
+            if self.tracer.on(cat) {
+                let flow = trace::flow_of_frame(frame);
+                self.tracer
+                    .record(self.now_ns, cat, TraceKind::Drop(r), port, flow);
+            }
         }
     }
 
@@ -381,9 +403,18 @@ impl Pipeline {
         let v = match self.ingress(card, frame, off, len) {
             Ok((ingress, off, len)) => {
                 let v = self.classify(ingress, frame, off, len);
+                if let (Verdict::Drop(r), true) = (v, self.tracer.cfg.mask != 0) {
+                    self.trace_drop(r, ingress, &frame[off..off + len]);
+                }
                 self.wrap_for_link(frame, v)
             }
-            Err(r) => Verdict::Drop(r),
+            Err(r) => {
+                if self.tracer.cfg.mask != 0 && off + len <= frame.len() {
+                    // No interface yet: reported against the card.
+                    self.trace_drop(r, PortId::MAX - card, &frame[off..off + len]);
+                }
+                Verdict::Drop(r)
+            }
         };
         if let Verdict::Drop(r) = v {
             self.stats.drop(r);
@@ -681,9 +712,24 @@ impl Pipeline {
     fn insert_neighbor(&mut self, n: Neighbor, answer: bool) {
         let k = (n.port, n.ip);
         let now = self.now_ns;
-        let shared_ns = match self.neighbors.get(&k).copied() {
+        let prev = self.neighbors.get(&k).copied();
+        let shared_ns = match prev {
             Some(e) if e.mac != n.mac && !answer => {
                 self.stats.arp_conflicts += 1;
+                let flow = TraceFlow {
+                    src: n.ip,
+                    ..TraceFlow::default()
+                };
+                self.tracer.record(
+                    now,
+                    TraceCat::Arp,
+                    TraceKind::ArpConflict {
+                        claimed: n.mac,
+                        known: e.mac,
+                    },
+                    n.port,
+                    flow,
+                );
                 self.resolve(n.port, n.ip);
                 return;
             }
@@ -692,6 +738,23 @@ impl Pipeline {
             None if !self.neighbor_room() => return,
             None => 0,
         };
+        if prev.is_none_or(|e| e.mac != n.mac) {
+            let flow = TraceFlow {
+                src: n.ip,
+                ..TraceFlow::default()
+            };
+            let changed = prev.is_some();
+            self.tracer.record(
+                now,
+                TraceCat::Arp,
+                TraceKind::ArpLearned {
+                    mac: n.mac,
+                    changed,
+                },
+                n.port,
+                flow,
+            );
+        }
         let share = now.saturating_sub(shared_ns) >= NEIGHBOR_SHARE_NS || shared_ns == 0;
         self.neighbors.insert(
             k,
@@ -726,6 +789,12 @@ impl Pipeline {
             }
         }
         self.arp_pending.insert((port, ip), now);
+        let flow = TraceFlow {
+            dst: ip,
+            ..TraceFlow::default()
+        };
+        self.tracer
+            .record(now, TraceCat::Arp, TraceKind::ArpRequest, port, flow);
         let p = &self.ports[port as usize];
         let mut e = Emit {
             port,
@@ -1003,6 +1072,34 @@ impl Pipeline {
                 };
                 if let Some(seg) = tcp {
                     self.sessions.observe_tcp(idx, Dir::Forward, &seg);
+                }
+                if self.tracer.on(TraceCat::Session) || self.tracer.on(TraceCat::Nat) {
+                    let (sport, dport) = if lo_to_hi {
+                        (key.lo_port, key.hi_port)
+                    } else {
+                        (key.hi_port, key.lo_port)
+                    };
+                    let flow = TraceFlow {
+                        proto: key.proto,
+                        src: h.src,
+                        dst: h.dst,
+                        sport,
+                        dport,
+                    };
+                    self.tracer.record(
+                        now,
+                        TraceCat::Session,
+                        TraceKind::SessionNew,
+                        ingress,
+                        flow,
+                    );
+                    if let Some(b) = binding {
+                        let kind = TraceKind::NatBound {
+                            addr: b.addr,
+                            port: b.port,
+                        };
+                        self.tracer.record(now, TraceCat::Nat, kind, ingress, flow);
+                    }
                 }
                 if let Some(b) = binding {
                     self.sessions.bind_nat(idx, b);
@@ -1300,8 +1397,27 @@ impl Pipeline {
         // (rate limit, ARP miss), which bumps a second counter.
         if !self.take_icmp_token() {
             self.stats.drop(DropReason::IcmpRateLimited);
+            if self.tracer.on(TraceCat::Icmp) {
+                let flow = trace::flow_of_frame(&frame[off..off + ETH + h.total_len]);
+                let kind = TraceKind::Drop(DropReason::IcmpRateLimited);
+                self.tracer
+                    .record(self.now_ns, TraceCat::Icmp, kind, ingress, flow);
+            }
             return Verdict::Drop(reason);
         }
+        // The packet is dropped (traced under its reason's category), and
+        // an ICMP error goes back instead (traced under icmp).
+        if self.tracer.cfg.mask != 0 {
+            let flow = trace::flow_of_frame(&frame[off..off + ETH + h.total_len]);
+            if let Some(cat) = TraceCat::of_drop(reason) {
+                self.tracer
+                    .record(self.now_ns, cat, TraceKind::Drop(reason), ingress, flow);
+            }
+            let kind = TraceKind::IcmpSent { kind: typ, code };
+            self.tracer
+                .record(self.now_ns, TraceCat::Icmp, kind, ingress, flow);
+        }
+        let buf = &mut frame[off..];
         let quote_dst = ETH + ipv4::MIN_HDR_LEN + icmp::HDR_LEN;
         buf.copy_within(ETH..ETH + quote, quote_dst);
         icmp::write_error(

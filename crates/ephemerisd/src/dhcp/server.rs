@@ -3,11 +3,13 @@
 //! Pure logic: a received message in, a frame to send out. The caller
 //! supplies the time and persists the leases, so this is fully testable.
 
+use crate::logging::cat::DHCP_SERVER;
 use eph_fib::Prefix;
 use eph_packet::dhcp::{self, Message, Received};
 use eph_packet::{eth, Mac};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
+use tracing::{debug, info, warn};
 
 /// How long an offered address is held for the client that was offered it.
 const OFFER_HOLD_SECS: u64 = 60;
@@ -77,16 +79,28 @@ impl Server {
     /// and whether the lease table changed (so it should be saved).
     pub fn handle(&mut self, rx: &Received, now: u64) -> (Option<Vec<u8>>, bool) {
         let m = &rx.msg;
+        let iface = self.cfg.interface.clone();
+        let iface = iface.as_str();
+        let mac = eth::fmt_mac(&m.chaddr);
         // Relayed requests (giaddr) are for other subnets: not supported.
         if m.op != dhcp::OP_REQUEST || !m.giaddr.is_unspecified() {
+            debug!(target: DHCP_SERVER, iface, mac, "ignored: {}",
+                if m.op != dhcp::OP_REQUEST { "not a request" } else { "relayed (giaddr): relays aren't supported" });
             return (None, false);
         }
+        debug!(target: DHCP_SERVER, iface, mac, hostname = m.text(dhcp::OPT_HOSTNAME).unwrap_or_default(),
+            "{} (ciaddr {}, requested {})", dhcp::type_name(m.msg_type()), m.ciaddr,
+            m.ip(dhcp::OPT_REQUESTED_IP).map_or("-".into(), |i| i.to_string()));
         self.expire(now);
         match m.msg_type() {
             Some(dhcp::DISCOVER) => {
                 let Some(ip) = self.choose(m) else {
-                    return (None, false); // pool exhausted: stay silent
+                    // Stay silent: another server may have room.
+                    warn!(target: DHCP_SERVER, iface, mac,
+                        "no free address in {}-{} for {mac}: not answering", self.cfg.range.0, self.cfg.range.1);
+                    return (None, false);
                 };
+                debug!(target: DHCP_SERVER, iface, mac, "OFFER {ip} (held {OFFER_HOLD_SECS}s)");
                 self.record(m, ip, LeaseState::Offered, now + OFFER_HOLD_SECS);
                 (Some(self.reply(m, dhcp::OFFER, ip)), true)
             }
@@ -95,12 +109,17 @@ impl Server {
                 let before = self.leases.len();
                 self.leases
                     .retain(|l| !(l.mac == m.chaddr && l.ip == m.ciaddr));
+                info!(target: DHCP_SERVER, iface, mac, "{mac} released {}", m.ciaddr);
                 (None, self.leases.len() != before)
             }
             Some(dhcp::DECLINE) => {
                 let Some(ip) = m.ip(dhcp::OPT_REQUESTED_IP) else {
                     return (None, false);
                 };
+                // The client found the address in use (it ARPed for it):
+                // a host with a static address inside the pool.
+                warn!(target: DHCP_SERVER, iface, mac,
+                    "{mac} declined {ip}: something else on the link uses it; not offering it for {DECLINE_HOLD_SECS}s");
                 self.leases.retain(|l| l.ip != ip);
                 self.leases.push(Lease {
                     mac: [0; 6],
@@ -112,6 +131,7 @@ impl Server {
                 (None, true)
             }
             Some(dhcp::INFORM) if !m.ciaddr.is_unspecified() => {
+                debug!(target: DHCP_SERVER, iface, mac, "ACK (settings only) to {}", m.ciaddr);
                 // Configuration only, no address (RFC 2131 4.3.5).
                 (Some(self.reply(m, dhcp::ACK, Ipv4Addr::UNSPECIFIED)), false)
             }
@@ -127,6 +147,8 @@ impl Server {
             (Some(sid), Some(ip)) => {
                 if sid != self.cfg.addr {
                     // The client chose someone else: free our offer.
+                    warn!(target: DHCP_SERVER, iface = %self.cfg.interface, mac = %eth::fmt_mac(&m.chaddr),
+                        "{} took an offer from another DHCP server ({sid}) on this link", eth::fmt_mac(&m.chaddr));
                     let before = self.leases.len();
                     self.leases
                         .retain(|l| !(l.mac == m.chaddr && l.state == LeaseState::Offered));
@@ -140,10 +162,26 @@ impl Server {
             (None, None) if !m.ciaddr.is_unspecified() => m.ciaddr,
             _ => return (None, false),
         };
+        let mac = eth::fmt_mac(&m.chaddr);
+        let iface = self.cfg.interface.clone();
+        let iface = iface.as_str();
         if self.acceptable(m.chaddr, ip) {
+            let renewal = self
+                .leases
+                .iter()
+                .any(|l| l.mac == m.chaddr && l.ip == ip && l.state == LeaseState::Bound);
+            let host = m.text(dhcp::OPT_HOSTNAME);
+            if renewal {
+                debug!(target: DHCP_SERVER, iface, mac, "ACK {ip}: renewed for {}s", self.cfg.lease_secs);
+            } else {
+                info!(target: DHCP_SERVER, iface, mac, "{ip} leased to {mac}{} for {}s",
+                    host.map(|h| format!(" ({h})")).unwrap_or_default(), self.cfg.lease_secs);
+            }
             self.record(m, ip, LeaseState::Bound, now + self.cfg.lease_secs as u64);
             (Some(self.reply(m, dhcp::ACK, ip)), true)
         } else {
+            info!(target: DHCP_SERVER, iface, mac,
+                "NAK: {mac} asked for {ip}, which {}", if self.in_pool(ip) { "belongs to another client" } else { "isn't ours to give" });
             // We're the only server on this link: say no, so the client
             // starts over instead of keeping a wrong address.
             (Some(self.reply(m, dhcp::NAK, Ipv4Addr::UNSPECIFIED)), false)

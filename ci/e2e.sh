@@ -234,6 +234,25 @@ check "resources: worker threads measured" sh -c "${SSH[*]} ephctl --json system
 check "live route add"                     sh -c "${SSH[*]} ephctl route add 0.0.0.0/0 10.10.2.10 && ! ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'net unreachable'"
 check "live route delete"                  sh -c "${SSH[*]} ephctl route del 0.0.0.0/0 && ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'From 10.10.1.1 .*net unreachable'"
 
+# ------------------------------------------------------------ logging
+# Categories, levels changed at run time, the files under /var/log/ephemeris
+# (created by systemd, private, capped), structured journal entries, and a
+# packet trace limited to one host.
+echo "Logging:"
+check "log directory private"              sh -c "[ \"\$(${SSH[*]} stat -c %a /var/log/ephemeris)\" = 700 ]"
+check "audit.log has the web login"         on_router "grep -q 'audit .*web login: admin' /var/log/ephemeris/audit.log"
+check "journal entries carry the category"  on_router "journalctl -u ephemerisd TARGET=audit --no-pager | grep -q 'web login'"
+check "debug for a while"                   sh -c "${SSH[*]} ephctl log set route debug --for 2m | grep -q 'debug for 2m'"
+check "levels show it, with its timer"      sh -c "${SSH[*]} ephctl log levels | grep '^route' | grep -q 'tracing packets.*[12]m'"
+on_router ephctl log host 10.10.1.10 >/dev/null
+ip netns exec ci-ha ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 || true
+check "packet trace: why it was dropped"    wait_for 10 "a route trace line" on_router "ephctl log show -c route | grep -q 'drop no-route: icmp 10.10.1.10 -> 8.8.8.8'"
+check "packet trace in debug.log"           wait_for 10 "debug.log" on_router "grep -q 'DEBUG route .*drop no-route' /var/log/ephemeris/debug.log"
+check "debug isn't in the journal"          sh -c "! ${SSH[*]} journalctl -u ephemerisd --no-pager | grep -q 'drop no-route'"
+check "the change is audited"               on_router "ephctl log audit | grep -q 'log category route set to debug for 2m'"
+check "reset"                               sh -c "${SSH[*]} ephctl log reset && ${SSH[*]} ephctl log levels | grep '^route' | grep -qv tracing"
+check "journal kept 90 days at most"        on_router "systemd-analyze cat-config systemd/journald.conf | grep -q '^MaxRetentionSec=90day'"
+
 # A config the data plane can't start with (a card that doesn't exist,
 # written behind the API's back): the router must go back to the last one
 # that worked by itself, keep management up, and say what happened.
