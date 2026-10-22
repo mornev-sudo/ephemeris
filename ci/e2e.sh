@@ -287,7 +287,9 @@ ip -n ci-ha route del 10.10.2.0/24 via 10.10.10.1 dev eth0.10
 ip -n ci-ha link add link eth0 name eth0.20 type vlan id 20
 ip -n ci-ha addr add 10.10.20.10/24 dev eth0.20
 ip -n ci-ha link set eth0.20 up
-check "a VLAN not configured is dropped"   sh -c "! ip netns exec ci-ha ping -c2 -i0.2 -W1 10.10.20.1 && curl -skf -b '$WORK/cookies' $WEB/api/v1/status | grep -q '\"vlan\":[1-9]'"
+# (Counted on the router with ephctl: the restart above ended the
+# portal's login session.)
+check "a VLAN not configured is dropped"   sh -c "! ip netns exec ci-ha ping -c2 -i0.2 -W1 10.10.20.1 && ${SSH[*]} ephctl --json status | grep -q '\"vlan\": [1-9]'"
 ip -n ci-ha link del eth0.20
 ip -n ci-ha link del eth0.10
 check "remove it again (restart)"          on_router "ephctl config rollback 1 && ephctl restart"
