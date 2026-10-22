@@ -333,6 +333,8 @@ mod tests {
     fn port(id: u16, addr: &str, role: Role) -> Port {
         Port {
             id,
+            card: id,
+            vlan: None,
             name: format!("p{id}"),
             mac: [2, 0, 0, 0, 0, id as u8],
             addr: addr.parse().unwrap(),

@@ -795,6 +795,7 @@ address = "10.10.2.1/24"
             cfg.interfaces.push(crate::config::InterfaceCfg {
                 name: "lan-c".into(),
                 device: device.into(),
+                vlan: None,
                 address: "10.10.3.1/24".into(),
                 role: Default::default(),
                 allow_new_sessions: None,

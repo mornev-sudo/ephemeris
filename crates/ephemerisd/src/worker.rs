@@ -1,4 +1,6 @@
-//! A data-plane worker: one thread, one CPU core, one RX queue per interface.
+//! A data-plane worker: one thread, one CPU core, one RX queue per network
+//! card. (VLAN interfaces share their card's queue; the pipeline tells them
+//! apart by their tag.)
 //!
 //! The loop is "run to completion": each packet is received, fully processed
 //! and queued for transmission by the same thread, in batches of up to
@@ -9,6 +11,7 @@ use crate::report::{
     unix_ms, Control, DetailWanted, KernelStats, Report, SessionView, SESSION_DETAIL,
 };
 use eph_dataplane::{DropReason, Pipeline, PortId, Punt, Verdict};
+use eph_packet::eth;
 use eph_xdp::{Umem, XdpDesc, Xsk};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
@@ -30,6 +33,9 @@ const DETAIL_EVERY: Duration = Duration::from_secs(1);
 pub struct Worker {
     pub id: usize,
     // Field order matters: sockets must be dropped before the UMEM they use.
+    /// One socket per network card, in the order of [`Port::card`].
+    ///
+    /// [`Port::card`]: eph_dataplane::Port::card
     pub socks: Vec<Xsk>,
     pub umem: Umem,
     pub pipeline: Pipeline,
@@ -53,12 +59,12 @@ impl Worker {
             pin_to_cpu(cpu);
         }
         // Every frame starts in our free list; then we hand some to each
-        // interface's fill ring so the NIC has somewhere to put packets.
+        // card's fill ring so the NIC has somewhere to put packets.
         let mut free: Vec<u64> = (0..self.umem.frames())
             .map(|i| self.umem.frame_addr(i))
             .collect();
-        let nports = self.socks.len();
-        let mut tx_pending = vec![false; nports];
+        let ncards = self.socks.len();
+        let mut tx_pending = vec![false; ncards];
         let mut idle = 0u32;
         let mut last_report = Instant::now();
         // Busy time: a round that handled packets counts from its start to
@@ -123,10 +129,10 @@ impl Worker {
             }
 
             // 3. Receive and process.
-            for rx_port in 0..nports {
+            for rx_card in 0..ncards {
                 let mut count = 0;
                 while count < BATCH {
-                    match self.socks[rx_port].rx.pop() {
+                    match self.socks[rx_card].rx.pop() {
                         Some(d) => {
                             batch[count] = d;
                             count += 1;
@@ -135,10 +141,10 @@ impl Worker {
                     }
                 }
                 if count == 0 {
-                    self.socks[rx_port].kick_rx();
+                    self.socks[rx_card].kick_rx();
                     continue;
                 }
-                self.socks[rx_port].rx.release();
+                self.socks[rx_card].rx.release();
                 work += count;
 
                 for d in &batch[..count] {
@@ -152,18 +158,19 @@ impl Worker {
                     let frame = unsafe { self.umem.frame_mut(base) };
                     match self
                         .pipeline
-                        .process(rx_port as PortId, frame, off, d.len as usize)
+                        .process(rx_card as u16, frame, off, d.len as usize)
                     {
                         Verdict::Tx { port, off, len } => {
                             // Zero-copy forwarding: the *same frame* goes onto
-                            // the egress port's TX ring.
+                            // the egress card's TX ring.
                             let desc = XdpDesc {
                                 addr: base + off as u64,
                                 len: len as u32,
                                 options: 0,
                             };
-                            if self.socks[port as usize].tx.push(desc) {
-                                tx_pending[port as usize] = true;
+                            let card = self.pipeline.card_of(port);
+                            if self.socks[card].tx.push(desc) {
+                                tx_pending[card] = true;
                                 self.pipeline.stats.sent(port, len);
                             } else {
                                 self.pipeline.stats.drop(DropReason::TxRingFull);
@@ -176,40 +183,49 @@ impl Worker {
             }
 
             // 4. Frames the router generated itself (ARP requests, overlay probes).
-            for e in self.pipeline.emits.drain(..) {
+            let mut emits = std::mem::take(&mut self.pipeline.emits);
+            for e in emits.drain(..) {
                 let Some(addr) = free.pop() else { break };
                 let buf = unsafe { self.umem.frame_mut(addr) };
                 buf[..e.len].copy_from_slice(&e.frame[..e.len]);
-                let s = &mut self.socks[e.port as usize];
-                if s.tx.push(XdpDesc {
+                let card = self.pipeline.card_of(e.port);
+                if self.socks[card].tx.push(XdpDesc {
                     addr,
                     len: e.len as u32,
                     options: 0,
                 }) {
-                    tx_pending[e.port as usize] = true;
+                    tx_pending[card] = true;
                     self.pipeline.stats.sent(e.port, e.len);
                 } else {
                     free.push(addr);
                 }
             }
+            self.pipeline.emits = emits; // keep its capacity
 
-            // ...and frames from the control plane (DHCP).
+            // ...and frames from the control plane (DHCP, PPPoE), tagged
+            // here for a VLAN interface (room for the tag left in front).
             for (port, frame) in outbox.drain(..) {
                 let Some(addr) = free.pop() else { break };
                 let buf = unsafe { self.umem.frame_mut(addr) };
-                if frame.len() > buf.len() || port as usize >= nports {
+                const ROOM: usize = eth::VLAN_TAG_LEN;
+                if ROOM + frame.len() > buf.len() || port as usize >= self.pipeline.ports().len() {
                     free.push(addr);
                     continue;
                 }
-                buf[..frame.len()].copy_from_slice(&frame);
-                if self.socks[port as usize].tx.push(XdpDesc {
-                    addr,
-                    len: frame.len() as u32,
+                buf[ROOM..ROOM + frame.len()].copy_from_slice(&frame);
+                let Some((off, len)) = self.pipeline.tag_for(port, buf, ROOM, frame.len()) else {
+                    free.push(addr);
+                    continue;
+                };
+                let card = self.pipeline.card_of(port);
+                if self.socks[card].tx.push(XdpDesc {
+                    addr: addr + off as u64,
+                    len: len as u32,
                     options: 0,
                 }) {
-                    tx_pending[port as usize] = true;
+                    tx_pending[card] = true;
                     self.pipeline.stats.originated += 1;
-                    self.pipeline.stats.sent(port, frame.len());
+                    self.pipeline.stats.sent(port, len);
                 } else {
                     free.push(addr);
                 }

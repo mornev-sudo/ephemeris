@@ -5,7 +5,7 @@ use eph_dataplane::{
     build_fib, NextHop, OverlayRoute, Port, Role, SessionConfig, StaticRoute, Timeouts,
 };
 use eph_fib::{Fib, Prefix};
-use eph_packet::Mac;
+use eph_packet::{eth, Mac};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -204,6 +204,11 @@ pub struct InterfaceCfg {
     pub name: String,
     /// Linux network device, e.g. "ens19".
     pub device: String,
+    /// 802.1Q VLAN ID (1-4094): this interface is the tagged traffic for
+    /// that VLAN on `device`. Several interfaces can share a device, each
+    /// with its own VLAN (and at most one untagged). Unset: untagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<u16>,
     /// The router's address and prefix length on this link, e.g.
     /// "10.10.1.1/24", or "dhcp" to get it (and a default route) from a DHCP
     /// server on the link, as most ISP connections do.
@@ -411,6 +416,13 @@ impl InterfaceCfg {
                 .unwrap_or(eph_packet::pppoe::DEFAULT_MTU)
         } else {
             self.mtu.unwrap_or(ETHERNET_MTU)
+        }
+    }
+    /// The link as people name it: "ens19", or "ens19.10" for VLAN 10.
+    pub fn link_name(&self) -> String {
+        match self.vlan {
+            Some(v) => format!("{}.{v}", self.device),
+            None => self.device.clone(),
         }
     }
     /// Is the address handed out by someone else (DHCP or PPPoE)?
@@ -650,7 +662,19 @@ impl Config {
                 .interfaces
                 .iter()
                 .zip(&new.interfaces)
-                .all(|(a, b)| a.name == b.name && a.device == b.device)
+                .all(|(a, b)| a.name == b.name && a.device == b.device && a.vlan == b.vlan)
+    }
+
+    /// The network cards the interfaces use, each once, in the order they
+    /// first appear. A port's `card` is its device's index here.
+    pub fn cards(&self) -> Vec<&str> {
+        let mut cards: Vec<&str> = Vec::new();
+        for i in &self.interfaces {
+            if !cards.contains(&i.device.as_str()) {
+                cards.push(&i.device);
+            }
+        }
+        cards
     }
 
     fn validate(&self) -> Result<()> {
@@ -725,6 +749,11 @@ impl Config {
                     i.device
                 );
             }
+            if let Some(v) = i.vlan {
+                if !(1..=eth::VLAN_ID_MAX).contains(&v) {
+                    bail!("{which}: vlan must be between 1 and {}", eth::VLAN_ID_MAX);
+                }
+            }
             if let Some(mss) = i.mss_adjust {
                 if !MSS_ADJUST_RANGE.contains(&mss) {
                     bail!(
@@ -738,8 +767,21 @@ impl Config {
         let addrs = self.interface_addrs()?;
         for (i, a) in self.interfaces.iter().enumerate() {
             for b in &self.interfaces[i + 1..] {
-                if a.device == b.device {
-                    bail!("device {} is used by two interfaces", a.device);
+                if a.device == b.device && a.vlan == b.vlan {
+                    match a.vlan {
+                        Some(v) => bail!(
+                            "interfaces {} and {} are both VLAN {v} on {}",
+                            a.name,
+                            b.name,
+                            a.device
+                        ),
+                        None => bail!(
+                            "interfaces {} and {} both use {} untagged (give one of them a vlan)",
+                            a.name,
+                            b.name,
+                            a.device
+                        ),
+                    }
                 }
                 if a.name == b.name {
                     bail!("two interfaces are named {}", a.name);
@@ -990,6 +1032,7 @@ impl Config {
     /// Build the port table; `mac_of` supplies each device's MAC address.
     pub fn ports(&self, mut mac_of: impl FnMut(&InterfaceCfg) -> Result<Mac>) -> Result<Vec<Port>> {
         let addrs = self.interface_addrs()?;
+        let cards = self.cards();
         self.interfaces
             .iter()
             .zip(addrs)
@@ -1017,6 +1060,8 @@ impl Config {
                     gateway: i.gateway.as_deref().and_then(|g| g.parse().ok()),
                     onlink: i.onlink.clone(),
                     mtu: i.ip_mtu(),
+                    card: cards.iter().position(|&c| c == i.device).unwrap_or(0) as u16,
+                    vlan: i.vlan,
                     pppoe: match (i.is_pppoe(), i.pppoe_session) {
                         (false, _) => eph_dataplane::Pppoe::Off,
                         (true, None) => eph_dataplane::Pppoe::Dialing,
@@ -1441,7 +1486,7 @@ pub fn print_summary(cfg: &Config) -> Result<()> {
         println!(
             "  {:<10} {:<10} {:<18} {role:<8} {policy}{mss}",
             p.name,
-            cfg.interfaces[p.id as usize].device,
+            cfg.interfaces[p.id as usize].link_name(),
             format!("{}/{}", p.addr, p.subnet.len())
         );
     }
@@ -2076,6 +2121,60 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
         );
         assert!(err(two).contains("two interfaces are named lan"));
         assert!(parse(&iface("lan", "ens19")).is_ok());
+    }
+
+    #[test]
+    fn vlans_share_a_card() {
+        let iface = |name: &str, device: &str, vlan: Option<u16>, addr: &str| {
+            let vlan = vlan.map(|v| format!("vlan = {v}\n")).unwrap_or_default();
+            format!(
+                "[[interface]]\nname = {name:?}\ndevice = {device:?}\n{vlan}address = {addr:?}\n"
+            )
+        };
+        let text = [
+            iface("lan", "ens19", None, "10.0.1.1/24"),
+            iface("guest", "ens19", Some(10), "10.0.10.1/24"),
+            iface("wan", "ens20", Some(7), "pppoe"),
+            "role = \"outside\"\n[interface.pppoe]\nusername = \"u\"\npassword = \"p\"\n".into(),
+            iface("iot", "ens19", Some(20), "10.0.20.1/24"),
+        ]
+        .concat();
+        let c = parse(&text).unwrap();
+        assert_eq!(c.cards(), ["ens19", "ens20"]);
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        let link: Vec<_> = ports
+            .iter()
+            .map(|p| (p.name.as_str(), p.card, p.vlan))
+            .collect();
+        assert_eq!(
+            link,
+            [
+                ("lan", 0, None),
+                ("guest", 0, Some(10)),
+                ("wan", 1, Some(7)),
+                ("iot", 0, Some(20))
+            ]
+        );
+        assert_eq!(c.interfaces[1].link_name(), "ens19.10");
+        // Written back as it was read.
+        assert!(toml::to_string(&c).unwrap().contains("vlan = 10"));
+
+        let err = |t: String| parse(&t).unwrap_err().to_string();
+        let two = |a: Option<u16>, b: Option<u16>| {
+            iface("a", "ens19", a, "10.0.1.1/24") + &iface("b", "ens19", b, "10.0.2.1/24")
+        };
+        assert!(err(two(None, None)).contains("both use ens19 untagged"));
+        assert!(err(two(Some(5), Some(5))).contains("both VLAN 5 on ens19"));
+        assert!(parse(&two(None, Some(5))).is_ok());
+        assert!(parse(&two(Some(5), Some(6))).is_ok());
+        for bad in [0, 4095, 5000] {
+            assert!(err(iface("a", "ens19", Some(bad), "10.0.1.1/24"))
+                .contains("vlan must be between 1 and 4094"));
+        }
+        // Moving an interface to another VLAN reshapes the sockets: restart.
+        let moved = parse(&text.replace("vlan = 20", "vlan = 21")).unwrap();
+        assert!(!c.live_applicable(&moved));
+        assert!(c.live_applicable(&c.clone()));
     }
 
     #[test]

@@ -38,6 +38,13 @@ pub struct Port {
     /// Largest IP packet this link carries (1500 on Ethernet, 1492 over
     /// PPPoE). Bigger ones get "fragmentation needed" (or are dropped).
     pub mtu: u16,
+    /// The network card this port sends and receives on: an index into the
+    /// router's list of cards (one AF_XDP socket per card and worker). VLAN
+    /// ports share their card with each other and with an untagged port.
+    pub card: u16,
+    /// 802.1Q VLAN ID: frames on this port carry this tag on the wire.
+    /// `None`: untagged.
+    pub vlan: Option<u16>,
 }
 
 /// A port's PPPoE state.

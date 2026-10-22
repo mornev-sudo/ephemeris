@@ -264,6 +264,35 @@ check "traffic over PPPoE (NAT)"           wait_for 30 "ping over PPPoE" ip netn
 check "back to DHCP"                       on_router "ephctl config rollback 1"
 check "forwarding again over DHCP"         wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
 
+# ------------------------------------------------------------ VLANs
+# A second interface on lan-a's card: VLAN 10, next to the untagged lan-a.
+# Host A gets a VLAN device for it. QEMU's virtio-net filters VLAN tags
+# nobody registered, so this also checks the router opens the card up
+# (promiscuous mode) rather than relying on the kernel's VLAN devices.
+echo "VLANs:"
+modprobe 8021q 2>/dev/null || true
+printf '\n[[interface]]\nname = "lan-a10"\ndevice = "enp0s19"\nvlan = 10\naddress = "10.10.10.1/24"\n' \
+    | cat "$WORK/ephemeris.toml" - > "$WORK/vlan.toml"
+on_router "cat > /run/vlan.toml" < "$WORK/vlan.toml"
+check "add a VLAN interface (restart)"     on_router "ephctl config load /run/vlan.toml && ephctl config commit && ephctl restart"
+check "VLAN interface running"             wait_for 60 "lan-a10" on_router "ephctl status | grep lan-a10 | grep -q 'enp0s19.10'"
+ip -n ci-ha link add link eth0 name eth0.10 type vlan id 10
+ip -n ci-ha addr add 10.10.10.10/24 dev eth0.10
+ip -n ci-ha link set eth0.10 up
+check "ping the router on VLAN 10"         wait_for 30 "the router on VLAN 10" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.10.1
+check "untagged lan-a still works"         wait_for 60 "lan-a" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.1.1
+ip -n ci-ha route add 10.10.2.0/24 via 10.10.10.1 dev eth0.10
+check "VLAN 10 routed out to lan-b"        wait_for 30 "forwarding from VLAN 10" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+ip -n ci-ha route del 10.10.2.0/24 via 10.10.10.1 dev eth0.10
+ip -n ci-ha link add link eth0 name eth0.20 type vlan id 20
+ip -n ci-ha addr add 10.10.20.10/24 dev eth0.20
+ip -n ci-ha link set eth0.20 up
+check "a VLAN not configured is dropped"   sh -c "! ip netns exec ci-ha ping -c2 -i0.2 -W1 10.10.20.1 && curl -skf -b '$WORK/cookies' $WEB/api/v1/status | grep -q '\"vlan\":[1-9]'"
+ip -n ci-ha link del eth0.20
+ip -n ci-ha link del eth0.10
+check "remove it again (restart)"          on_router "ephctl config rollback 1 && ephctl restart"
+check "forwarding again without VLANs"     wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+
 # ------------------------------------------------------------ updates
 if [[ -n $UPDATE_DIR ]]; then
     echo "A/B update to $UPDATE_VERSION:"

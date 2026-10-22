@@ -30,6 +30,8 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
     let ports: Arc<[Port]> = Arc::new([
         Port {
             id: 0,
+            card: 0,
+            vlan: None,
             name: "lan-a".into(),
             mac: R0,
             addr: ip("10.10.1.1"),
@@ -45,6 +47,8 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
         },
         Port {
             id: 1,
+            card: 1,
+            vlan: None,
             name: "lan-b".into(),
             mac: R1,
             addr: ip("10.10.2.1"),
@@ -400,6 +404,8 @@ fn corrupted_header_is_dropped() {
 fn static_route_gateway_must_be_connected() {
     let ports = [Port {
         id: 0,
+        card: 0,
+        vlan: None,
         name: "x".into(),
         mac: R0,
         addr: ip("10.0.0.1"),
@@ -427,6 +433,8 @@ fn static_route_gateway_must_be_connected() {
 fn on_link_gateway_outside_the_subnet() {
     let wan = |addr: &str, subnet: &str, onlink: Vec<eph_fib::Prefix>| Port {
         id: 0,
+        card: 0,
+        vlan: None,
         name: "wan".into(),
         mac: R0,
         addr: ip(addr),

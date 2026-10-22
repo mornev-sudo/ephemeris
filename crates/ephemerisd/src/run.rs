@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use eph_dataplane::overlay::{ReplayGuard, DEFAULT_MTU};
 use eph_dataplane::{Pipeline, Port};
 use eph_packet::eth;
-use eph_xdp::{iface, BindMode, Umem, XdpMode, XdpRedirect, Xsk, XskConfig, XskMap};
+use eph_xdp::{iface, BindMode, Promisc, Umem, XdpMode, XdpRedirect, Xsk, XskConfig, XskMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -89,6 +89,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         runtime,
         handles,
         links,
+        promisc,
         epoch,
         replay,
         punts,
@@ -251,6 +252,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     }
     print_stats(&shared, d.show_sessions);
     drop(links); // detaches XDP; the kernel would also do this when we exit
+    drop(promisc);
     Ok(())
 }
 
@@ -304,6 +306,8 @@ struct Dataplane {
     runtime: Vec<PortRuntime>,
     handles: Vec<std::thread::JoinHandle<()>>,
     links: Vec<XdpRedirect>,
+    /// Promiscuous mode on cards carrying VLANs, released when dropped.
+    promisc: Vec<Promisc>,
     epoch: Instant,
     /// Received overlay counters, shared by the workers (persisted by the
     /// path loop).
@@ -348,6 +352,7 @@ impl Dataplane {
             handles: vec![],
             punts: None,
             links: vec![],
+            promisc: vec![],
             epoch: Instant::now(),
         })
     }
@@ -372,34 +377,58 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         m => bail!("dataplane.bind_mode: unknown mode {m:?}"),
     };
 
-    // ---- interfaces
+    // ---- network cards: one socket per card and worker, however many
+    // (VLAN) interfaces share it
+    let cards = cfg.cards();
     let mut ifindexes = Vec::new();
-    for i in &cfg.interfaces {
-        let idx = iface::ifindex(&i.device).with_context(|| format!("interface {}", i.name))?;
-        if !iface::is_up(&i.device) {
-            bail!(
-                "device {} is down; run: ip link set dev {} up",
-                i.device,
-                i.device
-            );
+    let mut promisc = Vec::new();
+    for &dev in &cards {
+        let users = || {
+            cfg.interfaces
+                .iter()
+                .filter(|i| i.device == dev)
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let idx = iface::ifindex(dev).with_context(|| format!("interface {}", users()))?;
+        if !iface::is_up(dev) {
+            bail!("device {dev} is down; run: ip link set dev {dev} up");
         }
-        let queues = iface::rx_queues(&i.device)?;
+        let queues = iface::rx_queues(dev)?;
         if queues < workers {
             bail!(
-                "device {} has {queues} RX queue(s) but {workers} workers are configured \
-                 (try: ethtool -L {} combined {workers})",
-                i.device,
-                i.device
+                "device {dev} has {queues} RX queue(s) but {workers} workers are configured \
+                 (try: ethtool -L {dev} combined {workers})"
             );
         }
         if queues > workers {
             warn!(
-                "device {} has {queues} RX queues but only {workers} worker(s): traffic hashed to \
-                 queues {workers}..{} will be dropped. Fix: ethtool -L {} combined {workers}",
-                i.device,
-                queues - 1,
-                i.device
+                "device {dev} has {queues} RX queues but only {workers} worker(s): traffic hashed to \
+                 queues {workers}..{} will be dropped. Fix: ethtool -L {dev} combined {workers}",
+                queues - 1
             );
+        }
+        // Tags must reach the data plane as they are on the wire: a card
+        // that strips them would make every VLAN look untagged.
+        match iface::disable_vlan_stripping(dev) {
+            Ok(true) => info!("{dev}: VLAN stripping turned off"),
+            Ok(false) => {}
+            Err(e) => warn!(
+                "{dev}: could not turn VLAN stripping off ({e}); tagged frames may arrive \
+                 untagged. Try: ethtool -K {dev} rxvlan off"
+            ),
+        }
+        if cfg
+            .interfaces
+            .iter()
+            .any(|i| i.device == dev && i.vlan.is_some())
+        {
+            promisc.push(
+                Promisc::enable(idx)
+                    .with_context(|| format!("{dev}: promiscuous mode (needed for its VLANs)"))?,
+            );
+            info!("{dev}: carries VLANs ({}); promiscuous mode on", users());
         }
         ifindexes.push(idx);
     }
@@ -454,7 +483,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             "port {} {} dev {} mac {} addr {}/{}",
             p.id,
             p.name,
-            cfg.interfaces[p.id as usize].device,
+            cfg.interfaces[p.id as usize].link_name(),
             eth::fmt_mac(&p.mac),
             p.addr,
             p.subnet.len()
@@ -462,7 +491,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     }
     info!("forwarding table: {} route(s)", fib.routes().len());
 
-    // ---- per-worker UMEM + one socket per interface on queue `w`
+    // ---- per-worker UMEM + one socket per card on queue `w`
     let ring = d.ring_size;
     let xcfg = XskConfig {
         rx_size: ring,
@@ -473,9 +502,9 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     };
     // Enough frames to fill every fill ring and every TX ring, rounded to a
     // whole number of 2 MiB huge pages (512 frames).
-    let frames = (ports.len() as u32 * ring * 2).div_ceil(512) * 512;
+    let frames = (cards.len() as u32 * ring * 2).div_ceil(512) * 512;
 
-    let maps: Vec<XskMap> = ports
+    let maps: Vec<XskMap> = cards
         .iter()
         .map(|_| XskMap::new(workers))
         .collect::<Result<_, _>>()?;
@@ -486,26 +515,25 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     // for it are dropped and counted, never queued without end.
     let (punt_tx, punt_rx) = mpsc::sync_channel(1024);
     let detail: crate::report::DetailWanted = Default::default();
-    let mut zero_copy = vec![false; ports.len()];
+    let mut zero_copy = vec![false; cards.len()];
     let reports: Vec<Arc<Mutex<Report>>> = (0..workers).map(|_| Default::default()).collect();
     let mut pool = Vec::new();
 
     for (w, control) in rxs.into_iter().enumerate() {
         let umem = Umem::new(frames, FRAME_SIZE).context("allocating UMEM")?;
         let first = Xsk::new(&umem, ifindexes[0], w as u32, &xcfg, None)
-            .with_context(|| format!("AF_XDP socket on {} queue {w}", cfg.interfaces[0].device))?;
+            .with_context(|| format!("AF_XDP socket on {} queue {w}", cards[0]))?;
         let mut socks = Vec::new();
-        for (p, &idx) in ifindexes.iter().enumerate().skip(1) {
+        for (c, &idx) in ifindexes.iter().enumerate().skip(1) {
             socks.push(
-                Xsk::new(&umem, idx, w as u32, &xcfg, Some(&first)).with_context(|| {
-                    format!("AF_XDP socket on {} queue {w}", cfg.interfaces[p].device)
-                })?,
+                Xsk::new(&umem, idx, w as u32, &xcfg, Some(&first))
+                    .with_context(|| format!("AF_XDP socket on {} queue {w}", cards[c]))?,
             );
         }
         socks.insert(0, first);
-        for (p, s) in socks.iter().enumerate() {
-            maps[p].insert(w as u32, s.fd())?;
-            zero_copy[p] |= s.zero_copy;
+        for (c, s) in socks.iter().enumerate() {
+            maps[c].insert(w as u32, s.fd())?;
+            zero_copy[c] |= s.zero_copy;
         }
         info!(
             "worker {w}: {frames} frames ({} MiB, huge pages: {}), zero-copy: {}",
@@ -552,21 +580,21 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
 
     // ---- attach XDP last, once every queue has a socket to redirect to.
     let mut links = Vec::new();
-    let mut runtime = Vec::new();
-    for (p, &idx) in ifindexes.iter().enumerate() {
-        let link = XdpRedirect::attach(idx, &maps[p], xdp_mode)
-            .with_context(|| format!("attaching XDP to {}", cfg.interfaces[p].device))?;
-        info!(
-            "XDP attached to {} in {:?} mode",
-            cfg.interfaces[p].device, link.mode
-        );
-        runtime.push(PortRuntime {
-            device: cfg.interfaces[p].device.clone(),
-            xdp_mode: format!("{:?}", link.mode),
-            zero_copy: zero_copy[p],
-        });
+    for (c, &idx) in ifindexes.iter().enumerate() {
+        let link = XdpRedirect::attach(idx, &maps[c], xdp_mode)
+            .with_context(|| format!("attaching XDP to {}", cards[c]))?;
+        info!("XDP attached to {} in {:?} mode", cards[c], link.mode);
         links.push(link);
     }
+    // What each interface ended up with is its card's.
+    let runtime = ports
+        .iter()
+        .map(|p| PortRuntime {
+            device: cards[p.card as usize].to_string(),
+            xdp_mode: format!("{:?}", links[p.card as usize].mode),
+            zero_copy: zero_copy[p.card as usize],
+        })
+        .collect();
 
     // ---- run
     let epoch = Instant::now();
@@ -590,6 +618,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         runtime,
         handles,
         links,
+        promisc,
         epoch,
         replay,
         punts: Some(punt_rx),
