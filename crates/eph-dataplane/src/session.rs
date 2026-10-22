@@ -334,7 +334,53 @@ pub struct SessionTable {
     pub nat_active: u64,
 }
 
+/// Keys a session can have in the map: its 5-tuple, plus its translated
+/// one while it's source-NATed.
+const KEYS_PER_SESSION: usize = 2;
+/// The timer wheel holds about one (index, generation) entry per session,
+/// sometimes a stale one more; it grows as needed rather than up front.
+const WHEEL_BYTES_PER_SESSION: u64 = 2 * std::mem::size_of::<(u32, u32)>() as u64;
+
 impl SessionTable {
+    /// Memory a table for `max` sessions takes once full: what [`new`]
+    /// reserves (the slab and the hash map) plus the free list and the timer
+    /// wheel, which grow into their share as sessions come and go.
+    ///
+    /// The map's part is exact: Rust's `HashMap` (hashbrown) keeps 1/8 of
+    /// its buckets empty, rounds the bucket count up to a power of two, and
+    /// stores one control byte per bucket (plus one group of 16).
+    ///
+    /// [`new`]: SessionTable::new
+    pub fn reserved_bytes(max: u32) -> u64 {
+        let keys = max as u64 * KEYS_PER_SESSION as u64;
+        let buckets = match keys {
+            0 => 0,
+            1..=3 => 4,
+            4..=7 => 8,
+            k => (k * 8 / 7).next_power_of_two(),
+        };
+        let entry = std::mem::size_of::<(FlowKey, u32)>() as u64;
+        let map = buckets * (entry + 1) + 16;
+        let slab = max as u64 * std::mem::size_of::<Session>() as u64;
+        let free = max as u64 * std::mem::size_of::<u32>() as u64;
+        map + slab + free + max as u64 * WHEEL_BYTES_PER_SESSION
+    }
+
+    /// The most sessions whose table fits in `bytes` (see
+    /// [`reserved_bytes`](SessionTable::reserved_bytes)).
+    pub fn max_for_bytes(bytes: u64) -> u32 {
+        let (mut lo, mut hi) = (0u32, u32::MAX);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if Self::reserved_bytes(mid) <= bytes {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
     /// How many sessions the table can hold (allocated up front).
     pub fn capacity(&self) -> u32 {
         self.cfg.max_sessions
@@ -348,7 +394,12 @@ impl SessionTable {
         let max = cfg.max_sessions as usize;
         SessionTable {
             cfg,
-            map: HashMap::with_capacity_and_hasher(max, FxSeededState::with_seed(seed)),
+            // Room for both keys of every session (its own and, NATed, its
+            // translated one): the map never grows on the fast path.
+            map: HashMap::with_capacity_and_hasher(
+                max * KEYS_PER_SESSION,
+                FxSeededState::with_seed(seed),
+            ),
             slab: Vec::with_capacity(max),
             free: Vec::new(),
             wheel: (0..WHEEL_SLOTS).map(|_| Vec::new()).collect(),
@@ -850,5 +901,52 @@ mod tests {
         assert_eq!(t.expire(3000 * NS), 0);
         assert_eq!(t.expire(3599 * NS), 0);
         assert_eq!(t.expire(3602 * NS), 1);
+    }
+}
+
+#[cfg(test)]
+mod sizing {
+    use super::*;
+
+    #[test]
+    fn the_map_is_sized_for_nat_keys_and_counted_exactly() {
+        for max in [1u32, 5, 100, 1000, 262_144] {
+            let t = SessionTable::new(SessionConfig {
+                max_sessions: max,
+                ..SessionConfig::default()
+            });
+            assert!(t.map.capacity() >= 2 * max as usize, "max {max}");
+            // hashbrown's capacity is 7/8 of its buckets (all of them when
+            // tiny): the bucket count reserved_bytes assumes.
+            let keys = 2 * max as u64;
+            let buckets = if keys < 8 {
+                if keys < 4 {
+                    4
+                } else {
+                    8
+                }
+            } else {
+                (keys * 8 / 7).next_power_of_two()
+            };
+            let usable = if buckets < 8 {
+                buckets - 1
+            } else {
+                buckets / 8 * 7
+            };
+            assert_eq!(t.map.capacity() as u64, usable, "max {max}");
+        }
+    }
+
+    #[test]
+    fn max_for_bytes_inverts_reserved_bytes() {
+        assert_eq!(SessionTable::max_for_bytes(0), 0);
+        for budget in [1u64 << 20, 40 << 20, 1 << 30, 7 << 30] {
+            let n = SessionTable::max_for_bytes(budget);
+            assert!(SessionTable::reserved_bytes(n) <= budget);
+            assert!(SessionTable::reserved_bytes(n + 1) > budget);
+        }
+        // The default table: about 300 bytes a session, 80 MB once full.
+        let mb = SessionTable::reserved_bytes(262_144) as f64 / 1e6;
+        assert!((60.0..100.0).contains(&mb), "{mb} MB");
     }
 }

@@ -2,6 +2,7 @@
 //! the XDP programs, start the workers, and print stats until told to stop.
 
 use crate::config::Config;
+use crate::memory::FRAME_SIZE;
 use crate::mgmt::configmgr::ConfigManager;
 use crate::mgmt::paths::{PathSelector, TICK_MS};
 use crate::mgmt::{api, load_or_create_token, PortRuntime, Shared, Summary};
@@ -19,8 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-
-const FRAME_SIZE: u32 = 4096;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -491,6 +490,25 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     }
     info!("forwarding table: {} route(s)", fib.routes().len());
 
+    // ---- memory: size "auto" session tables, and refuse what can't fit
+    // (that falls back to the last config that worked) before allocating.
+    let mem = crate::memory::machine();
+    let plan = crate::memory::plan(cfg, fib.memory_bytes() as u64, mem.as_ref())?;
+    info!(
+        "memory: {} session(s) per worker{}; reserving {} MiB (packet buffers {} MiB, session \
+         tables {} MiB, forwarding table {} MiB) of {} MiB available",
+        plan.sessions_per_worker,
+        if plan.auto { " (auto)" } else { "" },
+        plan.ordinary_memory() >> 20,
+        plan.packet_buffers >> 20,
+        plan.session_tables >> 20,
+        plan.forwarding_table >> 20,
+        plan.available.map_or("?".into(), |a| (a >> 20).to_string()),
+    );
+    if let Some(w) = &plan.warning {
+        warn!("memory: {w}");
+    }
+
     // ---- per-worker UMEM + one socket per card on queue `w`
     let ring = d.ring_size;
     let xcfg = XskConfig {
@@ -500,9 +518,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         comp_size: ring,
         bind_mode,
     };
-    // Enough frames to fill every fill ring and every TX ring, rounded to a
-    // whole number of 2 MiB huge pages (512 frames).
-    let frames = (cards.len() as u32 * ring * 2).div_ceil(512) * 512;
+    let frames = crate::memory::umem_frames(cards.len(), ring);
 
     let maps: Vec<XskMap> = cards
         .iter()
@@ -554,7 +570,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         let mut pipeline = Pipeline::new(
             ports.clone(),
             fib.clone(),
-            cfg.sessions.to_config(),
+            cfg.sessions.to_config(plan.sessions_per_worker),
             overlay.clone(),
         );
         // One worker sends the SD-WAN probes; replies may land on any worker.

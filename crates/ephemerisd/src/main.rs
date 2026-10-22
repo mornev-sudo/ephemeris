@@ -10,6 +10,7 @@
 mod config;
 mod dhcp;
 mod files;
+mod memory;
 mod mgmt;
 mod overlay_state;
 mod pppoe;

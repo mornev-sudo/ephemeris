@@ -151,7 +151,10 @@ in systems code.
 ## Memory: reserve everything up front
 
 Each worker reserves room for `max_per_worker` sessions at startup (about
-150 bytes each). A full table refuses *new* flows (`session-table-full`) but
+300 bytes each: the 200-byte session itself, and room in the hash map for
+both of its keys, its own and its NAT translation's). With `"auto"`, the
+default, the size comes from the memory the machine has free at start; a
+fixed size that won't fit is refused (see `ephemerisd/src/memory.rs`). A full table refuses *new* flows (`session-table-full`) but
 existing ones keep working. Two reasons:
 
 - **No allocation on the fast path** (chapter 4).

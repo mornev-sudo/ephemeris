@@ -763,7 +763,12 @@ async fn stats_resources(State(s): St) -> Json<Value> {
         );
     }
 
-    let session_bytes = sessions_max * std::mem::size_of::<eph_dataplane::Session>() as u64;
+    // Each worker's table, as reserved for its size (map, slab, timers).
+    let session_bytes: u64 = sum
+        .workers
+        .iter()
+        .map(|w| eph_dataplane::session::SessionTable::reserved_bytes(w.sessions_max as u32))
+        .sum();
     Json(json!({
         "system": {
             "cpu_pct": sys.cpu_pct, "cpu_each_pct": sys.cpu_each_pct,
