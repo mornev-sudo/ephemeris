@@ -24,7 +24,8 @@ PrivateTmp=yes
 # Everything ephemerisd creates is private (configs can hold tether keys).
 UMask=0077
 # More of the system kept out of reach: ephemerisd needs its sockets, AF_XDP
-# and BPF, and nothing else of the kernel's.
+# and BPF, and nothing else of the kernel's. (AF_PACKET: a socket that only
+# holds promiscuous mode on cards carrying VLANs; it receives nothing.)
 NoNewPrivileges=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -38,7 +39,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_XDP
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_XDP AF_PACKET
 
 [Install]
 WantedBy=multi-user.target
