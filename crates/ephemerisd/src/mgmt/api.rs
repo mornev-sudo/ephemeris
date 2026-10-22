@@ -548,7 +548,7 @@ async fn status(State(s): St) -> Json<Value> {
         .zip(&s.runtime)
         .map(|(p, rt)| {
             json!({
-                "id": p.id, "name": p.name, "device": rt.device,
+                "id": p.id, "name": p.name, "device": rt.device, "vlan": p.vlan,
                 "mac": eth::fmt_mac(&p.mac),
                 "address": format!("{}/{}", p.addr, p.subnet.len()),
                 "allow_new_sessions": p.allow_new_sessions,

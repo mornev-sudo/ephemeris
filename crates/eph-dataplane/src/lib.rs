@@ -35,3 +35,5 @@ mod tests_filter;
 mod tests_nat;
 #[cfg(test)]
 mod tests_overlay;
+#[cfg(test)]
+mod tests_vlan;

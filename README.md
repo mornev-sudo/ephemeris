@@ -144,6 +144,7 @@ Plain-language explanations of everything in here, in reading order:
 14. [The packet filter and MSS adjust: what a certified firewall always drops](docs/learn/14-packet-filter.md)
 15. [DHCP: handing out addresses, and getting one](docs/learn/15-dhcp.md)
 16. [PPPoE: dialling the ISP](docs/learn/16-pppoe.md)
+17. [VLANs: many networks on one cable](docs/learn/17-vlans.md)
 
 ## Roadmap
 
@@ -163,7 +164,8 @@ Plain-language explanations of everything in here, in reading order:
 - [x] **Reporting:** open sessions, packets/s, throughput and drops sampled every 5 s; live graphs in the portal (last hour), the same numbers on the dashboard and in `ephctl status`
 - [x] **Resources and capacity:** CPU (per core, per thread), memory and huge pages, disk, worker busy %, and every table's usage against its limit (FIB, sessions, neighbours, NAT, DHCP pools, tethers)
 - [x] **Bounded resources:** every session expires (idle limit of an hour, closed within 10 minutes), session views show the newest 1000 and are gathered only while viewed, a bounded control-plane queue, a capped journal and history, management at lower CPU priority
-- [ ] **Next for the edge:** destination NAT / port forwarding, VLANs (802.1Q), `ephsh` router CLI
+- [x] **VLANs (802.1Q):** several interfaces per card, each with its own tag (and at most one untagged), PPPoE over a VLAN, tag stripping and VLAN filtering handled on the NIC
+- [ ] **Next for the edge:** destination NAT / port forwarding, `ephsh` router CLI
 - [ ] **Performance and capacity:**
   - [ ] Benchmarks: a microbenchmark of the per-packet pipeline (CPU ceiling per core, no NIC), and a lab test with a traffic generator (pktgen / TRex) for real packets per second on Proxmox and on hardware NICs
   - [ ] Memory-aware sizing: `sessions.max_per_worker = "auto"` sized from the RAM available at start, and a start-up check that refuses or warns when the reserved tables (sessions, FIB, packet buffers) exceed what the machine has

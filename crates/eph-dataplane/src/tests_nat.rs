@@ -27,6 +27,8 @@ fn router(nat: NatConfig) -> Pipeline {
     let ports: Arc<[Port]> = Arc::new([
         Port {
             id: 0,
+            card: 0,
+            vlan: None,
             name: "lan".into(),
             mac: R_LAN,
             addr: ip("10.0.0.1"),
@@ -42,6 +44,8 @@ fn router(nat: NatConfig) -> Pipeline {
         },
         Port {
             id: 1,
+            card: 1,
+            vlan: None,
             name: "wan".into(),
             mac: R_WAN,
             addr: ip("203.0.113.1"),

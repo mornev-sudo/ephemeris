@@ -263,7 +263,10 @@ fn run(cli: Cli) -> Result<()> {
                 rows(&s["ports"], |p| {
                     vec![
                         str(&p["name"]),
-                        str(&p["device"]),
+                        match p["vlan"].as_u64() {
+                            Some(v) => format!("{}.{v}", str(&p["device"])),
+                            None => str(&p["device"]),
+                        },
                         str(&p["address"]),
                         str(&p["mac"]),
                         str(&p["xdp_mode"]),

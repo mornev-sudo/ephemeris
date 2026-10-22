@@ -1,7 +1,9 @@
 //! Small helpers to look up interface facts.
 
+use crate::sys::{cvt, PacketMreq, PACKET_ADD_MEMBERSHIP, PACKET_MR_PROMISC};
 use std::ffi::CString;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 pub fn ifindex(name: &str) -> io::Result<u32> {
     let c =
@@ -44,4 +46,87 @@ pub fn is_up(name: &str) -> bool {
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .is_some_and(|flags| flags & IFF_UP != 0)
+}
+
+/// Stop the NIC taking 802.1Q tags off received frames (what `ethtool -K
+/// <dev> rxvlan off` does). With "VLAN stripping" on, the card moves the tag
+/// into the receive descriptor, where XDP never sees it: a tagged frame
+/// would arrive looking untagged. Returns whether it was on.
+///
+/// This uses the old ETHTOOL_GFLAGS / SFLAGS ioctl: one flag word instead
+/// of the feature-string tables `ethtool` itself walks.
+pub fn disable_vlan_stripping(name: &str) -> io::Result<bool> {
+    const ETHTOOL_GFLAGS: u32 = 0x25;
+    const ETHTOOL_SFLAGS: u32 = 0x26;
+    const ETH_FLAG_RXVLAN: u32 = 1 << 8;
+    #[repr(C)]
+    struct EthtoolValue {
+        cmd: u32,
+        data: u32,
+    }
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    let sock = unsafe { OwnedFd::from_raw_fd(cvt(sock)?) };
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name.len() >= req.ifr_name.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad name"));
+    }
+    for (d, s) in req.ifr_name.iter_mut().zip(name.bytes()) {
+        *d = s as libc::c_char;
+    }
+    let mut v = EthtoolValue {
+        cmd: ETHTOOL_GFLAGS,
+        data: 0,
+    };
+    let mut call = |v: &mut EthtoolValue| {
+        req.ifr_ifru.ifru_data = v as *mut EthtoolValue as *mut libc::c_char;
+        cvt(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCETHTOOL, &mut req) })
+    };
+    call(&mut v)?;
+    if v.data & ETH_FLAG_RXVLAN == 0 {
+        return Ok(false);
+    }
+    v.cmd = ETHTOOL_SFLAGS;
+    v.data &= !ETH_FLAG_RXVLAN;
+    call(&mut v)?;
+    Ok(true)
+}
+
+/// The card in promiscuous mode for as long as this lives.
+///
+/// A card carrying VLANs needs it: many NICs (Intel's, and virtio under
+/// QEMU) filter VLAN tags in hardware and drop every VLAN nobody registered.
+/// The kernel registers one when a VLAN device (ens19.10) is created, but
+/// the router has none: it reads the tags itself. Promiscuous mode lets all
+/// VLANs through. (Frames for other MACs come in too; the pipeline drops
+/// them, and on a switched network there are few.)
+///
+/// The request is tied to a packet socket rather than set as an interface
+/// flag: closing the socket (or the process dying) takes it back, like the
+/// XDP link, so nothing is left behind.
+pub struct Promisc {
+    _sock: OwnedFd,
+}
+
+impl Promisc {
+    pub fn enable(ifindex: u32) -> io::Result<Self> {
+        // Protocol 0: the socket receives nothing, it only holds the request.
+        let sock = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
+        let sock = unsafe { OwnedFd::from_raw_fd(cvt(sock)?) };
+        let mreq = PacketMreq {
+            mr_ifindex: ifindex as libc::c_int,
+            mr_type: PACKET_MR_PROMISC,
+            mr_alen: 0,
+            mr_address: [0; 8],
+        };
+        cvt(unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_PACKET,
+                PACKET_ADD_MEMBERSHIP,
+                &mreq as *const PacketMreq as *const libc::c_void,
+                std::mem::size_of::<PacketMreq>() as libc::socklen_t,
+            )
+        })?;
+        Ok(Promisc { _sock: sock })
+    }
 }

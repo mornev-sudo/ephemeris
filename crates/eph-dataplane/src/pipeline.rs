@@ -103,6 +103,9 @@ fn seeded() -> FxSeededState {
 /// Per-worker forwarding state.
 pub struct Pipeline {
     ports: Arc<[Port]>,
+    /// Per network card, which port each arriving frame belongs to (by its
+    /// VLAN tag, or the lack of one).
+    cards: Vec<CardPorts>,
     /// The smallest MTU of any port: packets up to this size skip the check.
     min_mtu: usize,
     fib: Arc<Fib<NextHop>>,
@@ -162,6 +165,7 @@ impl Pipeline {
         let endpoints = Arc::new(Endpoints::new(overlay.tethers.len()));
         Pipeline {
             min_mtu: min_mtu(&ports),
+            cards: card_ports(&ports),
             ports,
             fib,
             fib_gen: 1,
@@ -239,6 +243,7 @@ impl Pipeline {
     pub fn set_ports(&mut self, ports: Arc<[Port]>) {
         debug_assert_eq!(ports.len(), self.ports.len());
         self.min_mtu = min_mtu(&ports);
+        self.cards = card_ports(&ports);
         self.ports = ports;
     }
 
@@ -361,35 +366,113 @@ impl Pipeline {
         Some(e.mac)
     }
 
-    /// Process one received frame.
+    /// Process one frame received on network card `card`.
     ///
     /// `frame` is the whole packet buffer (a 4 KiB UMEM frame) and the packet
     /// is the `len` bytes starting at `off`. The space before `off` is
     /// headroom for encapsulation; the space after the packet lets replies
     /// that are bigger than the request (ICMP errors) be built in place.
+    ///
+    /// A [`Verdict::Tx`] names the *port* to send on; [`Pipeline::card_of`]
+    /// says which card that is.
     #[inline]
-    pub fn process(
+    pub fn process(&mut self, card: u16, frame: &mut [u8], off: usize, len: usize) -> Verdict {
+        self.stats.rx += 1;
+        let v = match self.ingress(card, frame, off, len) {
+            Ok((ingress, off, len)) => {
+                let v = self.classify(ingress, frame, off, len);
+                self.wrap_for_link(frame, v)
+            }
+            Err(r) => Verdict::Drop(r),
+        };
+        if let Verdict::Drop(r) = v {
+            self.stats.drop(r);
+        }
+        v
+    }
+
+    /// The network card port `port` sends on.
+    #[inline]
+    pub fn card_of(&self, port: PortId) -> usize {
+        self.ports[port as usize].card as usize
+    }
+
+    /// Which port a frame arriving on `card` belongs to, by its 802.1Q tag
+    /// (taken off here, so everything after sees a plain Ethernet frame).
+    /// Returns the port and the frame's new offset and length.
+    #[inline]
+    fn ingress(
         &mut self,
-        ingress: PortId,
+        card: u16,
         frame: &mut [u8],
         off: usize,
         len: usize,
-    ) -> Verdict {
-        self.stats.rx += 1;
-        if let Some(p) = self.stats.ports.get_mut(ingress as usize) {
-            p.rx_packets += 1;
-            p.rx_bytes += len as u64;
+    ) -> Result<(PortId, usize, usize), DropReason> {
+        if len < ETH || off + len > frame.len() {
+            return Err(DropReason::Malformed);
         }
-        let mut v = self.classify(ingress, frame, off, len);
+        let ports = self.cards.get(card as usize).ok_or(DropReason::Vlan)?;
+        let (port, off, len) = if eth::ethertype(&frame[off..]) != eth::TYPE_VLAN {
+            (ports.untagged.ok_or(DropReason::Vlan)?, off, len)
+        } else {
+            if len < ETH + eth::VLAN_TAG_LEN {
+                return Err(DropReason::Malformed);
+            }
+            let port = match eth::vlan_id(&frame[off..]) {
+                0 => ports.untagged, // priority tag only
+                vid => ports.tagged.iter().find(|t| t.0 == vid).map(|t| t.1),
+            }
+            .ok_or(DropReason::Vlan)?;
+            (port, eth::pop_vlan(frame, off), len - eth::VLAN_TAG_LEN)
+        };
+        let c = &mut self.stats.ports[port as usize];
+        c.rx_packets += 1;
+        c.rx_bytes += len as u64;
+        Ok((port, off, len))
+    }
+
+    /// Wrap a frame for the link it leaves on: PPPoE, then the VLAN tag
+    /// (PPPoE over a VLAN is how many ISPs deliver fibre and DSL).
+    #[inline]
+    fn wrap_for_link(&mut self, frame: &mut [u8], mut v: Verdict) -> Verdict {
         if let Verdict::Tx { port, off, len } = v {
             if self.ports[port as usize].pppoe != Pppoe::Off {
                 v = self.pppoe_wrap(frame, port, off, len);
             }
         }
-        if let Verdict::Drop(r) = v {
-            self.stats.drop(r);
+        if let Verdict::Tx { port, off, len } = v {
+            if let Some(vid) = self.ports[port as usize].vlan {
+                v = match make_room(frame, off, len, eth::VLAN_TAG_LEN) {
+                    Some(off) => Verdict::Tx {
+                        port,
+                        off: eth::push_vlan(frame, off, vid),
+                        len: len + eth::VLAN_TAG_LEN,
+                    },
+                    None => Verdict::Drop(DropReason::TooBig),
+                };
+            }
         }
         v
+    }
+
+    /// Tag a frame the control plane built (DHCP, PPPoE discovery and PPP
+    /// control) for `port`'s VLAN, if it has one. The frame is the `len`
+    /// bytes at `off` in `buf`; returns its new offset and length.
+    pub fn tag_for(
+        &self,
+        port: PortId,
+        buf: &mut [u8],
+        off: usize,
+        len: usize,
+    ) -> Option<(usize, usize)> {
+        let Some(vid) = self.ports.get(port as usize)?.vlan else {
+            return Some((off, len));
+        };
+        if len < ETH {
+            return None;
+        }
+        let off = make_room(buf, off, len, eth::VLAN_TAG_LEN)?;
+        Some((eth::push_vlan(buf, off, vid), len + eth::VLAN_TAG_LEN))
     }
 
     fn classify(&mut self, ingress: PortId, frame: &mut [u8], off: usize, len: usize) -> Verdict {
@@ -451,13 +534,7 @@ impl Pipeline {
 
     /// PPPoE out: put the session header in front of the IPv4 packet (in the
     /// frame's headroom; the packet itself doesn't move).
-    fn pppoe_wrap(
-        &mut self,
-        frame: &mut [u8],
-        port: PortId,
-        mut off: usize,
-        len: usize,
-    ) -> Verdict {
+    fn pppoe_wrap(&mut self, frame: &mut [u8], port: PortId, off: usize, len: usize) -> Verdict {
         let Some((session, peer, _)) = self.ports[port as usize].pppoe_up() else {
             return Verdict::Drop(DropReason::NoRoute); // still dialling
         };
@@ -465,13 +542,9 @@ impl Pipeline {
             return Verdict::Drop(DropReason::UnsupportedEthertype);
         }
         const N: usize = pppoe::SESSION_HDR_LEN;
-        if off < N {
-            if off + len + N > frame.len() {
-                return Verdict::Drop(DropReason::TooBig);
-            }
-            frame.copy_within(off..off + len, off + N);
-            off += N;
-        }
+        let Some(off) = make_room(frame, off, len, N) else {
+            return Verdict::Drop(DropReason::TooBig);
+        };
         let new_off = off - N;
         let mac = self.ports[port as usize].mac;
         let f = &mut frame[new_off..];
@@ -500,15 +573,30 @@ impl Pipeline {
         }
     }
 
-    /// Queue a frame the router made itself, wrapped for PPPoE if needed.
+    /// Queue a frame the router made itself, wrapped for PPPoE and tagged
+    /// for a VLAN as needed.
     fn push_emit(&mut self, mut e: Emit) {
-        if self.ports[e.port as usize].pppoe != Pppoe::Off {
-            const N: usize = pppoe::SESSION_HDR_LEN;
-            if e.len + N > EMIT_MAX {
+        let p = &self.ports[e.port as usize];
+        let n = if p.pppoe != Pppoe::Off {
+            pppoe::SESSION_HDR_LEN
+        } else {
+            0
+        } + if p.vlan.is_some() {
+            eth::VLAN_TAG_LEN
+        } else {
+            0
+        };
+        if n > 0 {
+            if e.len + n > EMIT_MAX {
                 return;
             }
-            e.frame.copy_within(0..e.len, N);
-            match self.pppoe_wrap(&mut e.frame, e.port, N, e.len) {
+            e.frame.copy_within(0..e.len, n);
+            let v = Verdict::Tx {
+                port: e.port,
+                off: n,
+                len: e.len,
+            };
+            match self.wrap_for_link(&mut e.frame, v) {
                 Verdict::Tx { off: 0, len, .. } => e.len = len,
                 _ => return,
             }
@@ -1833,4 +1921,42 @@ fn min_mtu(ports: &[Port]) -> usize {
         .map(|p| p.ip_mtu() as usize)
         .min()
         .unwrap_or(1500)
+}
+
+/// The ports on one network card: which one an arriving frame belongs to.
+#[derive(Debug, Clone, Default)]
+struct CardPorts {
+    /// The port for untagged (and priority-tagged, VLAN 0) frames.
+    untagged: Option<PortId>,
+    /// (VLAN ID, port). A handful at most, so a scan beats a hash.
+    tagged: Vec<(u16, PortId)>,
+}
+
+fn card_ports(ports: &[Port]) -> Vec<CardPorts> {
+    let n = ports.iter().map(|p| p.card as usize + 1).max().unwrap_or(0);
+    let mut cards = vec![CardPorts::default(); n];
+    for p in ports {
+        let c = &mut cards[p.card as usize];
+        match p.vlan {
+            None => c.untagged = Some(p.id),
+            Some(vid) => c.tagged.push((vid, p.id)),
+        }
+    }
+    cards
+}
+
+/// Make `n` bytes of room in front of the `len`-byte frame at `off`: there
+/// already is in a received frame (the driver's headroom); otherwise move the
+/// frame back. Returns the frame's (possibly new) offset, or `None` if the
+/// buffer can't hold it.
+#[inline]
+fn make_room(buf: &mut [u8], off: usize, len: usize, n: usize) -> Option<usize> {
+    if off >= n {
+        return Some(off);
+    }
+    if off + len + n > buf.len() {
+        return None;
+    }
+    buf.copy_within(off..off + len, off + n);
+    Some(off + n)
 }

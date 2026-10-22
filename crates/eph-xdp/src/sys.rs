@@ -1,4 +1,5 @@
-//! Kernel ABI: constants and structs from <linux/if_xdp.h> and <linux/bpf.h>.
+//! Kernel ABI: constants and structs from <linux/if_xdp.h>, <linux/bpf.h>
+//! and <linux/if_packet.h>.
 
 pub const AF_XDP: libc::c_int = 44;
 pub const SOL_XDP: libc::c_int = 283;
@@ -162,6 +163,18 @@ pub struct BpfInsn {
     pub regs: u8,
     pub off: i16,
     pub imm: i32,
+}
+
+// <linux/if_packet.h>: a packet socket's membership requests.
+pub const PACKET_ADD_MEMBERSHIP: libc::c_int = 1;
+pub const PACKET_MR_PROMISC: u16 = 1;
+
+#[repr(C)]
+pub struct PacketMreq {
+    pub mr_ifindex: libc::c_int,
+    pub mr_type: u16,
+    pub mr_alen: u16,
+    pub mr_address: [u8; 8],
 }
 
 pub unsafe fn bpf<T>(cmd: libc::c_long, attr: &mut T) -> libc::c_long {

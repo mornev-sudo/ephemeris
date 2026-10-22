@@ -33,6 +33,7 @@ mod sys;
 mod umem;
 
 pub use bpf::{XdpMode, XdpRedirect, XskMap};
+pub use iface::Promisc;
 pub use socket::{BindMode, Xsk, XskConfig, XskStats};
 pub use sys::XdpDesc;
 pub use umem::Umem;

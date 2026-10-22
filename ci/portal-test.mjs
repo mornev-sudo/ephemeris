@@ -56,7 +56,9 @@ try {
   });
   await step("reporting tab draws its four graphs", async () => {
     await page.click("button[data-tab=reports]");
-    await page.waitForFunction(() => document.querySelectorAll("#charts svg").length === 4);
+    // A locator, not waitForFunction: polling a function means eval in the
+    // page, which the portal's Content-Security-Policy (rightly) refuses.
+    await page.locator("#charts svg").nth(3).waitFor({ state: "attached" });
     await page.waitForSelector("#ifrates td:has-text('lan-a')");
     await page.waitForSelector("#captab td:has-text('Next hops')");
     await page.waitForSelector("#syscardsr .card:has-text('Memory')");

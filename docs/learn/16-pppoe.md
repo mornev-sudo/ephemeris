@@ -165,8 +165,8 @@ connections** table shows the same.
 - No RFC 4638 "baby jumbo" frames: some fibre ISPs allow a PPPoE MTU of
   1500 if the Ethernet side carries 1508-byte frames. Not yet supported.
 - IPv4 only (IPv6CP is rejected for now).
-- One session per interface. No PPPoE VLAN tagging yet (many ISPs need
-  VLAN 10 or 35 on fibre): that needs 802.1Q support first.
+- One session per interface. ISPs that want PPPoE on a VLAN (often 10, 35
+  or 7 on fibre): give the interface `vlan = <id>` (chapter 17).
 
 ## Exercises
 

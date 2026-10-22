@@ -189,7 +189,7 @@ async function refreshDash() {
     card("Throughput", r ? bps(r.rx_bps + r.tx_bps) : "–", r ? `in ${bps(r.rx_bps)} · out ${bps(r.tx_bps)}` : "measuring…"),
     card("Dropped packets", n(s.drops_total), r ? `${pps(r.drops_per_sec)} now · see Drops by reason` : "see Drops by reason"));
   table($("ports"), ["Name", "Role", "Device", "Address", "MAC", "XDP", "Zero-copy", "New sessions", "MSS adjust"],
-    s.ports.map(p => [p.name, p.role, td(p.device, "mono"), td(p.address, "mono"), td(p.mac, "mono"),
+    s.ports.map(p => [p.name, p.role, td(p.vlan != null ? `${p.device}.${p.vlan}` : p.device, "mono"), td(p.address, "mono"), td(p.mac, "mono"),
       td(p.xdp_mode, p.xdp_mode === "Native" ? "ok" : "warn"), p.zero_copy ? "yes" : "no",
       td(p.allow_new_sessions ? "allowed" : "replies only", p.allow_new_sessions ? "" : "warn"),
       p.mss_adjust ?? "off"]));
@@ -466,7 +466,7 @@ function renderNics() {
   box.append(t);
 }
 
-const newInterface = device => ({ name: "", device, address: "", role: "inside", allow_new_sessions: null,
+const newInterface = device => ({ name: "", device, vlan: null, address: "", role: "inside", allow_new_sessions: null,
   mss_adjust: null, mtu: null, gateway: null, dhcp: null });
 
 /// Interfaces: one card each with everything about it: name, card, role,
@@ -481,7 +481,8 @@ function renderIfaces() {
     if (i.pppoe && i.pppoe.mtu != null && i.mtu == null) { i.mtu = i.pppoe.mtu; i.pppoe.mtu = null; }
     const c = el("div", undefined, "card iface"); c.style.marginBottom = "12px";
     const head = el("div", undefined, "row");
-    head.append(el("h3", `${i.name || "new interface"}${i.device ? " (" + i.device + ")" : ""}`));
+    const on = i.device ? i.device + (i.vlan != null ? "." + i.vlan : "") : "";
+    head.append(el("h3", `${i.name || "new interface"}${on ? " (" + on + ")" : ""}`));
     const del = el("button", "Remove", "btn"); del.type = "button";
     del.onclick = () => { cfg.interface.splice(idx, 1); dirty(); renderCfg(); };
     head.append(del);
@@ -492,6 +493,8 @@ function renderIfaces() {
       { key: "name", label: "Name", placeholder: "lan" },
       { key: "device", label: "Network card", type: "select",
         options: () => devices.filter(d => !d.kernel).map(d => [d.name, d.driver ? `${d.name} (${d.driver})` : d.name]) },
+      { key: "vlan", label: "VLAN", type: "number", min: 1, max: 4094, optional: true, placeholder: "untagged",
+        help: "802.1Q VLAN ID (1-4094). One card can carry several VLAN interfaces and one untagged." },
       { key: "role", label: "Role", type: "select", options: [["inside", "inside: your network"], ["outside", "outside: the internet"]], empty: "inside" },
     ]);
     // Addressing: not a field of its own in the file (address says it).

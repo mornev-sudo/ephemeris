@@ -7,7 +7,8 @@ pub enum DropReason {
     Malformed,
     /// Unicast frame for some other MAC address.
     NotForUs,
-    /// 802.1Q tagged frames are not supported yet.
+    /// A VLAN no interface is configured for on that card (or an untagged
+    /// frame on a card that only has VLAN interfaces).
     Vlan,
     /// Not IPv4 or ARP (e.g. IPv6, LLDP).
     UnsupportedEthertype,

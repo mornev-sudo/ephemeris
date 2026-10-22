@@ -105,7 +105,9 @@ Two rules from RFC 1812 that we follow, and why:
 
 ## Things we deliberately don't handle yet
 
-- **VLAN tags** (802.1Q): an extra 4 bytes after the MACs. Dropped and counted.
+- **VLAN tags** (802.1Q): an extra 4 bytes after the MACs. Handled now:
+  see chapter 17. A tag no interface is configured for is dropped and
+  counted.
 - **IPv6**: dropped and counted as "unsupported-ethertype".
 - **Fragmentation**: if a packet is bigger than the outgoing link's MTU, a
   real router fragments it or sends "Fragmentation Needed". All our lab links

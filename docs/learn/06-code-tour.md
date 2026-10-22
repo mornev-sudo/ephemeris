@@ -11,7 +11,8 @@ client-b (10.10.2.10) through `ephemerisd`, in the order things happen.
    static routes into a DIR-24-8 table, wrapped in an `Arc` (a shared,
    read-only pointer) that every worker gets a copy of.
 2. **Per worker:** allocate a `Umem` (frames, on huge pages if available),
-   then create one `Xsk` socket per interface, all on the same queue number
+   then create one `Xsk` socket per network card (VLAN interfaces share
+   their card's, chapter 17), all on the same queue number
    and **sharing that UMEM**. The first socket registers the UMEM; the others
    pass `XDP_SHARED_UMEM`. See `Xsk::new` in
    [`eph-xdp/src/socket.rs`](../../crates/eph-xdp/src/socket.rs) for the exact
@@ -45,9 +46,10 @@ Each iteration does seven things in order:
    the ring in one go (one shared-memory write, not 64). For each descriptor:
    - `umem.frame_mut(addr)` turns the address into a `&mut [u8]`: the
      packet's bytes, right where the NIC put them.
-   - `pipeline.process(port, buf, len)` decides. More on that next.
-   - `Verdict::Tx { port, len }`: push `{addr, len}` onto the **egress
-     socket's TX ring**. Same frame, no copy.
+   - `pipeline.process(card, buf, off, len)` decides. More on that next.
+   - `Verdict::Tx { port, off, len }`: push `{addr + off, len}` onto the
+     TX ring of the **egress port's card** (`pipeline.card_of(port)`).
+     Same frame, no copy.
    - `Verdict::Drop(reason)`: return the frame to the free list.
 4. **Emit** router-generated frames (ARP requests) into fresh frames.
 5. **Broadcast** newly learned neighbours to sibling workers.

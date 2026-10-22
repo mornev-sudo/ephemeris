@@ -67,9 +67,19 @@ role = "inside"
 # address = "10.10.1.10"
 # name = "nas"
 
+# VLANs (802.1Q): more interfaces on the same card, each with its own tag
+# (see docs/learn/17-vlans.md). One card carries any number of VLANs and at
+# most one untagged interface. The switch port must send these VLANs tagged.
+# [[interface]]
+# name = "guest"
+# device = "ens19"
+# vlan = 10
+# address = "10.10.10.1/24"
+
 [[interface]]
 name = "wan"
 device = "ens20"
+# vlan = 7                     # e.g. PPPoE on VLAN 7, as some ISPs deliver it
 address = "10.10.2.1/24"       # or "dhcp", or "pppoe" (with [interface.pppoe] below)
 role = "outside"
 # gateway = "10.10.2.254"      # the ISP's router (static address): SD-WAN tethers use it

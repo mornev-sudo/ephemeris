@@ -124,6 +124,8 @@ fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
     let (a, l) = addr.split_once('/').unwrap();
     Port {
         id,
+        card: id,
+        vlan: None,
         name: name.into(),
         mac,
         addr: ip(a),
