@@ -689,7 +689,8 @@ function renderCfg() {
   ], () => ({ name: "", source: null, destination: null, outbound: null, translate: "interface", pool: null }), "Add rule");
 
   formFields($("f-sess"), cfg.sessions, [
-    { key: "max_per_worker", label: "Sessions per worker", type: "number", min: 1, help: "Memory is reserved up front (~150 bytes each)." },
+    { key: "max_per_worker", label: "Sessions per worker", placeholder: "auto", optional: true,
+      help: "\"auto\" sizes the tables from the memory free at start, or a number. Reserved up front, about 300 bytes each." },
     { key: "tcp_strict", label: "Strict TCP (only a SYN may open a session)", type: "check" },
     { key: "tcp_handshake_timeout_secs", max: 3600, label: "TCP handshake timeout (s)", type: "number", min: 1 },
     { key: "tcp_established_timeout_secs", max: 3600, label: "TCP established timeout (s)", type: "number", min: 1 },

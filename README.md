@@ -70,14 +70,17 @@ The minimum is what CI boot-tests every build on: a 2-core, 2 GB VM.
   runs the portal, DHCP and PPPoE, SD-WAN probing and the OS. Each extra
   worker needs another core and another NIC queue.
 - **RAM:** the tables are reserved at start-up:
-  - per worker, about 40 MB of session table (262,144 sessions by default)
-    and about 32 MB of packet buffers;
+  - per worker, the session table (about 300 bytes per session) and about
+    32 MB of packet buffers (two cards, the default ring size);
   - shared, the forwarding table: 32-48 MiB;
   - plus the OS, nginx and ephemerisd.
 
-  One worker with default settings fits in about 1 GB, but that isn't
-  tested. Table sizes are fixed by the config (`sessions.max_per_worker`),
-  not sized from the machine's RAM yet.
+  By default (`sessions.max_per_worker = "auto"`) the session tables are
+  sized from the memory free at start: half of what's left after the packet
+  buffers, the forwarding table and 256 MiB for the system. On a 2 GB
+  machine with one worker that's around 2 million sessions. A fixed size
+  that doesn't fit is refused at start (the router falls back to the last
+  config that worked); one that only just fits is logged as a warning.
 - **Disk:** the layout is fixed:
   - EFI system partition: 512 MB;
   - two root slots for A/B updates: 1.5 GB each, plus 64 MB of verity data
@@ -168,7 +171,7 @@ Plain-language explanations of everything in here, in reading order:
 - [ ] **Next for the edge:** destination NAT / port forwarding, `ephsh` router CLI
 - [ ] **Performance and capacity:**
   - [ ] Benchmarks: a microbenchmark of the per-packet pipeline (CPU ceiling per core, no NIC), and a lab test with a traffic generator (pktgen / TRex) for real packets per second on Proxmox and on hardware NICs
-  - [ ] Memory-aware sizing: `sessions.max_per_worker = "auto"` sized from the RAM available at start, and a start-up check that refuses or warns when the reserved tables (sessions, FIB, packet buffers) exceed what the machine has
+  - [x] Memory-aware sizing: `sessions.max_per_worker = "auto"` (the default) sized from the RAM available at start, and a start-up check that refuses or warns when the reserved tables (sessions, FIB, packet buffers) exceed what the machine has
   - [ ] Scaling beyond one core per flow: spread PPPoE traffic (NICs can't hash inside PPPoE, so a PPPoE WAN lands on one queue) and SD-WAN tether traffic (one UDP flow per tether) across workers
   - [ ] Jumbo frames: interface MTUs above 1500 (bigger packet buffers, the NIC's own MTU raised)
 - [ ] **Phase 4: SD-WAN.**

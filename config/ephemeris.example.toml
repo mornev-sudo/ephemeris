@@ -35,8 +35,10 @@ token_file = "/var/lib/ephemeris/api-token"
 # hostnames = ["router.example.net"]
 
 [sessions]
-# Capacity per worker. Memory is reserved up front (~150 bytes per session).
-max_per_worker = 262144
+# Capacity per worker. Memory is reserved up front (~300 bytes per session).
+# "auto": half of the memory left at start once packet buffers, the
+# forwarding table and 256 MiB for the system are set aside. Or a number.
+max_per_worker = "auto"
 # true: only a TCP SYN may open a session. false: also pick up connections
 # already in progress (useful right after a router restart).
 tcp_strict = false

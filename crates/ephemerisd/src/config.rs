@@ -495,8 +495,9 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SessionsCfg {
-    /// Session table capacity per worker thread.
-    pub max_per_worker: u32,
+    /// Session table capacity per worker thread: a number, or "auto" to
+    /// size it from the memory the machine has at start (see `memory`).
+    pub max_per_worker: SessionsMax,
     /// Only a TCP SYN may open a session (no mid-stream pickup).
     pub tcp_strict: bool,
     pub tcp_handshake_timeout_secs: u64,
@@ -506,11 +507,68 @@ pub struct SessionsCfg {
     pub icmp_timeout_secs: u64,
 }
 
+/// `sessions.max_per_worker`: a fixed size, or sized from memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionsMax {
+    #[default]
+    Auto,
+    Fixed(u32),
+}
+
+impl Serialize for SessionsMax {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            SessionsMax::Auto => s.serialize_str("auto"),
+            SessionsMax::Fixed(n) => s.serialize_u32(*n),
+        }
+    }
+}
+
+/// A number, or "auto". (The portal's form sends numbers as text too.)
+impl<'de> Deserialize<'de> for SessionsMax {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = SessionsMax;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a number of sessions or \"auto\"")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<SessionsMax, E> {
+                u32::try_from(v)
+                    .map(SessionsMax::Fixed)
+                    .map_err(|_| E::custom("too many sessions"))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<SessionsMax, E> {
+                u64::try_from(v)
+                    .map_err(|_| E::custom("must be at least 1"))
+                    .and_then(|v| self.visit_u64(v))
+            }
+            /// An emptied field in the portal.
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<SessionsMax, E> {
+                Ok(SessionsMax::Auto)
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<SessionsMax, E> {
+                let v = v.trim();
+                if v.is_empty() || v.eq_ignore_ascii_case("auto") {
+                    return Ok(SessionsMax::Auto);
+                }
+                v.parse::<u64>()
+                    .map_err(|_| E::custom("expected a number of sessions or \"auto\""))
+                    .and_then(|n| self.visit_u64(n))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 impl Default for SessionsCfg {
     fn default() -> Self {
         let s = SessionConfig::default();
         SessionsCfg {
-            max_per_worker: s.max_sessions,
+            max_per_worker: SessionsMax::Auto,
             tcp_strict: s.tcp_strict,
             tcp_handshake_timeout_secs: s.timeouts.tcp_handshake,
             tcp_established_timeout_secs: s.timeouts.tcp_established,
@@ -522,9 +580,11 @@ impl Default for SessionsCfg {
 }
 
 impl SessionsCfg {
-    /// The data plane's settings. No session may sit idle for more than an
-    /// hour ([`eph_dataplane::MAX_IDLE_SECS`]): longer timeouts are capped.
-    pub fn to_config(&self) -> SessionConfig {
+    /// The data plane's settings, for tables of `max_sessions` (the
+    /// configured size, or what `memory::plan` worked out for "auto"). No
+    /// session may sit idle for more than an hour
+    /// ([`eph_dataplane::MAX_IDLE_SECS`]): longer timeouts are capped.
+    pub fn to_config(&self, max_sessions: u32) -> SessionConfig {
         let cap = |name: &str, v: u64| {
             if v > eph_dataplane::MAX_IDLE_SECS {
                 tracing::warn!(
@@ -535,7 +595,7 @@ impl SessionsCfg {
             v.min(eph_dataplane::MAX_IDLE_SECS)
         };
         SessionConfig {
-            max_sessions: self.max_per_worker,
+            max_sessions,
             tcp_strict: self.tcp_strict,
             timeouts: Timeouts {
                 tcp_handshake: cap(
@@ -691,8 +751,13 @@ impl Config {
         if !d.cpus.is_empty() && d.cpus.len() != d.workers as usize {
             bail!("dataplane.cpus must list exactly one CPU per worker");
         }
-        if self.sessions.max_per_worker == 0 || self.sessions.max_per_worker > 16_000_000 {
-            bail!("sessions.max_per_worker must be between 1 and 16000000");
+        if let SessionsMax::Fixed(n) = self.sessions.max_per_worker {
+            if n == 0 || n > crate::memory::SESSIONS_MAX {
+                bail!(
+                    "sessions.max_per_worker must be between 1 and {}, or \"auto\"",
+                    crate::memory::SESSIONS_MAX
+                );
+            }
         }
         // Timeouts above an hour are capped when applied (`to_config`), not
         // refused: a config saved by an older release must still start.
@@ -1569,10 +1634,17 @@ pub fn print_summary(cfg: &Config) -> Result<()> {
         "\nData plane: {} worker(s), xdp_mode={}, bind_mode={}, ring_size={}, busy_poll={}",
         d.workers, d.xdp_mode, d.bind_mode, d.ring_size, d.busy_poll
     );
-    let sc = cfg.sessions.to_config();
+    // Sized for this machine, as at start (or the defaults, elsewhere).
+    let plan = crate::memory::plan(
+        cfg,
+        fib.memory_bytes() as u64,
+        crate::memory::machine().as_ref(),
+    )?;
+    let sc = cfg.sessions.to_config(plan.sessions_per_worker);
     println!(
-        "Sessions: up to {} per worker, tcp_strict={}, timeouts tcp={}s udp={}s/{}s icmp={}s",
+        "Sessions: up to {}{} per worker, tcp_strict={}, timeouts tcp={}s udp={}s/{}s icmp={}s",
         sc.max_sessions,
+        if plan.auto { " (auto)" } else { "" },
         sc.tcp_strict,
         sc.timeouts.tcp_established,
         sc.timeouts.udp,
@@ -1601,6 +1673,47 @@ mod tests {
     }
 
     #[test]
+    fn max_per_worker_is_a_number_or_auto() {
+        let max = |v: &str| -> Result<SessionsMax> {
+            Ok(parse(&format!(
+                "[sessions]\nmax_per_worker = {v}\n[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n"
+            ))?
+            .sessions
+            .max_per_worker)
+        };
+        assert_eq!(max("1000").unwrap(), SessionsMax::Fixed(1000));
+        assert_eq!(max("\"auto\"").unwrap(), SessionsMax::Auto);
+        assert_eq!(
+            max("\"5000\"").unwrap(),
+            SessionsMax::Fixed(5000),
+            "the portal's text"
+        );
+        let json: SessionsCfg = serde_json::from_str(r#"{"max_per_worker": null}"#).unwrap();
+        assert_eq!(
+            json.max_per_worker,
+            SessionsMax::Auto,
+            "an emptied portal field"
+        );
+        for bad in ["0", "16000001", "-1", "\"lots\"", "99999999999"] {
+            assert!(max(bad).is_err(), "{bad}");
+        }
+        // Left out: auto. Written back as it was read.
+        let c = Config::parse(
+            "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.sessions.max_per_worker, SessionsMax::Auto);
+        assert!(toml::to_string(&c)
+            .unwrap()
+            .contains("max_per_worker = \"auto\""));
+        let mut c = c;
+        c.sessions.max_per_worker = SessionsMax::Fixed(4096);
+        assert!(toml::to_string(&c)
+            .unwrap()
+            .contains("max_per_worker = 4096"));
+    }
+
+    #[test]
     fn session_timeouts_are_capped_at_an_hour() {
         let text = include_str!("../../../config/ephemeris.example.toml");
         let mut c = parse(text).unwrap();
@@ -1609,7 +1722,7 @@ mod tests {
         c.sessions.udp_stream_timeout_secs = 7_200;
         c.validate().unwrap();
         // ...but no session stays idle for more than an hour.
-        let t = c.sessions.to_config().timeouts;
+        let t = c.sessions.to_config(1000).timeouts;
         assert_eq!(t.tcp_established, eph_dataplane::MAX_IDLE_SECS);
         assert_eq!(t.udp_stream, eph_dataplane::MAX_IDLE_SECS);
         assert_eq!(t.udp, 30, "shorter ones are left alone");
