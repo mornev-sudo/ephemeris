@@ -35,6 +35,18 @@ chacha20poly1305 = { version = "0.10", default-features = false }
 # CHAP-MD5 for PPPoE logins (RFC 1994 mandates MD5; nothing else uses it).
 md-5 = { version = "0.10", default-features = false }
 
+# Rules for `unsafe`, checked on every build (and by clippy in CI): every
+# unsafe block and impl says why it's sound in a `// SAFETY:` comment, every
+# unsafe fn says what its callers must guarantee (`# Safety`), and unsafe
+# operations inside an unsafe fn still need their own block. Crates that
+# don't need unsafe at all forbid it outright (#![forbid(unsafe_code)]).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+
 # The data plane lives or dies by inlining and branch layout, so even
 # dev builds get some optimisation, and release builds get LTO.
 [profile.dev]

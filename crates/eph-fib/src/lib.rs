@@ -21,6 +21,10 @@
 //! change, the control plane builds a new table and swaps a pointer, so the
 //! data plane never sees a half-updated table and never takes a lock.
 
+// No unsafe code here: packet parsing, routing and forwarding logic is
+// all safe Rust, and the compiler keeps it that way.
+#![forbid(unsafe_code)]
+
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;

@@ -31,7 +31,7 @@ pub const XDP_UMEM_PGOFF_FILL_RING: libc::off_t = 0x1_0000_0000;
 pub const XDP_UMEM_PGOFF_COMPLETION_RING: libc::off_t = 0x1_8000_0000;
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct XdpRingOffset {
     pub producer: u64,
     pub consumer: u64,
@@ -177,8 +177,17 @@ pub struct PacketMreq {
     pub mr_address: [u8; 8],
 }
 
+/// The `bpf(2)` syscall.
+///
+/// # Safety
+/// `T` must be the `#[repr(C)]` leading part of `union bpf_attr` that `cmd`
+/// reads, with every unused byte zero; any addresses inside it (keys,
+/// values, instructions, log buffers) must point to memory that stays valid,
+/// and is big enough, for the duration of the call.
 pub unsafe fn bpf<T>(cmd: libc::c_long, attr: &mut T) -> libc::c_long {
-    libc::syscall(libc::SYS_bpf, cmd, attr as *mut T, std::mem::size_of::<T>())
+    // SAFETY: the caller upholds the contract above; the kernel reads and
+    // writes at most `size_of::<T>()` bytes of `attr`.
+    unsafe { libc::syscall(libc::SYS_bpf, cmd, attr as *mut T, std::mem::size_of::<T>()) }
 }
 
 pub fn cvt(r: libc::c_int) -> std::io::Result<libc::c_int> {

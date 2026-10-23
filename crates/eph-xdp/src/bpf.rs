@@ -57,11 +57,14 @@ impl XskMap {
             map_name: MAP_NAME,
             ..Default::default()
         };
+        // SAFETY: a bpf_attr for BPF_MAP_CREATE, zeroed past the fields set;
+        // no pointers inside.
         let fd = unsafe { bpf(BPF_MAP_CREATE, &mut attr) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(XskMap {
+            // SAFETY: a new, valid descriptor nobody else owns.
             fd: unsafe { OwnedFd::from_raw_fd(fd as RawFd) },
         })
     }
@@ -76,6 +79,8 @@ impl XskMap {
             value: &value as *const u32 as u64,
             ..Default::default()
         };
+        // SAFETY: `key` and `value` are live locals of the map's key and value
+        // size (4 bytes each), valid for the whole call.
         if unsafe { bpf(BPF_MAP_UPDATE_ELEM, &mut attr) } < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -118,10 +123,13 @@ impl XdpRedirect {
                 flags,
                 ..Default::default()
             };
+            // SAFETY: a bpf_attr for BPF_LINK_CREATE, zeroed past the fields
+            // set; no pointers inside.
             let fd = unsafe { bpf(BPF_LINK_CREATE, &mut attr) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: a new, valid descriptor nobody else owns.
             Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
         };
         let (link, mode) = match mode {
@@ -198,8 +206,11 @@ fn load_program(map_fd: RawFd) -> io::Result<OwnedFd> {
         expected_attach_type: BPF_XDP,
         ..Default::default()
     };
+    // SAFETY: `insns` and `license` (NUL-terminated) are live for the call;
+    // insn_cnt is the array's length.
     let fd = unsafe { bpf(BPF_PROG_LOAD, &mut attr) };
     if fd >= 0 {
+        // SAFETY: a new, valid descriptor nobody else owns.
         return Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
     }
     let err = io::Error::last_os_error();
@@ -208,7 +219,14 @@ fn load_program(map_fd: RawFd) -> io::Result<OwnedFd> {
     attr.log_level = 1;
     attr.log_size = log.len() as u32;
     attr.log_buf = log.as_mut_ptr() as u64;
-    unsafe { bpf(BPF_PROG_LOAD, &mut attr) };
+    // SAFETY: as above, plus `log`: live, and log_size is its length, so the
+    // kernel writes no further. (Any program it loads now is closed again:
+    // this call is only for the message.)
+    let fd = unsafe { bpf(BPF_PROG_LOAD, &mut attr) };
+    if fd >= 0 {
+        // SAFETY: a new, valid descriptor nobody else owns; dropped at once.
+        drop(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+    }
     let end = log.iter().position(|&b| b == 0).unwrap_or(log.len());
     Err(io::Error::new(
         err.kind(),

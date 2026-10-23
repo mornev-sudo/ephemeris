@@ -754,6 +754,9 @@ impl Config {
         if !d.cpus.is_empty() && d.cpus.len() != d.workers as usize {
             bail!("dataplane.cpus must list exactly one CPU per worker");
         }
+        if let Some(c) = d.cpus.iter().find(|&&c| c >= 1024) {
+            bail!("dataplane.cpus: CPU {c} doesn't exist (CPUs are numbered from 0, below 1024)");
+        }
         if let SessionsMax::Fixed(n) = self.sessions.max_per_worker {
             if n == 0 || n > crate::memory::SESSIONS_MAX {
                 bail!(
@@ -2238,6 +2241,20 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
         );
         assert!(err(two).contains("two interfaces are named lan"));
         assert!(parse(&iface("lan", "ens19")).is_ok());
+    }
+
+    #[test]
+    fn worker_cpus_must_exist() {
+        let cfg = |cpus: &str| {
+            parse(&format!(
+                "[dataplane]\nworkers = 1\ncpus = [{cpus}]\n[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n"
+            ))
+        };
+        assert!(cfg("3").is_ok());
+        assert!(cfg("1024")
+            .unwrap_err()
+            .to_string()
+            .contains("CPU 1024 doesn't exist"));
     }
 
     #[test]

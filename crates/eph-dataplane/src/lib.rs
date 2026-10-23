@@ -11,6 +11,10 @@
 //! that must be shared, learned ARP neighbours, is passed between workers as
 //! messages (see [`Pipeline::learned`] / [`Pipeline::learn`]).
 
+// No unsafe code here: packet parsing, routing and forwarding logic is
+// all safe Rust, and the compiler keeps it that way.
+#![forbid(unsafe_code)]
+
 mod config;
 mod filter;
 pub mod nat;
