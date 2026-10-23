@@ -45,6 +45,9 @@ pub struct Port {
     /// 802.1Q VLAN ID: frames on this port carry this tag on the wire.
     /// `None`: untagged.
     pub vlan: Option<u16>,
+    /// The router's own SSH and portal on this port's address (inside
+    /// ports only; see [`crate::host`]).
+    pub host: crate::host::HostAccess,
 }
 
 /// A port's PPPoE state.

@@ -30,6 +30,7 @@ pub mod iface;
 pub mod ring;
 mod socket;
 mod sys;
+pub mod tun;
 mod umem;
 
 pub use bpf::{XdpMode, XdpRedirect, XskMap};

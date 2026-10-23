@@ -219,6 +219,15 @@ pub struct InterfaceCfg {
     /// "inside" (your networks, the default) or "outside" (the internet).
     #[serde(default)]
     pub role: RoleCfg,
+    /// The router's own services reachable on this interface's address:
+    /// "https" (the portal, port 8443) and/or "ssh" (port 22). Inside
+    /// interfaces only; none by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub management: Vec<String>,
+    /// Only clients in these prefixes may use them (empty: anyone who can
+    /// reach the address).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub management_from: Vec<String>,
     /// May traffic arriving here start new sessions? Defaults to yes on
     /// inside and no on outside interfaces (only replies get in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -826,6 +835,27 @@ impl Config {
                     bail!("{which}: vlan must be between 1 and {}", eth::VLAN_ID_MAX);
                 }
             }
+            for m in &i.management {
+                if !["https", "ssh"].contains(&m.as_str()) {
+                    bail!(
+                        "{which}: management {m:?}: choose \"https\" (the portal) and/or \"ssh\""
+                    );
+                }
+            }
+            // The router's own SSH and portal are never offered to the
+            // internet (the data plane refuses them there as well).
+            if !i.management.is_empty() && i.role == RoleCfg::Outside {
+                bail!(
+                    "{which}: SSH and the portal can only be reached on inside interfaces, not on an outside one"
+                );
+            }
+            if !i.management_from.is_empty() && i.management.is_empty() {
+                bail!("{which}: management_from without management (\"https\", \"ssh\") has no effect");
+            }
+            for p in &i.management_from {
+                p.parse::<Prefix>()
+                    .map_err(|e| anyhow::anyhow!("{which}: management_from {p:?}: {e}"))?;
+            }
             if let Some(mss) = i.mss_adjust {
                 if !MSS_ADJUST_RANGE.contains(&mss) {
                     bail!(
@@ -1134,6 +1164,15 @@ impl Config {
                     mtu: i.ip_mtu(),
                     card: cards.iter().position(|&c| c == i.device).unwrap_or(0) as u16,
                     vlan: i.vlan,
+                    host: eph_dataplane::host::HostAccess {
+                        https: i.management.iter().any(|m| m == "https"),
+                        ssh: i.management.iter().any(|m| m == "ssh"),
+                        from: i
+                            .management_from
+                            .iter()
+                            .filter_map(|p| p.parse().ok())
+                            .collect(),
+                    },
                     pppoe: match (i.is_pppoe(), i.pppoe_session) {
                         (false, _) => eph_dataplane::Pppoe::Off,
                         (true, None) => eph_dataplane::Pppoe::Dialing,
@@ -2241,6 +2280,39 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
         );
         assert!(err(two).contains("two interfaces are named lan"));
         assert!(parse(&iface("lan", "ens19")).is_ok());
+    }
+
+    #[test]
+    fn management_access_only_on_inside_interfaces() {
+        let iface = |role: &str, extra: &str| {
+            format!(
+                "[[interface]]\nname = \"x\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\nrole = {role:?}\n{extra}"
+            )
+        };
+        let c = parse(&iface(
+            "inside",
+            "management = [\"https\", \"ssh\"]\nmanagement_from = [\"10.0.0.0/25\"]\n",
+        ))
+        .unwrap();
+        let p = &c.ports(|_| Ok([0; 6])).unwrap()[0];
+        assert!(p.host.https && p.host.ssh);
+        assert_eq!(p.host.from, vec!["10.0.0.0/25".parse().unwrap()]);
+        // None unless asked for.
+        let c = parse(&iface("inside", "")).unwrap();
+        assert!(!c.ports(|_| Ok([0; 6])).unwrap()[0].host.any());
+
+        let err = |extra: &str, role: &str| parse(&iface(role, extra)).unwrap_err().to_string();
+        assert!(err("management = [\"ssh\"]\n", "outside")
+            .contains("only be reached on inside interfaces"));
+        assert!(err("management = [\"https\"]\n", "outside")
+            .contains("only be reached on inside interfaces"));
+        assert!(err("management = [\"telnet\"]\n", "inside").contains("choose \"https\""));
+        assert!(err("management_from = [\"10.0.0.0/8\"]\n", "inside").contains("has no effect"));
+        assert!(err(
+            "management = [\"ssh\"]\nmanagement_from = [\"nope\"]\n",
+            "inside"
+        )
+        .contains("management_from"));
     }
 
     #[test]

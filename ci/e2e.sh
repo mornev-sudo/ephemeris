@@ -234,6 +234,24 @@ check "resources: worker threads measured" sh -c "${SSH[*]} ephctl --json system
 check "live route add"                     sh -c "${SSH[*]} ephctl route add 0.0.0.0/0 10.10.2.10 && ! ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'net unreachable'"
 check "live route delete"                  sh -c "${SSH[*]} ephctl route del 0.0.0.0/0 && ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'From 10.10.1.1 .*net unreachable'"
 
+# ------------------------------------------------------------ router access
+# The portal and SSH on lan-a's own address (inside), through the host path
+# (eph-host); never on lan-b, which is outside, whatever the config says.
+echo "Router access on data-plane interfaces:"
+sed 's|^address = "10.10.1.1/24"$|address = "10.10.1.1/24"\nmanagement = ["https", "ssh"]|' "$WORK/ephemeris.toml" > "$WORK/access.toml"
+on_router "cat > /run/access.toml" < "$WORK/access.toml"
+check "offer the portal and SSH on lan-a"   on_router "ephctl config load /run/access.toml && ephctl config commit"
+check "portal from lan-a (10.10.1.1:8443)"  wait_for 30 "the portal on lan-a" sh -c "[ \"\$(ip netns exec ci-ha curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://10.10.1.1:8443/)\" = 200 ]"
+check "SSH from lan-a (10.10.1.1:22)"       ip netns exec ci-ha ssh -q -i "$WORK/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes root@10.10.1.1 true
+check "sshd sees the real client address"   on_router "journalctl -u ssh --no-pager | grep -q 'from 10.10.1.10 port'"
+check "not on lan-b (outside): portal"      sh -c "! ip netns exec ci-hb curl -sk -o /dev/null --max-time 5 https://10.10.2.1:8443/"
+check "not on lan-b (outside): SSH"         sh -c "! ip netns exec ci-hb ssh -q -i '$WORK/key' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes root@10.10.2.1 true"
+sed 's|^address = "dhcp"$|address = "dhcp"\nmanagement = ["ssh"]|' "$WORK/access.toml" > "$WORK/access-wan.toml"
+on_router "cat > /run/access-wan.toml" < "$WORK/access-wan.toml"
+check "outside access is refused"           sh -c "${SSH[*]} ephctl config load /run/access-wan.toml 2>&1 | grep -q 'only be reached on inside interfaces'"
+check "turn it off again"                   on_router "ephctl config rollback 1"
+check "portal from lan-a closed again"      wait_for 15 "lan-a closed" sh -c "! ip netns exec ci-ha curl -sk -o /dev/null --max-time 3 https://10.10.1.1:8443/"
+
 # ------------------------------------------------------------ logging
 # Categories, levels changed at run time, the files under /var/log/ephemeris
 # (created by systemd, private, capped), structured journal entries, and a

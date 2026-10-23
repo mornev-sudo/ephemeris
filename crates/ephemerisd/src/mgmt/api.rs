@@ -542,6 +542,15 @@ async fn change_password(
 
 // ------------------------------------------------------------------ reads
 
+/// The router's own services an interface offers: ["https", "ssh"].
+fn management(h: &eph_dataplane::host::HostAccess) -> Vec<&'static str> {
+    [("https", h.https), ("ssh", h.ssh)]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(m, _)| m)
+        .collect()
+}
+
 async fn status(State(s): St) -> Json<Value> {
     let sum = s.summary();
     let ports = s.ports.read().unwrap().clone();
@@ -555,6 +564,7 @@ async fn status(State(s): St) -> Json<Value> {
                 "address": format!("{}/{}", p.addr, p.subnet.len()),
                 "allow_new_sessions": p.allow_new_sessions,
                 "mss_adjust": p.mss_adjust,
+                "management": management(&p.host),
                 "role": if p.role == eph_dataplane::Role::Outside { "outside" } else { "inside" },
                 "xdp_mode": rt.xdp_mode, "zero_copy": rt.zero_copy,
             })

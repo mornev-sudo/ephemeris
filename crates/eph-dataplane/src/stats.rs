@@ -80,10 +80,12 @@ pub enum DropReason {
     PppoeToControl,
     /// For the control plane, but its queue was full (e.g. a DHCP flood).
     ControlQueueFull,
+    /// SSH or portal traffic handed to the router's own host (see `host`).
+    ToHost,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 35] = [
+    pub const ALL: [DropReason; 36] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -119,6 +121,7 @@ impl DropReason {
         DropReason::DhcpToControl,
         DropReason::PppoeToControl,
         DropReason::ControlQueueFull,
+        DropReason::ToHost,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -159,6 +162,7 @@ impl DropReason {
             DropReason::DhcpToControl => "dhcp-to-control",
             DropReason::PppoeToControl => "pppoe-to-control",
             DropReason::ControlQueueFull => "control-queue-full",
+            DropReason::ToHost => "to-host",
         }
     }
 }

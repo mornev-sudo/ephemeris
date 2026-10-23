@@ -17,6 +17,7 @@
 
 mod config;
 mod filter;
+pub mod host;
 pub mod nat;
 pub mod overlay;
 mod pipeline;

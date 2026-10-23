@@ -71,6 +71,12 @@ device = "ens19"
 address = "10.10.1.1/24"
 role = "inside"
 
+# The router's own portal (https://10.10.1.1:8443/) and SSH on this
+# interface's address, besides the management NIC. Inside interfaces only:
+# never offered on an outside one. (docs/learn/19-router-access.md)
+# management = ["https", "ssh"]
+# management_from = ["10.10.1.0/24"]   # only these clients; empty: anyone here
+
 # Lease addresses to devices on this interface (see docs/learn/15-dhcp.md).
 # [interface.dhcp]
 # range = "10.10.1.100-10.10.1.199"

@@ -126,6 +126,7 @@ fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
         id,
         card: id,
         vlan: None,
+        host: Default::default(),
         name: name.into(),
         mac,
         addr: ip(a),

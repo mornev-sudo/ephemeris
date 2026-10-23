@@ -24,6 +24,9 @@ pub enum Control {
     SetNat(Arc<NatConfig>),
     /// What to trace (debug logging of packets).
     SetTrace(eph_dataplane::trace::TraceConfig),
+    /// A reply from the router's own SSH or portal (an IP packet from the
+    /// host path) to send.
+    InjectHost(Vec<u8>),
     /// Send this frame out of `port` (DHCP replies and requests).
     Transmit { port: PortId, frame: Vec<u8> },
 }
