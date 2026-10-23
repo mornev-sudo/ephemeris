@@ -8,6 +8,10 @@
 //! All multi-byte header fields on the wire are big-endian ("network byte
 //! order"), so reads go through `u16::from_be_bytes` and friends.
 
+// No unsafe code here: packet parsing, routing and forwarding logic is
+// all safe Rust, and the compiler keeps it that way.
+#![forbid(unsafe_code)]
+
 pub mod arp;
 pub mod checksum;
 pub mod dhcp;

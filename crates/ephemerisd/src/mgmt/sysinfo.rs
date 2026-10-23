@@ -115,7 +115,10 @@ pub struct Disk {
 pub fn disk(path: &str) -> Option<Disk> {
     use std::ffi::CString;
     let c = CString::new(path).ok()?;
+    // SAFETY: statvfs is plain C data; all zeros is a valid value.
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is NUL-terminated and `s` a live statvfs, both valid for
+    // the call.
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
         return None;
     }
@@ -244,6 +247,7 @@ impl Sampler {
 }
 
 fn ticks_per_sec() -> f64 {
+    // SAFETY: plain query, no pointers.
     let t = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if t > 0 {
         t as f64

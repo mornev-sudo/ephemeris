@@ -30,3 +30,6 @@ tower.workspace = true
 eph-xdp.workspace = true
 # Structured journal entries (fields, priorities) instead of text on stderr.
 tracing-journald = "0.3"
+
+[lints]
+workspace = true

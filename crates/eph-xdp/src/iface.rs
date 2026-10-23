@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 pub fn ifindex(name: &str) -> io::Result<u32> {
     let c =
         CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad name"))?;
+    // SAFETY: `c` is a valid NUL-terminated string, live for the call.
     match unsafe { libc::if_nametoindex(c.as_ptr()) } {
         0 => Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -64,10 +65,17 @@ pub fn disable_vlan_stripping(name: &str) -> io::Result<bool> {
         cmd: u32,
         data: u32,
     }
+    // SAFETY: plain syscall, no pointers; the result is checked.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    // SAFETY: a new, valid descriptor nobody else owns.
     let sock = unsafe { OwnedFd::from_raw_fd(cvt(sock)?) };
+    // SAFETY: ifreq is plain C data (integers, arrays, a union of them and
+    // a pointer); all zeros is a valid value, and a NUL-filled name.
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-    if name.len() >= req.ifr_name.len() {
+    // At most 15 bytes and no NUL inside, so the name stays NUL-terminated
+    // and the kernel reads the whole of it (a NUL would cut it short and
+    // name a different card).
+    if name.len() >= req.ifr_name.len() || name.bytes().any(|b| b == 0) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad name"));
     }
     for (d, s) in req.ifr_name.iter_mut().zip(name.bytes()) {
@@ -79,6 +87,9 @@ pub fn disable_vlan_stripping(name: &str) -> io::Result<bool> {
     };
     let mut call = |v: &mut EthtoolValue| {
         req.ifr_ifru.ifru_data = v as *mut EthtoolValue as *mut libc::c_char;
+        // SAFETY: `req` names the card (NUL-terminated, checked above) and
+        // points at `v`, a live ethtool_value the kernel reads and writes in
+        // place for the duration of the call.
         cvt(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCETHTOOL, &mut req) })
     };
     call(&mut v)?;
@@ -110,7 +121,9 @@ pub struct Promisc {
 impl Promisc {
     pub fn enable(ifindex: u32) -> io::Result<Self> {
         // Protocol 0: the socket receives nothing, it only holds the request.
+        // SAFETY: plain syscall, no pointers; the result is checked.
         let sock = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
+        // SAFETY: a new, valid descriptor nobody else owns.
         let sock = unsafe { OwnedFd::from_raw_fd(cvt(sock)?) };
         let mreq = PacketMreq {
             mr_ifindex: ifindex as libc::c_int,
@@ -118,6 +131,8 @@ impl Promisc {
             mr_alen: 0,
             mr_address: [0; 8],
         };
+        // SAFETY: `mreq` is a live, fully initialised packet_mreq and the
+        // length passed is its size.
         cvt(unsafe {
             libc::setsockopt(
                 sock.as_raw_fd(),

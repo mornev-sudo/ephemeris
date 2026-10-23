@@ -158,7 +158,8 @@ impl Worker {
                     let base = self.umem.frame_base(d.addr);
                     let off = (d.addr - base) as usize;
                     // SAFETY: the kernel handed this frame to us via the RX
-                    // ring; nothing else references it until we give it away.
+                    // ring; nothing else references it until we give it
+                    // away (TX ring or free list), and `frame` ends before.
                     let frame = unsafe { self.umem.frame_mut(base) };
                     match self
                         .pipeline
@@ -190,6 +191,8 @@ impl Worker {
             let mut emits = std::mem::take(&mut self.pipeline.emits);
             for e in emits.drain(..) {
                 let Some(addr) = free.pop() else { break };
+                // SAFETY: frames on the free list belong to this worker alone;
+                // `buf` ends before the frame goes onto a TX ring.
                 let buf = unsafe { self.umem.frame_mut(addr) };
                 buf[..e.len].copy_from_slice(&e.frame[..e.len]);
                 let card = self.pipeline.card_of(e.port);
@@ -210,6 +213,7 @@ impl Worker {
             // here for a VLAN interface (room for the tag left in front).
             for (port, frame) in outbox.drain(..) {
                 let Some(addr) = free.pop() else { break };
+                // SAFETY: as above, a frame from this worker's free list.
                 let buf = unsafe { self.umem.frame_mut(addr) };
                 const ROOM: usize = eth::VLAN_TAG_LEN;
                 if ROOM + frame.len() > buf.len() || port as usize >= self.pipeline.ports().len() {
@@ -300,6 +304,8 @@ impl Worker {
                 idle += 1;
                 if !self.busy_poll && idle >= IDLE_SPINS {
                     idle = 0;
+                    // SAFETY: `pollfds` is a live Vec and the count passed is
+                    // its length; the kernel writes only `revents` in it.
                     unsafe {
                         libc::poll(
                             pollfds.as_mut_ptr(),
@@ -376,14 +382,24 @@ fn newest_sessions(p: &Pipeline, now_ns: u64) -> Vec<SessionView> {
 }
 
 fn pin_to_cpu(cpu: usize) {
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
-            tracing::warn!(target: crate::logging::cat::DATAPLANE,
-                "could not pin worker to CPU {cpu}: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+    // cpu_set_t holds CPUs 0..CPU_SETSIZE; CPU_SET panics past that (the
+    // config refuses such numbers; this keeps the worker alive regardless).
+    if cpu >= libc::CPU_SETSIZE as usize {
+        tracing::warn!(target: crate::logging::cat::DATAPLANE, "can't pin a worker to CPU {cpu}: too high");
+        return;
+    }
+    // SAFETY: cpu_set_t is a plain bit array; all zeros is the empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `cpu` is below CPU_SETSIZE (checked above), so the bit is
+    // inside `set`.
+    unsafe { libc::CPU_SET(cpu, &mut set) };
+    // SAFETY: `set` is a live cpu_set_t and the size passed is its size; 0
+    // means the calling thread.
+    let r = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if r != 0 {
+        tracing::warn!(target: crate::logging::cat::DATAPLANE,
+            "could not pin worker to CPU {cpu}: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }

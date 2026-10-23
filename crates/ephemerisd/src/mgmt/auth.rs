@@ -353,10 +353,15 @@ mod crypt {
     fn run(key: &str, setting: &str) -> Option<String> {
         let (k, s) = (CString::new(key).ok()?, CString::new(setting).ok()?);
         let _g = LOCK.lock().unwrap();
+        // SAFETY: both arguments are NUL-terminated and live for the call;
+        // LOCK makes us the only caller, so the static buffer it returns
+        // isn't overwritten while we read it.
         let p = unsafe { crypt(k.as_ptr(), s.as_ptr()) };
         if p.is_null() {
             return None;
         }
+        // SAFETY: non-null, NUL-terminated by crypt(), and still ours (LOCK
+        // is held until after the copy).
         let out = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
         (!out.starts_with('*')).then_some(out) // "*0"/"*1" mean failure
     }

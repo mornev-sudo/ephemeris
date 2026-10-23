@@ -2,6 +2,10 @@
 //! portal uses, so the CLI, the portal and (later) a central controller can
 //! never disagree about what the router can do.
 
+// No unsafe code here: packet parsing, routing and forwarding logic is
+// all safe Rust, and the compiler keeps it that way.
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;

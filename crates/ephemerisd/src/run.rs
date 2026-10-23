@@ -28,15 +28,23 @@ extern "C" fn on_signal(_: libc::c_int) {
 }
 
 pub fn run(config_path: &Path) -> Result<()> {
+    // SAFETY: `on_signal` only stores to an atomic, which is
+    // async-signal-safe; it lives for the whole program.
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-        // Older kernels charge UMEM and BPF maps against RLIMIT_MEMLOCK.
-        let unlimited = libc::rlimit {
-            rlim_cur: libc::RLIM_INFINITY,
-            rlim_max: libc::RLIM_INFINITY,
-        };
-        libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlimited);
+    }
+    // Older kernels charge UMEM and BPF maps against RLIMIT_MEMLOCK.
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: `unlimited` is a live rlimit, read by the kernel during the call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlimited) } != 0 {
+        warn!(target: crate::logging::cat::SYSTEM,
+            "could not lift the locked-memory limit ({}): packet buffers may fail to allocate",
+            std::io::Error::last_os_error()
+        );
     }
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading {}", config_path.display()))?;
@@ -714,9 +722,11 @@ fn path_loop(shared: &Shared, epoch: Instant, replay: &ReplayGuard, state_dir: &
 /// busy router the workers get the CPU first. Linux sets this per thread.
 fn lower_priority(nice: i32) {
     #[cfg(target_os = "linux")]
-    unsafe {
-        let tid = libc::gettid() as libc::id_t;
-        if libc::setpriority(libc::PRIO_PROCESS, tid, nice) != 0 {
+    {
+        // SAFETY: plain syscalls on this thread, no pointers.
+        let r =
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice) };
+        if r != 0 {
             warn!(target: crate::logging::cat::SYSTEM,
                 "could not lower thread priority: {}",
                 std::io::Error::last_os_error()

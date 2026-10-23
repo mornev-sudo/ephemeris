@@ -66,8 +66,10 @@ impl Xsk {
         cfg: &XskConfig,
         shared_with: Option<&Xsk>,
     ) -> io::Result<Self> {
+        // SAFETY: plain syscall, no pointers; the result is checked.
         let fd = cvt(unsafe { libc::socket(AF_XDP, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) })
             .map_err(|e| ctx(e, "socket(AF_XDP)"))?;
+        // SAFETY: a new, valid descriptor nobody else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let raw = fd.as_raw_fd();
 
@@ -92,6 +94,8 @@ impl Xsk {
 
         let mut off = XdpMmapOffsets::default();
         let mut optlen = size_of::<XdpMmapOffsets>() as libc::socklen_t;
+        // SAFETY: `off` and `optlen` are live locals and optlen is off's size,
+        // so the kernel writes at most that much.
         cvt(unsafe {
             libc::getsockopt(
                 raw,
@@ -102,6 +106,15 @@ impl Xsk {
             )
         })
         .map_err(|e| ctx(e, "XDP_MMAP_OFFSETS"))?;
+        // Kernels before 5.4 answer with a shorter layout without the ring
+        // flags; `flags` would stay 0 and the need-wakeup check would read
+        // the producer counter instead. Refuse rather than misread.
+        if optlen as usize != size_of::<XdpMmapOffsets>() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "XDP_MMAP_OFFSETS: this kernel's AF_XDP is too old (needs Linux 5.4 or newer)",
+            ));
+        }
 
         let rx = map_ring::<XdpDesc>(raw, &off.rx, cfg.rx_size, XDP_PGOFF_RX_RING)?;
         let tx = map_ring::<XdpDesc>(raw, &off.tx, cfg.tx_size, XDP_PGOFF_TX_RING)?;
@@ -130,6 +143,8 @@ impl Xsk {
                     };
             }
         }
+        // SAFETY: `sa` is a live, fully initialised sockaddr_xdp and the
+        // length passed is its size.
         cvt(unsafe {
             libc::bind(
                 raw,
@@ -141,6 +156,7 @@ impl Xsk {
 
         let mut opts: u32 = 0;
         let mut optlen = size_of::<u32>() as libc::socklen_t;
+        // SAFETY: `opts`/`optlen` are live locals sized for the answer.
         let zero_copy = unsafe {
             libc::getsockopt(
                 raw,
@@ -174,6 +190,8 @@ impl Xsk {
     #[inline]
     pub fn kick_tx(&self) {
         if !self.zero_copy || self.tx.needs_wakeup() {
+            // SAFETY: zero-length send with null buffers is the documented
+            // AF_XDP kick; the kernel reads nothing through the pointers.
             unsafe {
                 libc::sendto(
                     self.fd(),
@@ -192,6 +210,8 @@ impl Xsk {
     #[inline]
     pub fn kick_rx(&self) {
         if self.fill.needs_wakeup() {
+            // SAFETY: zero-length receive with null buffers: the kernel writes
+            // nothing through the pointers.
             unsafe {
                 libc::recvfrom(
                     self.fd(),
@@ -209,6 +229,8 @@ impl Xsk {
     pub fn statistics(&self) -> io::Result<XskStats> {
         let mut s = XskStats::default();
         let mut optlen = size_of::<XskStats>() as libc::socklen_t;
+        // SAFETY: `s`/`optlen` are live locals; older kernels fill in fewer
+        // fields, and the rest stay zero from `default()`.
         cvt(unsafe {
             libc::getsockopt(
                 self.fd(),
@@ -222,7 +244,11 @@ impl Xsk {
     }
 }
 
+/// An AF_XDP socket option. `T` must be the `#[repr(C)]` type (or integer)
+/// the kernel expects for `name`.
 fn setsockopt<T>(fd: RawFd, name: libc::c_int, v: &T) -> io::Result<()> {
+    // SAFETY: `v` is a live reference and the length is exactly its size, so
+    // the kernel reads only initialised memory we own.
     cvt(unsafe {
         libc::setsockopt(
             fd,
@@ -242,6 +268,9 @@ fn map_ring<T: Copy>(
     pgoff: libc::off_t,
 ) -> io::Result<Ring<T>> {
     let len = off.desc as usize + size as usize * size_of::<T>();
+    // SAFETY: maps the socket's own ring (selected by `pgoff`) at an address
+    // of the kernel's choosing: it can't alias existing memory. Checked
+    // against MAP_FAILED below.
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -255,6 +284,8 @@ fn map_ring<T: Copy>(
     if p == libc::MAP_FAILED {
         return Err(ctx(io::Error::last_os_error(), "mmap ring"));
     }
+    // SAFETY: `p` is the live mapping of `len` bytes just made for this ring,
+    // laid out as `off` says; the Ring takes it over (and checks the layout).
     Ok(unsafe { Ring::new(p, len, off, size) })
 }
 
