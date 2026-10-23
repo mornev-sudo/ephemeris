@@ -335,6 +335,7 @@ mod tests {
             id,
             card: id,
             vlan: None,
+            host: Default::default(),
             name: format!("p{id}"),
             mac: [2, 0, 0, 0, 0, id as u8],
             addr: addr.parse().unwrap(),

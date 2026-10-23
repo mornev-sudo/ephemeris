@@ -469,6 +469,42 @@ function renderNics() {
 const newInterface = device => ({ name: "", device, vlan: null, address: "", role: "inside", allow_new_sessions: null,
   mss_adjust: null, mtu: null, gateway: null, dhcp: null });
 
+/// Which of the router's own services (SSH, the portal) this interface
+/// offers on its address. Inside interfaces only.
+function accessFields(i) {
+  const box = el("div");
+  box.dataset.field = "access";
+  if (i.role === "outside") {
+    box.append(el("p", "SSH and the portal are never reachable on an outside interface.", "s"));
+    return box;
+  }
+  i.management = i.management || [];
+  i.management_from = i.management_from || [];
+  const g = el("div", undefined, "fields");
+  const service = (key, label) => {
+    const l = el("label", undefined, "field");
+    const b = document.createElement("input"); b.type = "checkbox"; b.dataset.field = "management-" + key;
+    b.checked = i.management.includes(key);
+    b.onchange = () => {
+      i.management = i.management.filter(m => m !== key);
+      if (b.checked) i.management.push(key);
+      if (!i.management.length) i.management_from = [];
+      dirty(); renderCfg();
+    };
+    l.append(el("span", label), b);
+    return l;
+  };
+  g.append(service("https", "Portal (HTTPS, port 8443) on this interface"), service("ssh", "SSH (port 22) on this interface"));
+  if (i.management.length) {
+    const l = el("label", undefined, "field");
+    l.append(el("span", "Only from"), control({ key: "management_from", label: "Only from", type: "list", placeholder: "anyone on this network (e.g. 10.10.1.0/24)" }, i));
+    l.append(el("small", "Addresses or prefixes, separated by commas. Empty: any client that can reach this address.", "s"));
+    g.append(l);
+  }
+  box.append(el("h4", "Access to the router"), g);
+  return box;
+}
+
 /// Interfaces: one card each with everything about it: name, card, role,
 /// addressing (static / DHCP client / PPPoE), MTU and the rest.
 function renderIfaces() {
@@ -495,8 +531,10 @@ function renderIfaces() {
         options: () => devices.filter(d => !d.kernel).map(d => [d.name, d.driver ? `${d.name} (${d.driver})` : d.name]) },
       { key: "vlan", label: "VLAN", type: "number", min: 1, max: 4094, optional: true, placeholder: "untagged",
         help: "802.1Q VLAN ID (1-4094). One card can carry several VLAN interfaces and one untagged." },
-      { key: "role", label: "Role", type: "select", options: [["inside", "inside: your network"], ["outside", "outside: the internet"]], empty: "inside" },
+      { key: "role", label: "Role", type: "select", options: [["inside", "inside: your network"], ["outside", "outside: the internet"]], empty: "inside", rerender: true },
     ]);
+    // SSH and the portal are never offered on an outside interface.
+    if (i.role === "outside") { i.management = []; i.management_from = []; }
     // Addressing: not a field of its own in the file (address says it).
     const m = { mode };
     const ml = el("div");
@@ -544,6 +582,7 @@ function renderIfaces() {
         options: [["", "default for the role"], ["true", "allowed"], ["false", "replies only"]] },
     ]);
     c.append(link);
+    c.append(accessFields(i));
     box.append(c);
   });
   const add = el("button", "Add interface", "btn"); add.type = "button";

@@ -89,7 +89,8 @@ The minimum is what CI boot-tests every build on: a 2-core, 2 GB VM.
     boot, and holds config history, leases, the journal (capped at
     256 MiB) and update downloads.
 - **Network:** the management NIC stays with Linux (SSH, the portal over
-  HTTPS). The others belong to the data plane.
+  HTTPS). The others belong to the data plane; inside interfaces can offer
+  SSH and the portal on their own address too (`management`, chapter 19).
   - **Any NIC works:** without native XDP the router falls back to generic
     XDP in copy mode, which is slower but correct.
   - **Native XDP with zero-copy is the fast path:** virtio_net (Proxmox),
@@ -149,6 +150,7 @@ Plain-language explanations of everything in here, in reading order:
 16. [PPPoE: dialling the ISP](docs/learn/16-pppoe.md)
 17. [VLANs: many networks on one cable](docs/learn/17-vlans.md)
 18. [Logging: what the router says, and how to make it say more](docs/learn/18-logging.md)
+19. [Reaching the router itself: the host path](docs/learn/19-router-access.md)
 
 ## Roadmap
 
@@ -170,6 +172,7 @@ Plain-language explanations of everything in here, in reading order:
 - [x] **Bounded resources:** every session expires (idle limit of an hour, closed within 10 minutes), session views show the newest 1000 and are gathered only while viewed, a bounded control-plane queue, a capped journal and history, management at lower CPU priority
 - [x] **VLANs (802.1Q):** several interfaces per card, each with its own tag (and at most one untagged), PPPoE over a VLAN, tag stripping and VLAN filtering handled on the NIC
 - [x] **Logging:** a category per subsystem (17) with its own level, raised at run time with a timer; packet tracing in the data plane filtered by host and rate-limited; the journal (info and up, 90 days), a capped debug.log and audit.log in /var/log/ephemeris, `ephctl log`
+- [x] **Router access on inside interfaces:** the portal and SSH on an inside interface's own address (`management = ["https", "ssh"]`, optionally limited to source prefixes), through a tun host path; never on outside interfaces (refused by the config and by the data plane)
 - [ ] **Next for the edge:** destination NAT / port forwarding, `ephsh` router CLI
 - [ ] **Performance and capacity:**
   - [ ] Benchmarks: a microbenchmark of the per-packet pipeline (CPU ceiling per core, no NIC), and a lab test with a traffic generator (pktgen / TRex) for real packets per second on Proxmox and on hardware NICs

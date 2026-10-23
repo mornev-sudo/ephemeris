@@ -32,6 +32,7 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             id: 0,
             card: 0,
             vlan: None,
+            host: Default::default(),
             name: "lan-a".into(),
             mac: R0,
             addr: ip("10.10.1.1"),
@@ -49,6 +50,7 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             id: 1,
             card: 1,
             vlan: None,
+            host: Default::default(),
             name: "lan-b".into(),
             mac: R1,
             addr: ip("10.10.2.1"),
@@ -406,6 +408,7 @@ fn static_route_gateway_must_be_connected() {
         id: 0,
         card: 0,
         vlan: None,
+        host: Default::default(),
         name: "x".into(),
         mac: R0,
         addr: ip("10.0.0.1"),
@@ -435,6 +438,7 @@ fn on_link_gateway_outside_the_subnet() {
         id: 0,
         card: 0,
         vlan: None,
+        host: Default::default(),
         name: "wan".into(),
         mac: R0,
         addr: ip(addr),
@@ -1380,5 +1384,219 @@ fn tracing_records_what_happened_to_packets() {
         (e.flow.sport, e.flow.dport),
         (icmp::ECHO_REQUEST as u16, 0),
         "ICMP type/code"
+    );
+}
+
+// ------------------------------------------------------------ host path
+
+/// A TCP segment with a correct checksum (seg leaves it zero).
+fn tcp_ok(
+    dst_mac: Mac,
+    src_mac: Mac,
+    src: (&str, u16),
+    dst: (&str, u16),
+    flags: u8,
+) -> (Vec<u8>, usize) {
+    let (mut b, n) = seg(dst_mac, src_mac, src, dst, Some(flags));
+    let c = tcp_checksum(&b[14..n]);
+    b[34 + 16..34 + 18].copy_from_slice(&c.to_be_bytes());
+    (b, n)
+}
+
+/// The TCP checksum over pseudo-header and segment (0 if it's already right).
+fn tcp_checksum(ip: &[u8]) -> u16 {
+    let h = ipv4::parse(ip).unwrap();
+    let seg = &ip[h.hdr_len..h.total_len];
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&ip[12..20]);
+    pseudo.extend_from_slice(&[0, ipv4::PROTO_TCP]);
+    pseudo.extend_from_slice(&(seg.len() as u16).to_be_bytes());
+    let mut s = checksum::sum(&pseudo, 0);
+    s = checksum::sum(seg, s);
+    // Inverted: the value for the field, or (with a correct field in place)
+    // zero.
+    !checksum::fold(s)
+}
+
+/// lan-a offers SSH and the portal; lan-b is outside and (wrongly, as if
+/// the config had slipped) claims to offer them too.
+fn host_router() -> Pipeline {
+    let mut r = router();
+    let mut ports = r.ports().to_vec();
+    ports[0].host = host::HostAccess {
+        https: true,
+        ssh: true,
+        from: vec![],
+    };
+    ports[1].role = Role::Outside;
+    ports[1].host = ports[0].host.clone();
+    r.set_ports(ports.into());
+    learn(&mut r, 0, HOST_A, "10.10.1.10");
+    r
+}
+
+const SYN: u8 = 0x02;
+const SYN_ACK: u8 = 0x12;
+
+#[test]
+fn ssh_and_the_portal_reach_the_host_on_an_inside_port() {
+    let mut r = host_router();
+    for port in [host::SSH_PORT, host::HTTPS_PORT] {
+        let (mut f, n) = tcp_ok(R0, HOST_A, ("10.10.1.10", 50000), ("10.10.1.1", port), SYN);
+        assert_eq!(
+            r.process(0, &mut f, 0, n),
+            Verdict::Drop(DropReason::ToHost)
+        );
+        let p = r.host_out.pop().expect("handed to the host");
+        let h = ipv4::parse(&p).unwrap();
+        assert_eq!(
+            (h.src, h.dst),
+            (ip("10.10.1.10"), ip("169.254.240.1")),
+            "the client stays visible"
+        );
+        assert_eq!(tcp_checksum(&p), 0, "checksums still right");
+        assert_eq!(u16::from_be_bytes([p[22], p[23]]), port);
+    }
+    // Other ports on the router stay closed.
+    let (mut f, n) = tcp_ok(R0, HOST_A, ("10.10.1.10", 50000), ("10.10.1.1", 80), SYN);
+    assert_eq!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Drop(DropReason::LocalUnhandled)
+    );
+    assert!(r.host_out.is_empty());
+}
+
+#[test]
+fn never_from_the_outside() {
+    let mut r = host_router();
+    // To the outside port's own address, on the outside port.
+    let (mut f, n) = tcp_ok(
+        R1,
+        HOST_B,
+        ("10.10.2.10", 50000),
+        ("10.10.2.1", host::SSH_PORT),
+        SYN,
+    );
+    assert_eq!(
+        r.process(1, &mut f, 0, n),
+        Verdict::Drop(DropReason::LocalUnhandled)
+    );
+    // To the inside address, arriving on the outside port.
+    let (mut f, n) = tcp_ok(
+        R1,
+        HOST_B,
+        ("10.10.2.10", 50000),
+        ("10.10.1.1", host::HTTPS_PORT),
+        SYN,
+    );
+    assert_ne!(
+        r.process(1, &mut f, 0, n),
+        Verdict::Drop(DropReason::ToHost)
+    );
+    // An inside client, but to the outside port's address.
+    let (mut f, n) = tcp_ok(
+        R0,
+        HOST_A,
+        ("10.10.1.10", 50000),
+        ("10.10.2.1", host::SSH_PORT),
+        SYN,
+    );
+    assert_ne!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Drop(DropReason::ToHost)
+    );
+    assert!(r.host_out.is_empty());
+}
+
+#[test]
+fn only_from_the_allowed_sources() {
+    let mut r = host_router();
+    let mut ports = r.ports().to_vec();
+    ports[0].host.from = vec!["10.10.1.0/28".parse().unwrap()];
+    r.set_ports(ports.into());
+    let (mut f, n) = tcp_ok(
+        R0,
+        HOST_A,
+        ("10.10.1.10", 50000),
+        ("10.10.1.1", host::SSH_PORT),
+        SYN,
+    );
+    assert_eq!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Drop(DropReason::ToHost)
+    );
+    let (mut f, n) = tcp_ok(
+        R0,
+        HOST_A,
+        ("10.10.1.20", 50000),
+        ("10.10.1.1", host::SSH_PORT),
+        SYN,
+    );
+    assert_eq!(
+        r.process(0, &mut f, 0, n),
+        Verdict::Drop(DropReason::LocalUnhandled)
+    );
+}
+
+#[test]
+fn replies_go_back_with_the_port_address_and_nothing_else_gets_out() {
+    let mut r = host_router();
+    let reply = |src: (&str, u16), dst: (&str, u16), flags: u8| {
+        let (b, n) = tcp_ok([0; 6], [0; 6], src, dst, flags);
+        let mut f = vec![0u8; 2048];
+        f[256..256 + n].copy_from_slice(&b[..n]);
+        (f, n)
+    };
+    // sshd's SYN-ACK: leaves lan-a as 10.10.1.1, to host A's MAC.
+    let (mut f, n) = reply(
+        ("169.254.240.1", host::SSH_PORT),
+        ("10.10.1.10", 50000),
+        SYN_ACK,
+    );
+    let Verdict::Tx { port, off, len } = r.inject_host(&mut f, 256, n) else {
+        panic!("not sent")
+    };
+    assert_eq!(port, 0);
+    let o = &f[off..off + len];
+    assert_eq!((eth::dst(o), eth::src(o)), (HOST_A, R0));
+    let h = ipv4::parse(&o[14..]).unwrap();
+    assert_eq!((h.src, h.dst), (ip("10.10.1.1"), ip("10.10.1.10")));
+    assert_eq!(tcp_checksum(&o[14..]), 0);
+
+    // Not from SSH or the portal (the host starting something of its own).
+    let (mut f, n) = reply(("169.254.240.1", 80), ("10.10.1.10", 50000), SYN);
+    assert_eq!(
+        r.inject_host(&mut f, 256, n),
+        Verdict::Drop(DropReason::LocalUnhandled)
+    );
+    // As the outside port.
+    let (mut f, n) = reply(
+        ("169.254.240.2", host::SSH_PORT),
+        ("10.10.2.10", 50000),
+        SYN_ACK,
+    );
+    assert_eq!(
+        r.inject_host(&mut f, 256, n),
+        Verdict::Drop(DropReason::LocalUnhandled)
+    );
+    // Towards the outside, even as an inside port.
+    let (mut f, n) = reply(
+        ("169.254.240.1", host::SSH_PORT),
+        ("10.10.2.10", 50000),
+        SYN_ACK,
+    );
+    assert_eq!(
+        r.inject_host(&mut f, 256, n),
+        Verdict::Drop(DropReason::NoRoute)
+    );
+    // Not a host-side address at all.
+    let (mut f, n) = reply(
+        ("10.10.1.1", host::SSH_PORT),
+        ("10.10.1.10", 50000),
+        SYN_ACK,
+    );
+    assert_eq!(
+        r.inject_host(&mut f, 256, n),
+        Verdict::Drop(DropReason::LocalUnhandled)
     );
 }

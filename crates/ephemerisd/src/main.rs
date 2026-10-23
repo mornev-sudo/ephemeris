@@ -10,6 +10,8 @@
 mod config;
 mod dhcp;
 mod files;
+#[cfg(target_os = "linux")]
+mod host;
 mod logging;
 mod memory;
 mod mgmt;

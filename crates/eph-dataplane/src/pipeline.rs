@@ -1,5 +1,6 @@
 use crate::config::{Dhcp, NextHop, Port, PortId, Pppoe, Role};
 use crate::filter;
+use crate::host;
 use crate::nat::{self, NatConfig};
 use crate::overlay::{
     self, Endpoints, Overlay, PathTable, ReplayGuard, TetherId, TetherStats, OUTER_LEN, TAG_LEN,
@@ -155,6 +156,9 @@ pub struct Pipeline {
     /// Packet tracing (debug logging), off unless asked for; the worker
     /// drains `tracer.events`.
     pub tracer: Tracer,
+    /// IP packets for the router's own SSH and portal (see [`host`]); the
+    /// worker hands them to the host path.
+    pub host_out: Vec<Vec<u8>>,
 }
 
 impl Pipeline {
@@ -204,6 +208,7 @@ impl Pipeline {
             learned: Vec::with_capacity(16),
             punts: Vec::new(),
             tracer: Tracer::default(),
+            host_out: Vec::new(),
         }
     }
 
@@ -1335,6 +1340,11 @@ impl Pipeline {
             }
             return self.overlay_rx(ingress, frame, off, len, h);
         }
+        if via.is_none() && h.proto == ipv4::PROTO_TCP {
+            if let Some(v) = self.punt_to_host(ingress, frame, off, len, h) {
+                return v;
+            }
+        }
         let is_echo = h.proto == ipv4::PROTO_ICMP
             && len >= ETH + h.hdr_len + icmp::HDR_LEN
             && frame[l4] == icmp::ECHO_REQUEST
@@ -1356,6 +1366,95 @@ impl Pipeline {
         ip[10..12].copy_from_slice(&c.to_be_bytes());
         icmp::echo_request_to_reply(&mut frame[l4..off + len]);
         self.output(frame, off, len, h.src)
+    }
+
+    /// SSH or the portal on an inside port's own address: hand the packet to
+    /// the host, addressed to the port's host-side address (see [`host`]).
+    /// `None`: not for the host; the caller carries on.
+    fn punt_to_host(
+        &mut self,
+        ingress: PortId,
+        frame: &mut [u8],
+        off: usize,
+        len: usize,
+        h: &ipv4::Header,
+    ) -> Option<Verdict> {
+        let l4 = off + ETH + h.hdr_len;
+        let ip = off + ETH..off + len;
+        let port = &self.ports[ingress as usize];
+        // Its own address only: a LAN client can't reach the router through
+        // another port's address, and nothing reaches it from outside.
+        if h.dst != port.addr || ipv4::is_fragment(&frame[ip.clone()]) || len < l4 - off + 20 {
+            return None;
+        }
+        let dport = u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]]);
+        if !host::allowed_in(port, h.src, dport) {
+            return None;
+        }
+        let to = host::host_addr(ingress)?;
+        let mss = port.mss_adjust;
+        nat::translate_dst(&mut frame[ip.clone()], to, dport);
+        // Segments the host sends back must fit this port's link too.
+        if let Some(max) = mss {
+            clamp_mss(&mut frame[ip.clone()], h, max);
+        }
+        if self.host_out.len() >= PUNT_MAX {
+            return Some(Verdict::Drop(DropReason::ControlQueueFull));
+        }
+        self.host_out.push(frame[ip].to_vec());
+        Some(Verdict::Drop(DropReason::ToHost))
+    }
+
+    /// A reply from the router's own SSH or portal (an IP packet from the
+    /// host path, at `off + ETH` in `frame`): give it the port's real
+    /// address and send it. Only TCP from those services, back out of an
+    /// inside port; anything else the host sends this way is dropped.
+    pub fn inject_host(&mut self, frame: &mut [u8], off: usize, len: usize) -> Verdict {
+        let v = self.host_reply(frame, off, len);
+        let v = self.wrap_for_link(frame, v);
+        match v {
+            Verdict::Drop(r) => self.stats.drop(r),
+            Verdict::Tx { .. } => self.stats.originated += 1,
+        }
+        v
+    }
+
+    fn host_reply(&mut self, frame: &mut [u8], off: usize, len: usize) -> Verdict {
+        if len < ETH + ipv4::MIN_HDR_LEN || off + len > frame.len() {
+            return Verdict::Drop(DropReason::Malformed);
+        }
+        let Ok(h) = ipv4::parse(&frame[off + ETH..off + len]) else {
+            return Verdict::Drop(DropReason::BadIpHeader);
+        };
+        let len = ETH + h.total_len;
+        let ip = off + ETH..off + len;
+        let l4 = off + ETH + h.hdr_len;
+        let Some(pid) = host::port_of(h.src).filter(|&p| (p as usize) < self.ports.len()) else {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        };
+        let port = &self.ports[pid as usize];
+        if h.proto != ipv4::PROTO_TCP
+            || ipv4::is_fragment(&frame[ip.clone()])
+            || len < l4 - off + 20
+        {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        }
+        let sport = u16::from_be_bytes([frame[l4], frame[l4 + 1]]);
+        if port.role != Role::Inside || !port.host.offers(sport) || port.addr.is_unspecified() {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        }
+        // Back out of an inside port, never towards the outside or a tether.
+        match self.fib.lookup(h.dst) {
+            Some(NextHop::Ip { port: out, .. })
+                if self.ports[*out as usize].role == Role::Inside => {}
+            _ => return Verdict::Drop(DropReason::NoRoute),
+        }
+        let (addr, mss) = (port.addr, port.mss_adjust);
+        nat::translate_src(&mut frame[ip.clone()], addr, sport);
+        if let Some(max) = mss {
+            clamp_mss(&mut frame[ip], &h, max);
+        }
+        self.output(frame, off, len, h.dst)
     }
 
     /// Build an ICMP error about the packet in the frame, in place, and send

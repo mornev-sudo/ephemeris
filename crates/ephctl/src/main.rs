@@ -310,6 +310,7 @@ fn run(cli: Cli) -> Result<()> {
                     "XDP",
                     "ZC",
                     "NEW SESSIONS",
+                    "ACCESS",
                 ],
                 rows(&s["ports"], |p| {
                     vec![
@@ -327,6 +328,11 @@ fn run(cli: Cli) -> Result<()> {
                         } else {
                             "replies only".into()
                         },
+                        p["management"]
+                            .as_array()
+                            .map(|m| m.iter().map(str).collect::<Vec<_>>().join(","))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "-".into()),
                     ]
                 }),
             );

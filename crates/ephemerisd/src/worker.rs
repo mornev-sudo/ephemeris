@@ -51,6 +51,9 @@ pub struct Worker {
     pub punt: SyncSender<Punt>,
     /// Until when (Unix ms) someone wants the session and neighbour lists.
     pub detail: DetailWanted,
+    /// Where packets for the router's own SSH and portal go (the host
+    /// path); `None` if it isn't running.
+    pub host: Option<SyncSender<Vec<u8>>>,
     pub busy_poll: bool,
     pub cpu: Option<usize>,
 }
@@ -90,6 +93,8 @@ impl Worker {
         let mut last_suppressed = Instant::now();
         // Frames the control plane asked us to send.
         let mut outbox: Vec<(PortId, Vec<u8>)> = Vec::new();
+        // Replies from the router's own SSH and portal.
+        let mut host_in: Vec<Vec<u8>> = Vec::new();
 
         while !stop.load(Ordering::Relaxed) {
             let now_ns = epoch.elapsed().as_nanos() as u64;
@@ -108,6 +113,7 @@ impl Worker {
                     Control::SetNat(nat) => self.pipeline.set_nat(nat),
                     Control::SetTrace(t) => self.pipeline.set_trace(t),
                     Control::Transmit { port, frame } => outbox.push((port, frame)),
+                    Control::InjectHost(p) => host_in.push(p),
                 }
             }
             let mut work = 0usize;
@@ -236,6 +242,45 @@ impl Worker {
                     self.pipeline.stats.sent(port, len);
                 } else {
                     free.push(addr);
+                }
+            }
+            // ...and replies from the router's own SSH and portal, given the
+            // interface's address and routed back out (inside ports only).
+            for p in host_in.drain(..) {
+                let Some(addr) = free.pop() else { break };
+                // SAFETY: a frame from this worker's free list; `buf` ends
+                // before the frame goes onto a TX ring.
+                let buf = unsafe { self.umem.frame_mut(addr) };
+                const HEAD: usize = 128; // room for Ethernet, a VLAN tag, PPPoE
+                if HEAD + eth::HDR_LEN + p.len() > buf.len() {
+                    free.push(addr);
+                    continue;
+                }
+                buf[HEAD + eth::HDR_LEN..HEAD + eth::HDR_LEN + p.len()].copy_from_slice(&p);
+                match self.pipeline.inject_host(buf, HEAD, eth::HDR_LEN + p.len()) {
+                    Verdict::Tx { port, off, len } => {
+                        let card = self.pipeline.card_of(port);
+                        if self.socks[card].tx.push(XdpDesc {
+                            addr: addr + off as u64,
+                            len: len as u32,
+                            options: 0,
+                        }) {
+                            tx_pending[card] = true;
+                            self.pipeline.stats.sent(port, len);
+                        } else {
+                            self.pipeline.stats.drop(DropReason::TxRingFull);
+                            free.push(addr);
+                        }
+                    }
+                    Verdict::Drop(_) => free.push(addr),
+                }
+            }
+            // ...and packets for the router's own SSH and portal go to the
+            // host path (bounded: a flood is dropped and counted here).
+            for p in self.pipeline.host_out.drain(..) {
+                let sent = self.host.as_ref().is_some_and(|h| h.try_send(p).is_ok());
+                if !sent {
+                    self.pipeline.stats.drop(DropReason::ControlQueueFull);
                 }
             }
             // ...and packets for the control plane go to it.

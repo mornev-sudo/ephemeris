@@ -15,3 +15,18 @@ for dev in $devices; do
     ethtool -K "$dev" gro off lro off 2>/dev/null || true      # native XDP needs plain frames
     ethtool -X "$dev" hfunc toeplitz symmetric-xor 2>/dev/null || true  # symmetric RSS
 done
+
+# The host path: SSH and the portal on inside interfaces that offer them
+# (interface management = [...]). ephemerisd hands their packets to the tun
+# device eph-host, addressed to 169.254.240.<interface + 1>; that whole range
+# is local here, and anything sent from it goes back into eph-host (table
+# 240), where ephemerisd gives it the interface's real address again. Every
+# step can run again on the next start.
+modprobe tun 2>/dev/null || true
+ip tuntap add dev eph-host mode tun 2>/dev/null || true
+sysctl -qw net.ipv6.conf.eph-host.disable_ipv6=1 2>/dev/null || true
+ip link set dev eph-host up
+ip route replace local 169.254.240.0/20 dev eph-host table local
+ip route replace default dev eph-host table 240
+ip rule del from 169.254.240.0/20 lookup 240 2>/dev/null || true
+ip rule add from 169.254.240.0/20 lookup 240 priority 100

@@ -34,6 +34,7 @@ fn port(id: u16, name: &str, card: u16, vlan: Option<u16>, mac: Mac, addr: &str)
         id,
         card,
         vlan,
+        host: Default::default(),
         name: name.into(),
         mac,
         addr: ip(addr),

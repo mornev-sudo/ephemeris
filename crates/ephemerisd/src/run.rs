@@ -556,6 +556,18 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     // for it are dropped and counted, never queued without end.
     let (punt_tx, punt_rx) = mpsc::sync_channel(1024);
     let detail: crate::report::DetailWanted = Default::default();
+    // The host path: SSH and the portal on inside interfaces that offer
+    // them. Replies go to worker 0, which sends them like its own packets.
+    let (host_tx, host_threads) = match crate::host::start(txs[0].clone(), &STOP) {
+        Ok((tx, threads)) => (Some(tx), threads),
+        Err(e) => {
+            if cfg.interfaces.iter().any(|i| !i.management.is_empty()) {
+                warn!(target: crate::logging::cat::MGMT,
+                    "SSH and the portal can't be reached on data-plane interfaces: {e}");
+            }
+            (None, vec![])
+        }
+    };
     let mut zero_copy = vec![false; cards.len()];
     let reports: Vec<Arc<Mutex<Report>>> = (0..workers).map(|_| Default::default()).collect();
     let mut pool = Vec::new();
@@ -615,6 +627,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             report: reports[w].clone(),
             punt: punt_tx.clone(),
             detail: detail.clone(),
+            host: host_tx.clone(),
             busy_poll: d.busy_poll,
             cpu: d.cpus.get(w).copied(),
         });
@@ -640,7 +653,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
 
     // ---- run
     let epoch = Instant::now();
-    let handles: Vec<_> = pool
+    let mut handles: Vec<_> = pool
         .into_iter()
         .map(|w| {
             std::thread::Builder::new()
@@ -649,6 +662,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
                 .expect("spawning worker")
         })
         .collect();
+    handles.extend(host_threads);
     info!(target: crate::logging::cat::SYSTEM, "ephemerisd running with {workers} worker(s); Ctrl-C to stop");
     Ok(Dataplane {
         workers,

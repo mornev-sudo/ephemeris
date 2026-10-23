@@ -32,6 +32,7 @@ fn port(id: u16, addr: &str, subnet: &str, mss_adjust: Option<u16>) -> Port {
         id,
         card: id,
         vlan: None,
+        host: Default::default(),
         name: format!("p{id}"),
         mac: MACS[id as usize],
         addr: ip(addr),
