@@ -151,7 +151,6 @@ try {
     await page.click("#logaudit");
     await page.waitForSelector("#auditlines div:has-text('log category pppoe set to debug')");
     await page.screenshot({ path: `${shots}/portal-logs.png`, fullPage: true });
-    page.once("dialog", (d) => d.accept());
     await page.click("#logreset");
     await page.waitForSelector("#loglevels td[data-left=pppoe]:not(.warn)");
   });
