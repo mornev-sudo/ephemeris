@@ -108,6 +108,16 @@ ephctl log show -c route -f
 
 The host filter goes away by itself once the last packet trace ends.
 
+## In the portal
+
+The **Logs** tab does the same as `ephctl log`:
+
+- the recent lines, filtered by category, level and text, following new
+  ones as they come;
+- every category's level, a list to change it (debug and trace for the
+  time you pick), its timer counting down, and the packet host filter;
+- the audit trail, from audit.log.
+
 ## Where lines go
 
 | Where | What | Kept |

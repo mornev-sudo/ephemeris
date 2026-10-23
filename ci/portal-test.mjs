@@ -140,6 +140,20 @@ try {
     await page.click("button[data-tab=routes]");
     await page.waitForSelector("#rt td:has-text('192.168.77.0/24')", { state: "detached" });
   });
+  await step("logs tab: lines, a level changed for a while, the audit trail", async () => {
+    await page.click("button[data-tab=logs]");
+    await page.waitForSelector("#loglines div:has-text('web login')");
+    const pppoe = page.locator("#loglevels select[data-category=pppoe]");
+    await pppoe.selectOption("debug");
+    await page.waitForSelector("#loglevels td[data-left=pppoe]:has-text('m')");
+    await page.selectOption("#logcat", "audit");
+    await page.waitForSelector("#loglines div:has-text('log category pppoe set to debug')");
+    await page.click("#logaudit");
+    await page.waitForSelector("#auditlines div:has-text('log category pppoe set to debug')");
+    await page.screenshot({ path: `${shots}/portal-logs.png`, fullPage: true });
+    await page.click("#logreset");
+    await page.waitForSelector("#loglevels td[data-left=pppoe]:not(.warn)");
+  });
   await step("system tab shows the build", async () => {
     await page.click("button[data-tab=system]");
     await page.waitForSelector("#syscards .card:has-text('Running version')");

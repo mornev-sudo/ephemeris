@@ -771,10 +771,135 @@ $("radd").onclick = async () => { try { await api("POST", "/routes", JSON.string
   $("rprefix").value = $("rvia").value = ""; refreshRoutes(); } catch (e) { alert(e.message); } };
 $("sessfilter").oninput = () => refreshSessions().catch(() => {});
 
+// --- Logs: recent lines (fetched incrementally: only what came after the
+// last line seen), the levels per category, and the audit trail.
+const LOG_KEEP = 2000;
+let logLines = [], logAfter = 0, logLevelsKey = "";
+
+/// Errors from the Logs tab's buttons, shown on the tab itself.
+function logGuard(fn) {
+  return async () => {
+    $("logmsg").replaceChildren();
+    try { await fn(); } catch (e) { if (e.message !== "unauthorised") $("logmsg").replaceChildren(el("p", e.message, "bad")); }
+  };
+}
+
+function logLine(r) {
+  const d = el("div", undefined, "lv-" + r.level);
+  // Local time, like the rest of the portal; the exact UTC time on hover.
+  const t = new Date(r.unix_ms);
+  const hms = t.toLocaleTimeString([], { hour12: false }) + "." + String(t.getMilliseconds()).padStart(3, "0");
+  d.append(el("span", hms + " ", "t"), el("b", r.level.toUpperCase().padEnd(6)),
+    el("span", r.category.padEnd(12)), el("span", r.message));
+  d.title = r.time;
+  return d;
+}
+
+function logMatches(r) {
+  const q = $("logfilter").value.trim().toLowerCase();
+  return !q || (r.category + " " + r.message).toLowerCase().includes(q);
+}
+
+function renderLogs() {
+  const box = $("loglines");
+  const shown = logLines.filter(logMatches);
+  box.replaceChildren(...shown.map(logLine));
+  if (!shown.length) box.append(el("div", logLines.length ? "no line matches the search" : "no lines yet", "t"));
+  $("logcount").textContent = `${n(shown.length)} of ${n(logLines.length)} lines`;
+  if ($("logfollow").checked) box.scrollTop = box.scrollHeight;
+}
+
+async function refreshLogLines() {
+  const q = new URLSearchParams({ after: logAfter, limit: logAfter ? 5000 : 500 });
+  if ($("logcat").value) q.set("category", $("logcat").value);
+  if ($("loglevel").value) q.set("level", $("loglevel").value);
+  const fresh = await api("GET", "/logs?" + q);
+  if (!fresh.length && logAfter) return;
+  for (const r of fresh) logAfter = Math.max(logAfter, r.seq);
+  logLines = logLines.concat(fresh).slice(-LOG_KEEP);
+  // Paused (follow off): keep the lines coming, but leave the view where
+  // the reader is.
+  const box = $("loglines"), at = box.scrollTop;
+  renderLogs();
+  if (!$("logfollow").checked) box.scrollTop = at;
+}
+
+function logTimeLeft(c) {
+  return !c.overridden ? "" : c.expires_in_secs == null ? "until reset" : dur(c.expires_in_secs);
+}
+
+function drawLogLevels(v) {
+  table($("loglevels"), ["Category", "Group", "Level", "Configured", "For", "Covers"], v.categories.map(c => {
+    const s = document.createElement("select");
+    s.setAttribute("aria-label", "Level for " + c.name);
+    s.dataset.category = c.name;
+    v.levels.forEach(l => { const o = el("option", l); o.value = l; s.append(o); });
+    s.value = c.level;
+    s.onchange = logGuard(async () => {
+      const body = { category: c.name, level: s.value };
+      if ($("logfor").value && (s.value === "debug" || s.value === "trace")) body.for = $("logfor").value;
+      await api("PUT", "/logging", JSON.stringify(body), true);
+      s.blur(); await refreshLogLevels(true);
+    });
+    const lv = el("td"); lv.append(s);
+    if (c.packets && (c.level === "debug" || c.level === "trace")) lv.append(el("span", " tracing packets", "s warn"));
+    const timer = td(logTimeLeft(c), c.overridden ? "warn" : "");
+    timer.dataset.left = c.name;
+    return [td(c.name, "mono"), c.group, lv, c.configured, timer, td(c.about, "s")];
+  }));
+}
+
+async function refreshLogLevels(force) {
+  // Not while a level is being chosen: redrawing would close the list.
+  if (!force && $("loglevels").contains(document.activeElement)) return;
+  const v = await api("GET", "/logging");
+  $("lograte").textContent = v.trace_per_sec;
+  const sel = $("logcat");
+  if (sel.options.length === 1) v.categories.forEach(c => { const o = el("option", c.name); o.value = c.name; sel.append(o); });
+  // Redraw the table only when a level changed; otherwise just count the
+  // timers down, so the controls stay put under the pointer.
+  const key = JSON.stringify(v.categories.map(c => [c.name, c.level, c.configured, c.overridden]));
+  if (force || key !== logLevelsKey) drawLogLevels(v);
+  else v.categories.forEach(c => { const cell = $("loglevels").querySelector(`td[data-left="${c.name}"]`); if (cell) cell.textContent = logTimeLeft(c); });
+  logLevelsKey = key;
+  if (document.activeElement !== $("loghost")) $("loghost").value = v.host || "";
+  const f = v.files, size = x => `${bytes(x.bytes)} of ${bytes(x.limit)}`;
+  $("logfiles").replaceChildren(
+    el("span", `In ${f.dir}: debug.log ${size(f.debug)}, audit.log ${size(f.audit)}. `),
+    ...(f.error ? [el("span", "Can't write the log files: " + f.error + ". ", "bad")] : []),
+    ...(v.dropped ? [el("span", `${n(v.dropped)} line(s) dropped because logging fell behind.`, "warn")] : []));
+}
+
+async function refreshLogs() {
+  await refreshLogLines();
+  await refreshLogLevels();
+}
+
+const restartLogs = () => { logLines = []; logAfter = 0; refreshLogLines().catch(() => {}); };
+$("logcat").onchange = restartLogs;
+$("loglevel").onchange = restartLogs;
+$("logfilter").oninput = renderLogs;
+$("logfollow").onchange = () => { if ($("logfollow").checked) renderLogs(); };
+$("loghostset").onclick = logGuard(async () => {
+  await api("PUT", "/logging/host", JSON.stringify({ host: $("loghost").value.trim() || null }), true);
+  $("loghost").blur(); await refreshLogLevels(true);
+});
+$("logreset").onclick = logGuard(async () => {
+  if (!confirm("Put every category back to its configured level, and trace packets for all hosts again?")) return;
+  await api("DELETE", "/logging"); await refreshLogLevels(true);
+});
+$("logaudit").onclick = logGuard(async () => {
+  const lines = await api("GET", "/logs/audit?limit=200");
+  const box = $("auditlines");
+  box.replaceChildren(...(lines.length ? lines.map(l => el("div", l)) : [el("div", "audit.log is empty", "t")]));
+  box.classList.remove("hidden");
+  box.scrollTop = box.scrollHeight;
+});
+
 function show(tab) {
   current = tab;
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
-  ["dash", "reports", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.toggle("hidden", t !== tab));
+  ["dash", "reports", "sessions", "routes", "dhcp", "sdwan", "config", "logs", "system"].forEach(t => $("tab-" + t).classList.toggle("hidden", t !== tab));
   tick(true);
 }
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => show(b.dataset.tab));
@@ -793,6 +918,7 @@ async function tick(first) {
     else if (tab === "reports") await refreshReports();
     else if (tab === "config" && first && !cfgDirty) await loadConfig(); // never throw away unsaved edits
     else if (tab === "system") await refreshSystem();
+    else if (tab === "logs") await refreshLogs();
   } catch (e) { if (e.message !== "unauthorised") console.warn(e); }
   // Reporting follows the 5-second samples; nothing polls while the page
   // is hidden (a background tab, a minimised window).
@@ -803,7 +929,7 @@ function showLogin(err) {
   signedIn = false; clearTimeout(timer);
   $("login").classList.remove("hidden"); $("loginerr").textContent = err || "";
   $("tabs").classList.add("hidden"); $("logout").classList.add("hidden"); $("meta").textContent = "";
-  ["dash", "reports", "sessions", "routes", "dhcp", "sdwan", "config", "system"].forEach(t => $("tab-" + t).classList.add("hidden"));
+  ["dash", "reports", "sessions", "routes", "dhcp", "sdwan", "config", "logs", "system"].forEach(t => $("tab-" + t).classList.add("hidden"));
   $("password").focus();
 }
 function signedInUi() {

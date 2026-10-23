@@ -79,6 +79,12 @@
   .field { display: flex; flex-direction: column; gap: 4px; }
   .field:has(input[type=checkbox]) { flex-direction: row-reverse; justify-content: flex-end; align-items: center; gap: 8px; }
   button:disabled { opacity: .5; cursor: default; }
+  .logbox { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px;
+            height: 55vh; overflow: auto; font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .logbox div { padding: 1px 0; }
+  .logbox .t { color: var(--muted); }
+  .lv-error { color: var(--bad); } .lv-warn { color: var(--warn); } .lv-debug, .lv-trace { color: var(--muted); }
+  .logbox b { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -92,6 +98,7 @@
     <button data-tab="dhcp">DHCP</button>
     <button data-tab="sdwan">SD-WAN</button>
     <button data-tab="config">Configuration</button>
+    <button data-tab="logs">Logs</button>
     <button data-tab="system">System</button>
   </nav>
   <div id="meta"></div>
@@ -135,6 +142,48 @@
       <div class="tablewrap"><table id="wrktab"></table></div></section>
     <section><h2>ephemerisd: CPU per thread and memory</h2><div class="tablewrap"><table id="thrtab"></table></div>
       <div class="tablewrap" style="margin-top:8px"><table id="memtab"></table></div></section>
+  </div>
+
+  <div id="tab-logs" class="hidden">
+    <section><h2>Recent log lines</h2>
+      <p class="s">From memory: the last 5000 lines since ephemerisd started. Older ones are in
+        /var/log/ephemeris/debug.log and the journal (journalctl -u ephemerisd).</p>
+      <div class="row">
+        <select id="logcat" aria-label="Category"><option value="">all categories</option></select>
+        <select id="loglevel" aria-label="Level">
+          <option value="">all levels</option><option value="error">errors</option>
+          <option value="warn">warnings and up</option><option value="info">info and up</option>
+          <option value="debug">debug and up</option>
+        </select>
+        <input id="logfilter" placeholder="search (address, MAC, interface…)" style="min-width:240px">
+        <label class="row" style="margin:0"><input type="checkbox" id="logfollow" checked> follow</label>
+        <span class="s" id="logcount" style="margin-left:auto"></span>
+      </div>
+      <div class="logbox" id="loglines" role="log" aria-live="off"></div>
+    </section>
+    <section><h2>Log levels</h2>
+      <p class="s">Each category keeps lines at its level and more severe. Debug and trace switch
+        themselves off after the time chosen; packet categories at debug also trace packets in the data
+        plane (at most <span id="lograte">100</span> lines a second per worker).</p>
+      <div class="row">
+        <label class="row" style="margin:0">Debug and trace last
+          <select id="logfor" aria-label="For how long">
+            <option value="">the default</option><option value="10m">10 minutes</option><option value="30m">30 minutes</option>
+            <option value="1h">1 hour</option><option value="4h">4 hours</option><option value="forever">until reset</option>
+          </select></label>
+        <input id="loghost" placeholder="trace only host / prefix" style="min-width:200px" aria-label="Packet trace host">
+        <button class="btn" id="loghostset">Limit packet traces</button>
+        <button class="btn" id="logreset">Reset all levels</button>
+      </div>
+      <div id="logmsg"></div>
+      <div class="tablewrap"><table id="loglevels"></table></div>
+      <p class="s" id="logfiles"></p>
+    </section>
+    <section><h2>Audit trail</h2>
+      <p class="s">Logins, changes and restarts, kept in audit.log apart from everything else.</p>
+      <div class="row"><button class="btn" id="logaudit">Show the last 200 entries</button></div>
+      <div class="logbox hidden" id="auditlines" style="height:auto;max-height:45vh"></div>
+    </section>
   </div>
 
   <div id="tab-sessions" class="hidden">
