@@ -35,7 +35,7 @@ ureq = { version = "2", default-features = false }
 # allocation or OS randomness is needed for sealing packets in place.
 chacha20poly1305 = { version = "0.10", default-features = false }
 # CHAP-MD5 for PPPoE logins (RFC 1994 mandates MD5; nothing else uses it).
-md-5 = { version = "0.10", default-features = false }
+md-5 = { version = "0.11", default-features = false }
 
 # Rules for `unsafe`, checked on every build (and by clippy in CI): every
 # unsafe block and impl says why it's sound in a `// SAFETY:` comment, every
