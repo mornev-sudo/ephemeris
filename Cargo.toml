@@ -30,7 +30,7 @@ serde_json = "1"
 axum = "0.8"
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
 tower = { version = "0.5", features = ["util"] }
-ureq = { version = "2", default-features = false }
+ureq = { version = "3", default-features = false }
 # Overlay encryption (RustCrypto, pure Rust). No default features: no
 # allocation or OS randomness is needed for sealing packets in place.
 chacha20poly1305 = { version = "0.10", default-features = false }
