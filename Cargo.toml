@@ -20,7 +20,7 @@ eph-xdp = { path = "crates/eph-xdp" }
 libc = "0.2"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
-toml = { version = "0.8", features = ["preserve_order"] }  # keep struct field order when the GUI rewrites a section
+toml = { version = "1.1", features = ["preserve_order"] }  # keep struct field order when the GUI rewrites a section
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
