@@ -30,6 +30,31 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # Coverage-guided fuzzing (fuzz/): hostile packets through the full
+  # pipeline, and raw bytes into every parser. A panic there would let one
+  # packet restart the router, so each target gets a few minutes on every
+  # change; a crash fails the job and its input is kept to reproduce it.
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - name: Fuzz the pipeline
+        run: cd fuzz && cargo +nightly fuzz run pipeline -- -max_total_time=120 -rss_limit_mb=4096
+      - name: Fuzz the parsers
+        run: cd fuzz && cargo +nightly fuzz run parsers -- -max_total_time=120
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   image:
     needs: test
     runs-on: ubuntu-24.04

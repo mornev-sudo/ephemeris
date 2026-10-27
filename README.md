@@ -115,6 +115,14 @@ cargo test --workspace
 cargo run -p ephemerisd -- --check -c config/ephemeris.example.toml
 ```
 
+Hostile input: `cargo test` already pushes a few hundred thousand malformed
+packets through the pipeline. For coverage-guided fuzzing (needs nightly
+and `cargo install cargo-fuzz`):
+
+```bash
+cd fuzz && cargo +nightly fuzz run pipeline
+```
+
 In Proxmox, you deploy a pre-built image. [CI](.github/workflows/image.yml) builds and boot-tests
 an image for every push to `main`. Tagging a commit `v*` promotes that tested image to a GitHub
 Release ([release.yml](.github/workflows/release.yml)) without rebuilding it.

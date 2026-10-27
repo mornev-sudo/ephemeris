@@ -36,6 +36,10 @@ struct Args {
     /// Validate the configuration, print the resulting forwarding table, and exit.
     #[arg(long)]
     check: bool,
+    /// Read a password on stdin and print its hash, the way the admin
+    /// password is stored (yescrypt); first boot uses it.
+    #[arg(long)]
+    hash_password: bool,
     /// Development only (not in Linux builds): serve the web portal on
     /// 127.0.0.1:8080 against the config file, without a data plane.
     /// Sign in as admin / dev.
@@ -46,6 +50,13 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.hash_password {
+        let mut pw = String::new();
+        std::io::stdin().read_line(&mut pw)?;
+        let pw = pw.strip_suffix('\n').unwrap_or(&pw);
+        println!("{}", mgmt::auth::hash_password(pw)?);
+        return Ok(());
+    }
     logging::sink::init();
     #[cfg(not(target_os = "linux"))]
     if args.dev_portal {

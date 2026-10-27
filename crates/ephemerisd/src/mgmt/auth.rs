@@ -1,8 +1,11 @@
 //! Logins: the admin password, web sessions, and limits on guessing.
 //!
-//! There's one administrator. Their password is stored as a SHA-512 crypt
-//! hash (`$6$salt$hash`, the format /etc/shadow uses), so the same hash
-//! serves console/SSH login as `root` and web login as `admin`. It lives in
+//! There's one administrator. Their password is stored as a yescrypt hash
+//! (`$y$...`, the format Debian's /etc/shadow uses), so the same hash serves
+//! console/SSH login as `root` and web login as `admin`. yescrypt is slow
+//! and memory-hard on purpose: a stolen hash is expensive to guess at
+//! (ASVS V11.4.2). Older SHA-512 crypt hashes (`$6$`) still work, and are
+//! replaced by yescrypt at the next successful login. It lives in
 //! `/var/lib/ephemeris/admin.hash`, and the router's `/etc/shadow` is a bind
 //! mount of `/var/lib/ephemeris/shadow` (the root filesystem is read-only).
 //!
@@ -90,7 +93,29 @@ impl Auth {
             let _ = crypt::verify(password, dummy);
             return false;
         }
-        crypt::verify(password, stored)
+        let ok = crypt::verify(password, stored);
+        if ok && crypt::needs_upgrade(stored) {
+            // The password is right and we have it in hand: store it the
+            // stronger way. Sessions stay; nothing about the password changed.
+            match crypt::hash(password).and_then(|h| self.store_hash(&h)) {
+                Ok(()) => tracing::info!(target: crate::logging::cat::AUDIT,
+                    "admin password hash upgraded to yescrypt"),
+                Err(e) => tracing::warn!(target: crate::logging::cat::AUDIT,
+                    "could not upgrade the admin password hash: {e:#}"),
+            }
+        }
+        ok
+    }
+
+    /// Save `hash` as the admin's: the web login hash and root's
+    /// /etc/shadow entry.
+    fn store_hash(&self, hash: &str) -> Result<()> {
+        write_private(&self.hash_path(), &format!("{hash}\n"))?;
+        let shadow = self.state_dir.join("shadow");
+        if shadow.exists() {
+            set_shadow_hash(&shadow, "root", hash)?;
+        }
+        Ok(())
     }
 
     /// Set a new admin password: the web login hash and root's /etc/shadow
@@ -103,12 +128,7 @@ impl Auth {
         if password.len() > MAX_PASSWORD_LEN {
             bail!("the password must be at most {MAX_PASSWORD_LEN} bytes");
         }
-        let hash = crypt::hash(password)?;
-        write_private(&self.hash_path(), &format!("{hash}\n"))?;
-        let shadow = self.state_dir.join("shadow");
-        if shadow.exists() {
-            set_shadow_hash(&shadow, "root", &hash)?;
-        }
+        self.store_hash(&crypt::hash(password)?)?;
         self.end_all_sessions();
         Ok(())
     }
@@ -162,6 +182,12 @@ impl Auth {
     pub fn end_all_sessions(&self) {
         self.sessions.lock().unwrap().clear();
     }
+}
+
+/// Hash a password the way the admin password is stored (yescrypt); used
+/// by first boot (`ephemerisd --hash-password`).
+pub fn hash_password(password: &str) -> Result<String> {
+    crypt::hash(password)
 }
 
 /// Wrong passwords from one address before it's locked out...
@@ -345,7 +371,18 @@ mod crypt {
     #[link(name = "crypt")]
     extern "C" {
         fn crypt(key: *const c_char, setting: *const c_char) -> *mut c_char;
+        fn crypt_gensalt_rn(
+            prefix: *const c_char,
+            count: std::os::raw::c_ulong,
+            rbytes: *const c_char,
+            nrbytes: std::os::raw::c_int,
+            output: *mut c_char,
+            output_size: std::os::raw::c_int,
+        ) -> *mut c_char;
     }
+
+    /// yescrypt: what Debian uses for /etc/shadow.
+    const PREFIX: &str = "$y$";
 
     // crypt() returns a pointer to a static buffer: one caller at a time.
     static LOCK: Mutex<()> = Mutex::new(());
@@ -366,23 +403,110 @@ mod crypt {
         (!out.starts_with('*')).then_some(out) // "*0"/"*1" mean failure
     }
 
+    /// A new yescrypt hash of `password`, with a fresh random salt and
+    /// libxcrypt's default cost.
     pub fn hash(password: &str) -> Result<String> {
-        const ALPHABET: &[u8] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-        let mut bytes = [0u8; 16];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut bytes)?;
-        let salt: String = bytes
-            .iter()
-            .map(|b| ALPHABET[(b % 64) as usize] as char)
-            .collect();
-        match run(password, &format!("$6${salt}$")) {
-            Some(h) => Ok(h),
-            None => bail!("crypt() failed"),
+        let mut salt = [0u8; 32];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut salt)?;
+        let prefix = CString::new(PREFIX)?;
+        let mut setting = [0 as c_char; 128];
+        // SAFETY: `prefix` is NUL-terminated, `salt` holds the 32 bytes
+        // passed, and `setting` is a buffer we own of the size passed; the
+        // result is written there (the _rn variant uses no static state).
+        let p = unsafe {
+            crypt_gensalt_rn(
+                prefix.as_ptr(),
+                0,
+                salt.as_ptr() as *const c_char,
+                salt.len() as _,
+                setting.as_mut_ptr(),
+                setting.len() as _,
+            )
+        };
+        if p.is_null() {
+            bail!(
+                "crypt_gensalt() failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
+        // SAFETY: non-null means libxcrypt wrote a NUL-terminated setting
+        // into `setting`, which is still alive.
+        let setting = unsafe { CStr::from_ptr(setting.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        match run(password, &setting) {
+            Some(h) if h.starts_with(PREFIX) => Ok(h),
+            _ => bail!("crypt() failed"),
+        }
+    }
+
+    /// Stored the old way (SHA-512 crypt, or anything not yescrypt)?
+    pub fn needs_upgrade(hash: &str) -> bool {
+        !hash.starts_with(PREFIX)
     }
 
     pub fn verify(password: &str, hash: &str) -> bool {
         run(password, hash)
             .is_some_and(|h| crate::mgmt::constant_time_eq(h.as_bytes(), hash.as_bytes()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::mgmt::auth::Auth;
+
+        #[test]
+        fn yescrypt_hashes_and_old_ones_still_verify() {
+            let h = hash("correct horse battery").unwrap();
+            assert!(h.starts_with("$y$"), "{h}");
+            assert!(verify("correct horse battery", &h));
+            assert!(!verify("wrong horse battery", &h));
+            assert_ne!(
+                h,
+                hash("correct horse battery").unwrap(),
+                "a fresh salt each time"
+            );
+            let old = run("correct horse battery", "$6$abcdefgh$").unwrap();
+            assert!(verify("correct horse battery", &old) && needs_upgrade(&old));
+            assert!(!needs_upgrade(&h));
+        }
+
+        #[test]
+        fn an_old_hash_is_upgraded_at_login_and_sessions_stay() {
+            let dir = std::env::temp_dir().join(format!("eph-auth-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let old = run("correct horse battery", "$6$abcdefgh$").unwrap();
+            std::fs::write(dir.join("admin.hash"), format!("{old}\n")).unwrap();
+            std::fs::write(
+                dir.join("shadow"),
+                format!("root:{old}:19000:0:99999:7:::\n"),
+            )
+            .unwrap();
+            let a = Auth::new(&dir);
+            let session = a.new_session().unwrap();
+            assert!(
+                !a.check_password("wrong"),
+                "a wrong password changes nothing"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("admin.hash"))
+                    .unwrap()
+                    .trim(),
+                old
+            );
+            assert!(a.check_password("correct horse battery"));
+            let new = std::fs::read_to_string(dir.join("admin.hash")).unwrap();
+            assert!(new.starts_with("$y$"), "{new}");
+            assert!(std::fs::read_to_string(dir.join("shadow"))
+                .unwrap()
+                .starts_with("root:$y$"));
+            assert!(
+                a.check_password("correct horse battery"),
+                "still the same password"
+            );
+            assert!(a.session_valid(&session), "nobody logged out");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }
 
@@ -393,6 +517,9 @@ mod crypt {
         anyhow::bail!("password hashing needs Linux")
     }
     pub fn verify(_: &str, _: &str) -> bool {
+        false
+    }
+    pub fn needs_upgrade(_: &str) -> bool {
         false
     }
 }

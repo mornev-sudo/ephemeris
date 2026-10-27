@@ -168,6 +168,9 @@ check "no failed services"                 sh -c "[ -z \"\$(${SSH[*]} systemctl 
 check "ephemerisd runs as a service"         on_router systemctl is-active --quiet ephemerisd.service
 check "Secure Boot is enabled"             sh -c "${SSH[*]} od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c | grep -q 1"
 check "root filesystem is read-only"       sh -c "! ${SSH[*]} touch /usr/bin/test-write"
+# The router never updates or reboots by itself: Debian's sysupdate timers
+# and services are masked (updates are started by an operator).
+check "no automatic updates or reboots"    on_router 'for u in systemd-sysupdate.timer systemd-sysupdate.service systemd-sysupdate-reboot.timer systemd-sysupdate-reboot.service; do [ "$(systemctl is-enabled $u 2>/dev/null)" = masked ] || { echo "$u: $(systemctl is-enabled $u 2>&1)"; exit 1; }; done; ! systemctl list-timers --all --no-legend | grep -q sysupdate'
 check "SSH with the admin password"        sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true
 check "wrong password refused"             sh -c "! sshpass -p wrong-password ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true"
 check "ephctl on the router"                sh -c "${SSH[*]} ephctl status | grep -q lan-b"
@@ -182,6 +185,10 @@ check "API refuses anonymous requests"     sh -c "[ \"\$(curl -sk -o /dev/null -
 check "unknown host names refused"         sh -c "[ \"\$(curl -sk -o /dev/null -w '%{http_code}' -H 'Host: rebind.example' $WEB/)\" = 421 ]"
 check "security headers sent"              sh -c "curl -skI $WEB/ | grep -qi \"content-security-policy: default-src 'none'; script-src 'self'\" && curl -skI $WEB/ | grep -qi strict-transport-security"
 check "web login with the admin password"  sh -c "curl -skf -c '$WORK/cookies' -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"$PASSWORD\"}' $WEB/api/v1/login && curl -skf -b '$WORK/cookies' $WEB/api/v1/status | grep -q lan-a"
+# Deployed with a SHA-512 crypt hash; the first login stores it as yescrypt
+# (ASVS V11.4.2), for the web and for root's /etc/shadow alike.
+check "password hash upgraded to yescrypt"  on_router 'grep -q "^[\$]y[\$]" /var/lib/ephemeris/admin.hash && grep -q "^root:[\$]y[\$]" /etc/shadow'
+check "SSH password still works after it"   sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true
 check "session cookie is Secure"           grep -q '^#HttpOnly_127.0.0.1.*TRUE' "$WORK/cookies"
 check "config file is private"             sh -c "[ \"\$(${SSH[*]} stat -c %a /var/lib/ephemeris/ephemeris.toml)\" = 600 ]"
 check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="$PASSWORD" SHOTS="$LOGS" node "$HERE/portal-test.mjs"

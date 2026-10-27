@@ -234,9 +234,11 @@ after a plain restart.
 
 - **Two ways to authenticate.**
   - **People** sign in to the portal as `admin` with the admin password,
-    which is generated at deployment. The router keeps only its SHA-512
-    crypt hash, the same format and file (`/etc/shadow`) that console and
-    SSH logins use. Signing in creates a random 256-bit session in an
+    which is generated at deployment. The router keeps only its yescrypt
+    hash (slow and memory-hard on purpose, so a stolen hash is expensive to
+    guess at), the same format and file (`/etc/shadow`) that console and SSH
+    logins use. An older SHA-512 crypt hash, like the one the deploy script
+    passes in, is replaced by yescrypt at the first successful login. Signing in creates a random 256-bit session in an
     `HttpOnly` cookie, which page scripts can't read, so an XSS bug couldn't
     steal it. Failed logins wait a second, to slow down guessing.
   - **Tools** (`ephctl`, scripts) use the API token in

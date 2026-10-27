@@ -13,6 +13,7 @@
 //! once a second.
 
 use crate::logging::cat::PPPOE;
+use crate::logging::untrusted;
 use eph_packet::pppoe::{self, Control, Frame};
 use eph_packet::{eth, Mac};
 use serde::Serialize;
@@ -361,8 +362,11 @@ impl Client {
                     return (vec![], None); // offers another service
                 }
                 self.ac = f.src;
-                self.ac_name =
-                    String::from_utf8_lossy(&f.tag(pppoe::TAG_AC_NAME).unwrap_or_default()).into();
+                // From whoever answered discovery: cleaned before it's logged
+                // or shown.
+                self.ac_name = untrusted(&String::from_utf8_lossy(
+                    &f.tag(pppoe::TAG_AC_NAME).unwrap_or_default(),
+                ));
                 self.cookie = f.tag(pppoe::TAG_AC_COOKIE);
                 self.relay = f.tag(pppoe::TAG_RELAY_SESSION_ID);
                 debug!(target: PPPOE, iface = %self.cfg.interface,
@@ -656,7 +660,10 @@ impl Client {
                 (self.start_ipcp(now), None)
             }
             4 => self.down(
-                &format!("CHAP login refused: {}", String::from_utf8_lossy(&c.data)),
+                &format!(
+                    "CHAP login refused: {}",
+                    untrusted(&String::from_utf8_lossy(&c.data))
+                ),
                 now,
             ),
             _ => (vec![], None),
@@ -895,7 +902,7 @@ fn error_tag(f: &Frame) -> Option<String> {
         if v.is_empty() {
             "unspecified".into()
         } else {
-            String::from_utf8_lossy(&v).into()
+            untrusted(&String::from_utf8_lossy(&v))
         }
     })
 }
@@ -903,7 +910,7 @@ fn error_tag(f: &Frame) -> Option<String> {
 /// PAP Ack/Nak message: a length byte, then text.
 fn message(d: &[u8]) -> String {
     d.get(1..1 + *d.first().unwrap_or(&0) as usize)
-        .map(|m| String::from_utf8_lossy(m).into_owned())
+        .map(|m| untrusted(&String::from_utf8_lossy(m)))
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "no reason given".into())
 }

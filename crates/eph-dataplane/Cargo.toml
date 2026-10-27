@@ -11,5 +11,9 @@ eph-fib.workspace = true
 rustc-hash.workspace = true
 chacha20poly1305.workspace = true
 
+[features]
+# Test router and input driver for fuzzing (fuzz/ and the random-packet test).
+fuzzing = []
+
 [lints]
 workspace = true
