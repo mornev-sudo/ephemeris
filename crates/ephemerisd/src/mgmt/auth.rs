@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn crypt_round_trip() {
         let h = crypt::hash("correct horse battery").unwrap();
-        assert!(h.starts_with("$6$"));
+        assert!(h.starts_with("$y$"), "new hashes are yescrypt: {h}");
         assert!(crypt::verify("correct horse battery", &h));
         assert!(!crypt::verify("wrong", &h));
     }
