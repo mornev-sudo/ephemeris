@@ -28,7 +28,7 @@ mod stats;
 pub mod trace;
 
 pub use config::{build_fib, Dhcp, NextHop, OverlayRoute, Port, PortId, Pppoe, Role, StaticRoute};
-pub use pipeline::{Emit, Neighbor, Pipeline, Punt, Verdict, NEIGHBOR_MAX};
+pub use pipeline::{Emit, HandshakeIn, Neighbor, Pipeline, Punt, Verdict, NEIGHBOR_MAX};
 pub use session::{
     AppTimeout, Dir, FlowKey, NatBinding, Session, SessionConfig, State, Timeouts, Unanswered,
     MAX_APP_TIMEOUTS, MAX_CLOSING_SECS, MAX_IDLE_SECS,
@@ -45,5 +45,7 @@ mod tests_fuzz;
 mod tests_nat;
 #[cfg(test)]
 mod tests_overlay;
+#[cfg(test)]
+mod tests_session_keys;
 #[cfg(test)]
 mod tests_vlan;

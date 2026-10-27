@@ -47,6 +47,10 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         startup: Default::default(),
         dhcp: Default::default(),
         endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
+        sdwan: crate::sdwan::SdwanState {
+            public_key: crate::sdwan::Identity::generate().ok().map(|i| i.public),
+            ..Default::default()
+        },
         history: Default::default(),
         update: Default::default(),
         system: Default::default(),

@@ -88,9 +88,12 @@ impl TraceCat {
             Malformed | BadIpHeader | BadL4Header | Martian | SpoofedSource | IpOption
             | BadFragment | FragmentToRouter | IcmpMismatch => TraceCat::Filter,
             IcmpRateLimited => TraceCat::Icmp,
-            NoPath | UnknownTether | BadOverlay | OverlayAuth | OverlayReplay => TraceCat::Sdwan,
+            NoPath | UnknownTether | BadOverlay | OverlayAuth | OverlayReplay | OverlayNoKey => {
+                TraceCat::Sdwan
+            }
             TxRingFull | ControlQueueFull => TraceCat::Dataplane,
-            ArpConsumed | OverlayControl | DhcpToControl | PppoeToControl | ToHost => return None,
+            ArpConsumed | OverlayControl | OverlayHandshake | DhcpToControl | PppoeToControl
+            | ToHost => return None,
         })
     }
 }

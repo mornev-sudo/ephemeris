@@ -33,7 +33,15 @@ tower = { version = "0.5", features = ["util"] }
 ureq = { version = "2", default-features = false }
 # Overlay encryption (RustCrypto, pure Rust). No default features: no
 # allocation or OS randomness is needed for sealing packets in place.
-chacha20poly1305 = { version = "0.10", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false }
+# SD-WAN handshakes: the Noise protocol framework (Noise_IKpsk2, the
+# pattern WireGuard uses), with only the primitives that pattern needs. Not
+# its "std" feature: that also pulls in ring, which we don't use.
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom", "risky-raw-split"] }
+# This router's SD-WAN public key, from its private key (snow uses it too).
+curve25519-dalek = { version = "4.1", default-features = false }
+# The handshake's mac1 (a keyed BLAKE2s, as in WireGuard).
+blake2 = { version = "0.10", default-features = false }
 # CHAP-MD5 for PPPoE logins (RFC 1994 mandates MD5; nothing else uses it).
 md-5 = { version = "0.11", default-features = false }
 

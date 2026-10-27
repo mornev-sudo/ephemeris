@@ -145,8 +145,23 @@ enum LogCmd {
 
 #[derive(Subcommand)]
 enum SdwanCmd {
-    /// This router and the other sites: role, direct or through a hub, key.
+    /// This router and the other sites: role, direct or through a hub, and
+    /// how tethers to each are encrypted.
     Sites,
+    /// This router's SD-WAN public key: other routers put it in their entry
+    /// for this one (`public_key`).
+    Identity,
+    /// Show a site's public key; --set uses session keys from a handshake
+    /// with it from now on, --clear goes back to the pre-shared key
+    /// (committed; takes effect after `ephctl restart`).
+    PublicKey {
+        site: String,
+        /// Its public key (64 hex characters: `ephctl sdwan identity` there).
+        #[arg(long, conflicts_with = "clear")]
+        set: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Show the key shared with a site; --generate or --set replaces it
     /// (committed; takes effect after `ephctl restart`).
     Key {
@@ -161,6 +176,26 @@ enum SdwanCmd {
     /// Print a [[site]] entry describing this router, with the key it shares
     /// with SITE: paste it into SITE's configuration (`ephctl config edit`).
     Entry { site: String },
+}
+
+/// How tethers to a site (a row of /overlay/sites) are encrypted, in words.
+fn encryption(x: &serde_json::Value) -> String {
+    if x["connected"] != true {
+        return "not needed".into();
+    }
+    if x["public_key"].is_string() {
+        let h = &x["handshake"];
+        return match h["key_age_s"].as_u64() {
+            Some(age) => format!("handshake, keys {age}s old"),
+            None if h["pending"] == true => "handshake, waiting".into(),
+            None => "handshake, no keys yet".into(),
+        };
+    }
+    if x["has_key"] == true {
+        "pre-shared key".into()
+    } else {
+        "MISSING".into()
+    }
 }
 
 #[derive(Subcommand)]
@@ -615,7 +650,7 @@ fn run(cli: Cli) -> Result<()> {
                         "ID",
                         "ROLE",
                         "CONNECTION",
-                        "KEY",
+                        "ENCRYPTION",
                         "ADDRESSES",
                         "TETHERS",
                     ],
@@ -636,12 +671,7 @@ fn run(cli: Cli) -> Result<()> {
                                 "via hub"
                             }
                             .into(),
-                            match (x["connected"] == true, x["has_key"] == true) {
-                                (false, _) => "not needed",
-                                (true, true) => "set",
-                                (true, false) => "MISSING",
-                            }
-                            .into(),
+                            encryption(x),
                             if x["addresses"].as_array().is_some_and(|a| a.is_empty()) {
                                 "learned".into()
                             } else {
@@ -651,6 +681,48 @@ fn run(cli: Cli) -> Result<()> {
                         ]
                     }),
                 );
+            }
+            SdwanCmd::Identity => {
+                let v = c.get("/overlay/identity")?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                match v["public_key"].as_str() {
+                    Some(k) => println!("{k}"),
+                    None => bail!("no SD-WAN key pair: see `ephctl log show -c sdwan`"),
+                }
+            }
+            SdwanCmd::PublicKey { site, set, clear } => {
+                if set.is_none() && !clear {
+                    let v = c.get("/overlay/sites")?;
+                    let x = v["sites"]
+                        .as_array()
+                        .and_then(|a| a.iter().find(|x| x["name"] == site.as_str()))
+                        .with_context(|| format!("no site named {site:?}"))?;
+                    match x["public_key"].as_str() {
+                        Some(k) => println!("{k}"),
+                        None => bail!("site {site} has no public key (it uses the pre-shared key)"),
+                    }
+                    return Ok(());
+                }
+                let body = serde_json::json!({ "site": site, "public_key": set });
+                let v = c.call(
+                    "POST",
+                    "/overlay/public-key",
+                    Some(("application/json", &body.to_string())),
+                )?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                println!("Committed: {}.", describe(&v["applied"]));
+                if set.is_some() {
+                    println!("{site} needs this router's public key in its entry for this one:");
+                    println!("`ephctl sdwan entry {site}` prints that entry.");
+                } else {
+                    println!("Tethers to {site} use the pre-shared key again: so must {site}.");
+                }
             }
             SdwanCmd::Key {
                 site,

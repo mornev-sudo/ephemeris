@@ -31,6 +31,8 @@
 //! | GET    | /overlay/key?site=S       | the key shared with site S                  |
 //! | POST   | /overlay/key {site, key?} | set (or, without key, generate) it; commits |
 //! | GET    | /overlay/entry?site=S     | [[site]] entry describing this router, for S|
+//! | GET    | /overlay/identity         | this router's SD-WAN public key             |
+//! | POST   | /overlay/public-key {site, public_key?} | set (or clear) S's public key; commits |
 //! | GET    | /system                   | build, update job state                     |
 //! | POST   | /system/update/check      | list installed + available versions         |
 //! | POST   | /system/update            | install newest version into inactive slot   |
@@ -125,6 +127,8 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/overlay/sites", get(overlay_sites))
         .route("/overlay/key", get(site_key).post(set_site_key))
         .route("/overlay/entry", get(site_entry))
+        .route("/overlay/identity", get(overlay_identity))
+        .route("/overlay/public-key", post(set_site_public_key))
         .route("/system", get(system))
         .route("/system/update/check", post(update_check))
         .route("/system/update", post(update_start))
@@ -1012,7 +1016,8 @@ async fn overlay(State(s): St) -> Json<Value> {
                     t.remote.to_string()
                 },
                 "site": t.peer_site,
-                "encrypted": t.key.is_some(),
+                "crypto": crypto_name(o, t),
+                "encrypted": t.key.is_some() || matches!(o.crypto(t.site_idx), eph_dataplane::overlay::PeerCrypto::Handshake { .. }),
                 "up": h.up,
                 "rtt_ms": h.rtt_ns as f64 / 1e6, "jitter_ms": h.jitter_ns as f64 / 1e6,
                 "loss_pct": h.loss_pct,
@@ -1040,6 +1045,70 @@ async fn overlay(State(s): St) -> Json<Value> {
         "tethers": tethers,
         "paths": choices,
     }))
+}
+
+/// How a tether's packets are protected, in words.
+fn crypto_name(
+    o: &eph_dataplane::overlay::Overlay,
+    t: &eph_dataplane::overlay::Tether,
+) -> &'static str {
+    match o.crypto(t.site_idx) {
+        eph_dataplane::overlay::PeerCrypto::Handshake { .. } => "handshake",
+        _ if t.key.is_some() => "pre-shared key",
+        _ => "none",
+    }
+}
+
+/// This router's SD-WAN public key: what other routers put in their
+/// `[[site]]` entry for it.
+async fn overlay_identity(State(s): St) -> Json<Value> {
+    Json(json!({ "public_key": s.sdwan.public_key.map(|k| crate::sdwan::hex(&k)) }))
+}
+
+#[derive(Deserialize)]
+struct SetPublicKeyReq {
+    site: String,
+    /// 64 hex characters; omitted or null: back to the pre-shared key.
+    #[serde(default)]
+    public_key: Option<String>,
+}
+
+/// Set a site's public key (its routers then agree session keys in a
+/// handshake), or clear it, and commit.
+async fn set_site_public_key(State(s): St, Json(r): Json<SetPublicKeyReq>) -> ApiResult {
+    let key = r.public_key.map(|k| k.trim().to_ascii_lowercase());
+    if let Some(k) = &key {
+        crate::config::parse_public_key(k).map_err(|e| anyhow::anyhow!("public_key {e:#}"))?;
+        if s.sdwan
+            .public_key
+            .map(|me| crate::sdwan::hex(&me))
+            .as_deref()
+            == Some(k)
+        {
+            return Err(anyhow::anyhow!("that's this router's own public key: use the other router's (ephctl sdwan identity there)").into());
+        }
+    }
+    let c = {
+        let mut cfg = s.config.lock().unwrap();
+        if cfg.candidate_text().is_some() {
+            return Err(
+                anyhow::anyhow!("there are staged changes: commit or discard them first").into(),
+            );
+        }
+        let mut model = cfg.running().clone();
+        let site = model
+            .sites
+            .iter_mut()
+            .find(|x| x.name == r.site)
+            .ok_or_else(|| anyhow::anyhow!("no site named {:?}", r.site))?;
+        site.public_key = key.clone();
+        let text = cfg.text_from_model(&model)?;
+        cfg.set_candidate(text)?;
+        cfg.commit(None)?
+    };
+    let mut out = finish_commit(&s, c, None)?;
+    out.0["public_key"] = json!(key);
+    Ok(out)
 }
 
 /// This router as other sites should know it: its name, id and role, its
@@ -1073,6 +1142,7 @@ fn this_site(s: &Shared, cfg: &crate::config::Config) -> Option<crate::config::S
         addresses,
         prefixes,
         key: None,
+        public_key: None,
     })
 }
 
@@ -1082,6 +1152,7 @@ async fn overlay_sites(State(s): St) -> ApiResult {
     let tethers = cfg.site_tethers()?;
     let me = this_site(&s, &cfg);
     let role = cfg.overlay.as_ref().map(|o| o.role).unwrap_or_default();
+    let handshakes = s.sdwan.peers.lock().unwrap().clone();
     let sites: Vec<Value> = cfg
         .sites
         .iter()
@@ -1090,12 +1161,18 @@ async fn overlay_sites(State(s): St) -> ApiResult {
                 "name": x.name, "id": x.id, "role": x.role,
                 "addresses": x.addresses, "prefixes": x.prefixes,
                 "has_key": x.key.is_some(),
+                "public_key": x.public_key,
+                "handshake": handshakes.iter().find(|h| h.site == x.id),
                 "connected": role.peers_with(x.role),
                 "tethers": tethers.iter().filter(|t| t.site == x.id).map(|t| t.name.clone()).collect::<Vec<_>>(),
             })
         })
         .collect();
-    Ok(Json(json!({ "this": me, "sites": sites })))
+    Ok(Json(json!({
+        "this": me,
+        "public_key": s.sdwan.public_key.map(|k| crate::sdwan::hex(&k)),
+        "sites": sites,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1164,6 +1241,18 @@ async fn site_entry(State(s): St, Query(q): Query<SiteQuery>) -> ApiResult {
     let mut me = this_site(&s, &cfg)
         .ok_or_else(|| anyhow::anyhow!("SD-WAN isn't configured ([overlay])"))?;
     me.key = peer.key.clone();
+    // Both sides must agree: our public key only goes in if we use the
+    // handshake with that site too.
+    if peer.public_key.is_some() {
+        me.public_key = Some(
+            s.sdwan
+                .public_key
+                .map(|k| crate::sdwan::hex(&k))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("this router's SD-WAN key pair is unavailable (see the log)")
+                })?,
+        );
+    }
     #[derive(serde::Serialize)]
     struct Entry {
         site: Vec<crate::config::SiteCfg>,
@@ -1611,6 +1700,7 @@ address = "10.10.2.1/24"
             startup: Default::default(),
             dhcp: Default::default(),
             endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
+            sdwan: Default::default(),
             history: Default::default(),
             update: Default::default(),
             system: Default::default(),

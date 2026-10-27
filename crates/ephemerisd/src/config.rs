@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use eph_dataplane::nat::{NatAction, NatConfig, NatRule};
-use eph_dataplane::overlay::{Class, Overlay, Tether, TetherKey, DEFAULT_MTU};
+use eph_dataplane::overlay::{Class, Overlay, PeerCrypto, Tether, TetherKey, DEFAULT_MTU};
 use eph_dataplane::{
     build_fib, NextHop, OverlayRoute, Port, Role, SessionConfig, StaticRoute, Timeouts,
 };
@@ -109,9 +109,17 @@ pub struct SiteCfg {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefixes: Vec<String>,
     /// The key this router and that site share: 64 hex characters, the same
-    /// on both. Without one, no tether to it comes up.
+    /// on both. Without one (and without `public_key`), no tether to it
+    /// comes up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Its SD-WAN public key (64 hex characters; `ephctl sdwan identity` on
+    /// that router). With one, tethers use fresh session keys from a
+    /// handshake, replaced every two minutes, and `key` (optional) is mixed
+    /// into the handshake. Without one, packets are sealed with `key`
+    /// directly, as before 0.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 fn default_overlay_port() -> u16 {
@@ -136,9 +144,14 @@ pub struct TetherCfg {
     pub site: u16,
     /// Pre-shared key: 64 hex characters (32 random bytes, e.g. from
     /// `openssl rand -hex 32`), the same on both routers and on every tether
-    /// to the same site. Without one the tether stays down.
+    /// to the same site. Without one (and without `public_key`) the tether
+    /// stays down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// The other router's SD-WAN public key: session keys from a handshake
+    /// (see `[[site]]`). The same on every tether to the same site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1486,10 +1499,27 @@ impl Config {
             if all[..i].iter().any(|(x, _)| x.name == t.name) {
                 bail!("two tethers are named {}", t.name);
             }
+            let crypto = match t.public_key.as_deref() {
+                None => PeerCrypto::PreShared,
+                Some(k) => PeerCrypto::Handshake {
+                    public: parse_public_key(k)
+                        .map_err(|e| anyhow::anyhow!("tether {}: public_key {e:#}", t.name))?,
+                },
+            };
             let site_idx = match o.sites.iter().position(|&s| s == t.site) {
-                Some(i) => i,
+                Some(i) => {
+                    if o.peers[i] != crypto {
+                        bail!(
+                            "tethers to site {} need the same public_key (tether {})",
+                            t.site,
+                            t.name
+                        );
+                    }
+                    i
+                }
                 None => {
                     o.sites.push(t.site);
+                    o.peers.push(crypto);
                     o.sites.len() - 1
                 }
             };
@@ -1594,6 +1624,10 @@ impl Config {
             if let Some(k) = &s.key {
                 parse_key(k).map_err(|e| anyhow::anyhow!("site {}: key {e:#}", s.name))?;
             }
+            if let Some(k) = &s.public_key {
+                parse_public_key(k)
+                    .map_err(|e| anyhow::anyhow!("site {}: public_key {e:#}", s.name))?;
+            }
             let remotes: Vec<Ipv4Addr> = s
                 .addresses
                 .iter()
@@ -1633,6 +1667,7 @@ impl Config {
                         gateway: None,
                         site: s.id,
                         key: s.key.clone(),
+                        public_key: s.public_key.clone(),
                     });
                 }
             }
@@ -1678,6 +1713,16 @@ fn parse_key(s: &str) -> Result<TetherKey> {
         bail!("must not be all zeros");
     }
     Ok(TetherKey(k))
+}
+
+/// A router's SD-WAN public key: 64 hex characters, not all zero.
+pub fn parse_public_key(s: &str) -> Result<[u8; 32]> {
+    let k = crate::sdwan::parse_hex32(s.trim())
+        .context("must be 64 hex characters (ephctl sdwan identity on that router)")?;
+    if k == [0; 32] {
+        bail!("must not be all zeros");
+    }
+    Ok(k)
 }
 
 fn broadcast(net: Prefix) -> Ipv4Addr {
@@ -2381,6 +2426,60 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
                 "{dst} via the hub"
             );
         }
+    }
+
+    #[test]
+    fn a_site_with_a_public_key_uses_the_handshake() {
+        let pk = "ab".repeat(32);
+        // jhb: public key (and its key becomes the handshake's extra key).
+        let text = SITES_CFG.replacen(
+            "prefixes = [\"10.2.0.0/16\"]",
+            &format!("prefixes = [\"10.2.0.0/16\"]\npublic_key = \"{pk}\""),
+            1,
+        );
+        let o = parse(&text).unwrap().overlay().unwrap();
+        assert_eq!(o.crypto(0), PeerCrypto::Handshake { public: [0xab; 32] });
+        assert!(
+            o.tethers.iter().all(|t| t.key.is_some()),
+            "kept as the extra key"
+        );
+        // Without `key` it's fine too: the handshake doesn't need one.
+        let o = parse(&text.replacen(
+            "key = \"1111111111111111111111111111111111111111111111111111111111111111\"\n",
+            "",
+            1,
+        ))
+        .unwrap()
+        .overlay()
+        .unwrap();
+        assert!(matches!(o.crypto(0), PeerCrypto::Handshake { .. }));
+        // The rest stay on their pre-shared key.
+        let o = parse(SITES_CFG).unwrap().overlay().unwrap();
+        assert_eq!(o.crypto(0), PeerCrypto::PreShared);
+        // Bad keys are refused.
+        for bad in ["abcd", &"zz".repeat(32), &"00".repeat(32)] {
+            let t = text.replace(&pk, bad);
+            assert!(
+                parse(&t).and_then(|c| c.overlay()).is_err(),
+                "public_key {bad:?}"
+            );
+        }
+        // Hand-written tethers to one site must agree.
+        let mut c = parse(&text).unwrap();
+        c.tethers.push(TetherCfg {
+            name: "extra".into(),
+            interface: "wan".into(),
+            remote: "198.51.100.9".parse().unwrap(),
+            gateway: None,
+            site: 2,
+            key: Some("1".repeat(64)),
+            public_key: Some("cd".repeat(32)),
+        });
+        assert!(c
+            .overlay()
+            .unwrap_err()
+            .to_string()
+            .contains("same public_key"));
     }
 
     #[test]

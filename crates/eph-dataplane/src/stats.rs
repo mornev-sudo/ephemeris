@@ -89,10 +89,15 @@ pub enum DropReason {
     /// to the wrong queue. Replies need steering (see chapter 13), or one
     /// worker.
     NatWrongWorker,
+    /// Overlay packet sealed with a session key we don't have (unknown,
+    /// expired, or from before a restart).
+    OverlayNoKey,
+    /// SD-WAN handshake message handed to the control plane.
+    OverlayHandshake,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 38] = [
+    pub const ALL: [DropReason; 40] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -131,6 +136,8 @@ impl DropReason {
         DropReason::ToHost,
         DropReason::NatNoSession,
         DropReason::NatWrongWorker,
+        DropReason::OverlayNoKey,
+        DropReason::OverlayHandshake,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -174,6 +181,8 @@ impl DropReason {
             DropReason::ToHost => "to-host",
             DropReason::NatNoSession => "nat-no-session",
             DropReason::NatWrongWorker => "nat-wrong-worker",
+            DropReason::OverlayNoKey => "overlay-no-key",
+            DropReason::OverlayHandshake => "overlay-handshake",
         }
     }
 }

@@ -175,4 +175,10 @@ masquerade = true
 # role = "hub"
 # addresses = ["203.0.113.2"]   # empty: learned from its packets (no fixed address)
 # prefixes = ["10.2.0.0/16"]
+# public_key = "<jhb's public key: ephctl sdwan identity on jhb>"
+#   # With it, tethers to jhb get fresh session keys from a handshake every
+#   # two minutes (forward secrecy); jhb needs this router's public key in
+#   # its entry for it too (ephctl sdwan entry jhb prints that entry).
 # key = "<64 hex characters, the same on jhb: ephctl sdwan key jhb --generate>"
+#   # With public_key: optional, mixed into the handshake. Without: required,
+#   # and it encrypts the tethers itself.

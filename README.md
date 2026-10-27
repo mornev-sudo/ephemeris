@@ -198,7 +198,7 @@ a browser.
   - [x] 4a: UDP overlay tethers over multiple WANs, in-place encapsulation, probing (latency/jitter/loss), app-aware path selection with SLAs and hysteresis, failover, MSS clamping, path MTU
   - [x] 4b (first half): tether encryption and authentication with per-tether pre-shared keys (ChaCha20-Poly1305), replay protection
   - [x] Sites: hub / spoke / mesh roles decide who connects, tethers generated per WAN, routing through hubs, per-pair keys managed in the portal and `ephctl`, peers without a fixed address learned from their packets (works behind NAT)
-  - [ ] 4b (second half): WireGuard-style handshake (forward secrecy, key rotation)
+  - [x] 4b (second half): WireGuard-style handshake (Noise `IKpsk2`): a key pair per router, fresh session keys every two minutes (forward secrecy), chosen per site so existing pre-shared-key sites keep working
   - [ ] 4c: central controller; FRR/BGP for LAN-side routes
 
 ## Security
