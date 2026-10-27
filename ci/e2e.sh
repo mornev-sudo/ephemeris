@@ -197,9 +197,20 @@ check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="
 # baseline scan, and a TLS scan. Each fails on anything rated high; the
 # full reports are kept with the test logs.
 mkdir -p "$LOGS/scans" && chmod 777 "$LOGS/scans"
+# Both images come from GitHub's registry (Docker Hub rate-limits shared CI
+# runners), pinned to a version. Each scanner's own output is kept next to
+# its report; if no report appears, its last lines say why.
+ZAP_IMAGE=ghcr.io/zaproxy/zaproxy:2.17.0
+TESTSSL_IMAGE=ghcr.io/testssl/testssl.sh:3.2
+no_report() { # name log
+    echo "$1 wrote no report. Last lines of its output:"
+    tail -25 "$2"
+    return 1
+}
 zap_scan() { # passive scan of the portal; fails on any High risk alert
-    docker run --rm --network host -v "$LOGS/scans:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable \
-        zap-baseline.py -t "$WEB/" -I -J zap.json -r zap.html >/dev/null 2>&1
+    docker run --rm --network host -v "$LOGS/scans:/zap/wrk:rw" "$ZAP_IMAGE" \
+        zap-baseline.py -t "$WEB/" -I -J zap.json -r zap.html > "$LOGS/scans/zap.log" 2>&1
+    [[ -s $LOGS/scans/zap.json ]] || { no_report ZAP "$LOGS/scans/zap.log"; return; }
     python3 - "$LOGS/scans/zap.json" <<'PY'
 import json, sys
 alerts = [a for s in json.load(open(sys.argv[1])).get("site", []) for a in s.get("alerts", [])]
@@ -209,8 +220,9 @@ sys.exit(1 if high else 0)
 PY
 }
 tls_scan() { # testssl.sh against the portal; fails on HIGH or CRITICAL
-    docker run --rm --network host -v "$LOGS/scans:/out" drwetter/testssl.sh:3.2 \
-        --quiet --color 0 --warnings off --jsonfile /out/testssl.json 127.0.0.1:8443 >/dev/null 2>&1
+    docker run --rm --network host -v "$LOGS/scans:/out:rw" "$TESTSSL_IMAGE" \
+        --quiet --color 0 --warnings off --jsonfile /out/testssl.json 127.0.0.1:8443 > "$LOGS/scans/testssl.log" 2>&1
+    [[ -s $LOGS/scans/testssl.json ]] || { no_report testssl "$LOGS/scans/testssl.log"; return; }
     python3 - "$LOGS/scans/testssl.json" <<'PY'
 import json, sys
 # The certificate is self-signed on purpose (made on the router at first
