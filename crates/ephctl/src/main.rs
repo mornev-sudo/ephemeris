@@ -343,8 +343,8 @@ fn run(cli: Cli) -> Result<()> {
             );
             let ss = &s["sessions"];
             println!(
-                "sessions: {} active, {} created, {} expired   routes: {}   neighbours: {}",
-                ss["active"], ss["created"], ss["expired"], s["routes"], s["neighbors"]
+                "sessions: {} active, {} created, {} expired ({} never answered, {} dropped early)   routes: {}   neighbours: {}",
+                ss["active"], ss["created"], ss["expired"], ss["unanswered"], ss["early_dropped"], s["routes"], s["neighbors"]
             );
             if let Some(d) = s["drops"].as_object().filter(|d| !d.is_empty()) {
                 println!(

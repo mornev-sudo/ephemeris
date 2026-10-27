@@ -291,7 +291,11 @@
       <p class="s">Checked top to bottom; the first match wins. Traffic no rule matches falls back to the default above.</p>
       <div class="tablewrap" id="f-natrules"></div>
     </section>
-    <section class="cfgsec hidden" id="sec-sess"><div class="card" id="f-sess"></div></section>
+    <section class="cfgsec hidden" id="sec-sess"><div class="card" id="f-sess"></div>
+      <h2>Per-application timeouts</h2>
+      <p class="s">For sessions to these server ports, instead of the protocol's timeouts above. Checked top to bottom; the first match wins. For example DNS (UDP 53) can go after 10 s, and a VoIP or Teams media port can stay longer.</p>
+      <div class="tablewrap" id="f-sesstimeouts"></div>
+    </section>
     <section class="cfgsec hidden" id="sec-dp"><p class="s">Changes here need a data-plane restart.</p><div class="card" id="f-dp"></div></section>
     <section class="cfgsec hidden" id="sec-mgmt"><p class="s">Changes here need a restart. Careful: a wrong listen address locks you out of this page.</p><div class="card" id="f-mgmt"></div></section>
     <section class="cfgsec hidden" id="sec-hist">

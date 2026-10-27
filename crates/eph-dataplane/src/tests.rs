@@ -749,6 +749,7 @@ fn full_table_refuses_new_flows_but_keeps_old_ones() {
         true,
         SessionConfig {
             max_sessions: 2,
+            early_drop: false,
             ..Default::default()
         },
     );
@@ -764,6 +765,49 @@ fn full_table_refuses_new_flows_but_keeps_old_ones() {
     );
     let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", 1000), ("10.10.2.10", 53), None);
     assert!(matches!(r.process(0, &mut b, 0, n), Verdict::Tx { .. }));
+}
+
+/// Assert the router forwarded the packet.
+fn sent(v: Verdict) {
+    assert!(matches!(v, Verdict::Tx { .. }), "expected Tx, got {v:?}");
+}
+
+#[test]
+fn a_full_table_makes_room_by_dropping_unanswered_sessions() {
+    let mut r = router_with(
+        true,
+        SessionConfig {
+            max_sessions: 2,
+            ..Default::default()
+        },
+    );
+    learn(&mut r, 1, HOST_B, "10.10.2.10");
+    learn(&mut r, 0, HOST_A, "10.10.1.10");
+    // One conversation that's answered, one that never is.
+    let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", 1000), ("10.10.2.10", 53), None);
+    sent(r.process(0, &mut b, 0, n));
+    let (mut b, n) = seg(R1, HOST_B, ("10.10.2.10", 53), ("10.10.1.10", 1000), None);
+    sent(r.process(1, &mut b, 0, n));
+    let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", 1001), ("10.10.2.10", 53), None);
+    sent(r.process(0, &mut b, 0, n));
+    // A third: the unanswered one makes room.
+    let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", 1002), ("10.10.2.10", 53), None);
+    sent(r.process(0, &mut b, 0, n));
+    r.housekeeping();
+    assert_eq!(
+        (r.stats.sessions_early_dropped, r.stats.sessions_unanswered),
+        (1, 1)
+    );
+    // The answered one still works; another newcomer can't push it out.
+    let (mut b, n) = seg(R1, HOST_B, ("10.10.2.10", 53), ("10.10.1.10", 1000), None);
+    sent(r.process(1, &mut b, 0, n));
+    let (mut b, n) = seg(R1, HOST_B, ("10.10.2.10", 53), ("10.10.1.10", 1002), None);
+    sent(r.process(1, &mut b, 0, n)); // now both are answered
+    let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", 1003), ("10.10.2.10", 53), None);
+    assert_eq!(
+        r.process(0, &mut b, 0, n),
+        Verdict::Drop(DropReason::SessionTableFull)
+    );
 }
 
 #[test]

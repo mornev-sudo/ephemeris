@@ -133,14 +133,59 @@ established connection sees its FIN or RST), it is refiled straight away.
 Otherwise a closed connection would sit in the table until its old,
 hour-long slot came round.
 
-**Nothing is kept forever.** Every timeout is capped at an hour: a
-`*_timeout_secs` above 3600 is applied as 3600 (with a warning in the log),
-so no idle session outlives an hour, and a closing or closed one goes within 10 minutes at most
+**Nothing is kept forever.** Every timeout is capped at a day: a
+`*_timeout_secs` above 86,400 is applied as 86,400 (with a warning in the
+log), and a closing or closed TCP session goes within 10 minutes at most
 (`MAX_IDLE_SECS`, `MAX_CLOSING_SECS` in
 [`session.rs`](../../crates/eph-dataplane/src/session.rs)). A session that
 keeps carrying traffic stays as long as it's in use, as it should: cutting
-a live SSH session or video call after an hour would be a bug, not a
-safeguard.
+a live SSH session or video call would be a bug, not a safeguard.
+
+## How long an idle session lives
+
+Too short, and a quiet but live connection breaks: an SSH session left
+open over lunch, a VoIP call on hold. Too long, and dead flows fill the
+table. The defaults (`[sessions]`) follow the IETF's NAT behaviour
+requirements where applications depend on them, and Linux conntrack's
+practice for the rest:
+
+| Session | Default | Why |
+|---|---|---|
+| TCP handshake (SYN sent, not answered) | 30 s | A real handshake takes milliseconds; scans and SYN floods leave these behind |
+| TCP established | 2 h 4 min | RFC 5382 REQ-5: longer than TCP's own 2-hour keepalive, so an idle connection with keepalives survives |
+| TCP closing (one FIN) / closed (both FINs, or a reset) | 120 s / 10 s | Long enough for the last retransmits |
+| UDP, not answered yet | 30 s | What fills a table during a scan or flood; real requests get their answer in seconds. (RFC 4787 asks for 2 minutes here; conntrack, like us, chooses 30 s) |
+| UDP, answered | 3 min | RFC 4787 REQ-5: at least 2 minutes |
+| ICMP (echo) | 60 s | RFC 5508: at least 60 s |
+| Other protocols (GRE, ESP, ...) | 60 s | |
+
+Two more tools:
+
+- **Per-application timeouts.** Some applications want something else:
+  DNS is done after one answer, while a VoIP or Teams media flow may
+  pause for minutes. `[[sessions.timeout]]` sets them by protocol and
+  server port, decided when the session starts; the first match wins:
+
+  ```toml
+  [[sessions.timeout]]
+  name = "dns"
+  protocol = "udp"
+  ports = "53"
+  idle_secs = 10           # once answered
+  unanswered_secs = 5      # before an answer (else the protocol's)
+  ```
+
+- **Early drop.** When the table is full, a new flow isn't simply
+  refused: the session due to expire soonest among those that never got an
+  answer (or are closing) makes room for it, as Linux conntrack does
+  (`sessions.early_drop`, on by default). Only if every session is a live,
+  answered conversation is the new one refused. `ephctl status` shows how
+  many were dropped early.
+
+`ephctl status` also counts the sessions that expired **without a single
+packet back**. A handful is normal (a DNS server that didn't answer). A
+lot of them, while users complain, means replies aren't arriving: see
+chapter 13's "Replies that don't come back".
 
 There's one more subtlety: a freed slab slot can be reused by a new session
 while the wheel still holds a stale entry for the old one. Every slot carries
@@ -154,8 +199,9 @@ Each worker reserves room for `max_per_worker` sessions at startup (about
 300 bytes each: the 200-byte session itself, and room in the hash map for
 both of its keys, its own and its NAT translation's). With `"auto"`, the
 default, the size comes from the memory the machine has free at start; a
-fixed size that won't fit is refused (see `ephemerisd/src/memory.rs`). A full table refuses *new* flows (`session-table-full`) but
-existing ones keep working. Two reasons:
+fixed size that won't fit is refused (see `ephemerisd/src/memory.rs`). A full table refuses *new* flows (`session-table-full`), after first
+trying to make room by dropping one that never got an answer (early drop,
+above); existing conversations keep working. Two reasons:
 
 - **No allocation on the fast path** (chapter 4).
 - **Predictable behaviour under attack.** A flood of fake flows fills the

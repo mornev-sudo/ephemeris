@@ -68,6 +68,11 @@ impl Default for NatConfig {
 }
 
 impl NatConfig {
+    /// Does any source NAT happen at all?
+    pub fn active(&self) -> bool {
+        self.masquerade || !self.pools.is_empty() || !self.rules.is_empty()
+    }
+
     pub fn off() -> Self {
         NatConfig {
             masquerade: false,
@@ -127,6 +132,16 @@ fn l4_checksum_offset(proto: u8, l4: &[u8]) -> Option<usize> {
     }
 }
 
+/// A checksum to store: UDP sends a computed 0 as 0xffff (RFC 768), since
+/// 0 there means "no checksum". (The same number in one's complement.)
+fn l4_sum(proto: u8, c: u16) -> u16 {
+    if proto == ipv4::PROTO_UDP && c == 0 {
+        0xffff
+    } else {
+        c
+    }
+}
+
 fn rd16(b: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([b[o], b[o + 1]])
 }
@@ -148,7 +163,7 @@ fn set_addr(ip: &mut [u8], hl: usize, off: usize, new: Ipv4Addr) {
         wr16(ip, 10, checksum::update16(hc, old, new));
         if let Some(c) = csum_l4 {
             let lc = rd16(ip, hl + c);
-            wr16(ip, hl + c, checksum::update16(lc, old, new));
+            wr16(ip, hl + c, l4_sum(proto, checksum::update16(lc, old, new)));
         }
         wr16(ip, o, new);
     }
@@ -172,7 +187,7 @@ fn set_port(ip: &mut [u8], hl: usize, proto: u8, which: Which, new: u16) {
     let old = rd16(ip, field);
     if let Some(c) = csum {
         let lc = rd16(ip, c);
-        wr16(ip, c, checksum::update16(lc, old, new));
+        wr16(ip, c, l4_sum(proto, checksum::update16(lc, old, new)));
     }
     wr16(ip, field, new);
 }
@@ -320,6 +335,23 @@ mod tests {
         translate_dst(&mut p, "10.0.0.9".parse().unwrap(), 53);
         assert_eq!(checksum::checksum(&p[..20]), 0);
         assert_eq!(udp_sum(&p), 0);
+    }
+
+    #[test]
+    fn a_computed_zero_udp_checksum_is_sent_as_ffff() {
+        // Find the port whose translation makes the checksum come out 0.
+        let addr: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let port = (1024..=u16::MAX)
+            .find(|&port| {
+                let mut p = udp_packet(true);
+                translate_src(&mut p, addr, port);
+                matches!(&p[26..28], [0, 0] | [0xff, 0xff])
+            })
+            .expect("some port gives a zero sum");
+        let mut p = udp_packet(true);
+        translate_src(&mut p, addr, port);
+        assert_eq!(&p[26..28], &[0xff, 0xff], "0 would mean \"no checksum\"");
+        assert_eq!(udp_sum(&p), 0, "and it still verifies");
     }
 
     #[test]

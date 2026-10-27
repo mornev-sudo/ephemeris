@@ -84,7 +84,7 @@ impl TraceCat {
             NeighborMiss => TraceCat::Arp,
             NoRoute | TtlExceeded | TooBig | LocalUnhandled => TraceCat::Route,
             NoSession | InvalidTcpState | SessionTableFull | SessionMismatch => TraceCat::Session,
-            NatExhausted | NatUntranslatable => TraceCat::Nat,
+            NatExhausted | NatUntranslatable | NatNoSession | NatWrongWorker => TraceCat::Nat,
             Malformed | BadIpHeader | BadL4Header | Martian | SpoofedSource | IpOption
             | BadFragment | FragmentToRouter | IcmpMismatch => TraceCat::Filter,
             IcmpRateLimited => TraceCat::Icmp,
@@ -163,6 +163,13 @@ pub enum TraceKind {
     ArpRequest,
     /// The router sent an ICMP error (type, code) about this packet.
     IcmpSent { kind: u8, code: u8 },
+    /// A session expired without a single packet back: `flow` is what was
+    /// tried (initiator to responder), `nat` how it went out, if translated.
+    Unanswered {
+        packets: u32,
+        age_secs: u32,
+        nat: Option<(Ipv4Addr, u16)>,
+    },
 }
 
 /// One traced event. Copy, fixed size: recording one never allocates.

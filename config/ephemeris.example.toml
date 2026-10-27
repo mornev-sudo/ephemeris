@@ -42,11 +42,26 @@ max_per_worker = "auto"
 # true: only a TCP SYN may open a session. false: also pick up connections
 # already in progress (useful right after a router restart).
 tcp_strict = false
-# Idle timeouts.
-tcp_established_timeout_secs = 3600
-udp_timeout_secs = 30          # one-way UDP
+# Idle timeouts (seconds; chapter 7 explains the defaults).
+tcp_handshake_timeout_secs = 30
+tcp_established_timeout_secs = 7440  # 2 h 4 min (RFC 5382)
+tcp_closing_timeout_secs = 120
+tcp_closed_timeout_secs = 10
+udp_timeout_secs = 30          # UDP not answered yet
 udp_stream_timeout_secs = 180  # UDP that has seen replies
-icmp_timeout_secs = 30
+icmp_timeout_secs = 60
+other_timeout_secs = 60        # GRE, ESP, ...
+# Table full: drop a session that never got an answer to make room,
+# instead of refusing the new one.
+early_drop = true
+
+# Per-application timeouts, by protocol and server port; first match wins.
+# [[sessions.timeout]]
+# name = "dns"
+# protocol = "udp"
+# ports = "53"
+# idle_secs = 10          # once answered
+# unanswered_secs = 5     # before an answer (default: the protocol's)
 
 [ssh]
 # true: log in over SSH with an SSH key or the admin password. false: keys

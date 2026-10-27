@@ -136,7 +136,43 @@ All of this is also in the portal: Configuration → NAT.
 - **Real NICs with several workers:** replies must arrive at the worker that
   made the translation. On virtio (Proxmox) this happens naturally. On
   hardware NICs it needs RSS steering by port range or a worker handoff,
-  which is a future step. Use one worker for now.
+  which is a future step. Use one worker for now. If replies land on the
+  wrong worker, the `nat-wrong-worker` drop counter says so.
+
+## Replies that don't come back
+
+A session that shows packets going out and **none coming back** (`2 / 0`
+in the portal's Sessions tab) means one of three things:
+
+1. **The reply reached the router but found no session.** It's dropped and
+   counted: `nat-wrong-worker` if it arrived at a worker other than the one
+   that owns its NAT port (the network card chose the queue; see above),
+   `nat-no-session` if the session had already expired or never existed.
+2. **The reply never reached the router.** The drop counters stay still.
+   Something upstream dropped the request or the answer: the ISP, an
+   upstream router or firewall (a modem in router mode, double NAT), or the
+   far end ignoring a malformed packet.
+3. **The request never got out.** The interface's tx counter and the
+   upstream device's own counters tell.
+
+To see it packet by packet:
+
+```bash
+ephctl status                       # drops by reason; sessions never answered
+ephctl log host 8.8.8.8             # the server: replies don't carry the inside host
+ephctl log set nat debug            # translations, and replies without a session
+ephctl log set session debug        # sessions that expire without an answer
+ephctl log show -c nat -c session -f
+```
+
+```
+DEBUG nat      udp 10.0.0.2:59135 -> 8.8.8.8:53 in lan: translated to 192.168.3.56:51086
+DEBUG nat      drop nat-wrong-worker: udp 8.8.8.8:53 -> 192.168.3.56:51086 in wan (a reply that arrived at a worker other than ...)
+DEBUG session  no answer: udp 10.0.0.2:59135 -> 8.8.8.8:53 in lan, 3 packet(s) out and none back in 30 s, sent as 192.168.3.56:51086
+```
+
+A translation followed by "no answer" and no drop at all is case 2: look
+upstream.
 
 ## Exercises
 

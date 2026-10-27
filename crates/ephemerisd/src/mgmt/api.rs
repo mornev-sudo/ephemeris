@@ -604,6 +604,9 @@ async fn status(State(s): St) -> Json<Value> {
         "sessions": {
             "active": sum.sessions_active, "created": sum.sessions_created,
             "expired": sum.sessions_expired,
+            // Of those, never answered; and dropped early (table full).
+            "unanswered": sum.sessions_unanswered,
+            "early_dropped": sum.sessions_early_dropped,
         },
         "routes": s.fib.read().unwrap().routes().len(),
         // The four headline numbers, over the last sampling interval.
