@@ -3,6 +3,10 @@
 Read this with the code open. We follow a ping from client-a (10.10.1.10) to
 client-b (10.10.2.10) through `ephemerisd`, in the order things happen.
 
+For the same path as a picture, with every check and drop reason and more
+scenarios (NAT, PPPoE, VLANs, SD-WAN, the host path), open
+[packet-walk.html](../packet-walk.html) in a browser.
+
 ## Startup: [`ephemerisd/src/run.rs`](../../crates/ephemerisd/src/run.rs)
 
 1. **Config → ports → FIB.** [`config.rs`](../../crates/ephemerisd/src/config.rs)
