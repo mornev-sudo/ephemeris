@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "eph-dataplane"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "chacha20poly1305",
  "eph-fib",
@@ -295,22 +295,22 @@ dependencies = [
 
 [[package]]
 name = "eph-fib"
-version = "0.10.2"
+version = "0.11.0"
 
 [[package]]
 name = "eph-packet"
-version = "0.10.2"
+version = "0.11.0"
 
 [[package]]
 name = "eph-xdp"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ephctl"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "ephemerisd"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "axum",

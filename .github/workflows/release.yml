@@ -87,7 +87,15 @@ jobs:
             exit 1
           fi
           test -s SHA256SUMS.gpg || { echo "::error::image run produced no SHA256SUMS.gpg"; exit 1; }
-          notes="Image build \`$build\` (commit ${GITHUB_SHA::8}), boot-tested in [run ${{ steps.run.outputs.id }}](https://github.com/$GH_REPO/actions/runs/${{ steps.run.outputs.id }})."
+          # The release notes live in the repo, written with the release
+          # commit; the build line and GitHub's list of PRs go under them.
+          notes_file=../docs/releases/$GITHUB_REF_NAME.md
+          test -s "$notes_file" || { echo "::error::no release notes: add docs/releases/$GITHUB_REF_NAME.md to the release commit, then tag it again."; exit 1; }
+          notes="$(cat "$notes_file")
+
+          ---
+
+          Image build \`$build\` (commit ${GITHUB_SHA::8}), boot-tested in [run ${{ steps.run.outputs.id }}](https://github.com/$GH_REPO/actions/runs/${{ steps.run.outputs.id }})."
           # The qcow2 is for new routers; the .raw.xz and .efi files are what
           # existing routers download to update themselves (systemd-sysupdate).
           gh release create "$GITHUB_REF_NAME" --title "Ephemeris $GITHUB_REF_NAME" \
