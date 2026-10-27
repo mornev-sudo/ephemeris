@@ -228,11 +228,16 @@ tls_scan() { # testssl.sh against the portal; fails on HIGH or CRITICAL
     python3 - "$LOGS/scans/testssl.json" <<'PY'
 import json, sys
 # The certificate is self-signed on purpose (made on the router at first
-# boot; its fingerprint is on the console): trust findings are expected.
+# boot; its fingerprint is on the console): findings that follow from that
+# are expected. No CA means no CRL or OCSP; it lasts ten years because
+# nothing renews it; and testssl grades any untrusted certificate "T".
 # Everything else counts: protocols, ciphers, known TLS vulnerabilities.
-expected = ("cert_chain_of_trust", "cert_trust", "cert_caIssuers")
+expected = ("cert_chain_of_trust", "cert_trust", "cert_caIssuers",
+            "cert_revocation", "cert_extlifeSpan")
+def ok(f):
+    return f["id"].startswith(expected) or (f["id"] == "overall_grade" and f["finding"] == "T")
 bad = [f"{f['id']}: {f['finding']}" for f in json.load(open(sys.argv[1]))
-       if f.get("severity") in ("HIGH", "CRITICAL") and not f["id"].startswith(expected)]
+       if f.get("severity") in ("HIGH", "CRITICAL") and not ok(f)]
 print("\n".join(bad) or "no high or critical findings")
 sys.exit(1 if bad else 0)
 PY
