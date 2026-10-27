@@ -4,6 +4,7 @@
 //! supplies the time and persists the leases, so this is fully testable.
 
 use crate::logging::cat::DHCP_SERVER;
+use crate::logging::untrusted;
 use eph_fib::Prefix;
 use eph_packet::dhcp::{self, Message, Received};
 use eph_packet::{eth, Mac};
@@ -88,7 +89,7 @@ impl Server {
                 if m.op != dhcp::OP_REQUEST { "not a request" } else { "relayed (giaddr): relays aren't supported" });
             return (None, false);
         }
-        debug!(target: DHCP_SERVER, iface, mac, hostname = m.text(dhcp::OPT_HOSTNAME).unwrap_or_default(),
+        debug!(target: DHCP_SERVER, iface, mac, hostname = untrusted(&m.text(dhcp::OPT_HOSTNAME).unwrap_or_default()),
             "{} (ciaddr {}, requested {})", dhcp::type_name(m.msg_type()), m.ciaddr,
             m.ip(dhcp::OPT_REQUESTED_IP).map_or("-".into(), |i| i.to_string()));
         self.expire(now);
@@ -170,7 +171,7 @@ impl Server {
                 .leases
                 .iter()
                 .any(|l| l.mac == m.chaddr && l.ip == ip && l.state == LeaseState::Bound);
-            let host = m.text(dhcp::OPT_HOSTNAME);
+            let host = m.text(dhcp::OPT_HOSTNAME).map(|h| untrusted(&h));
             if renewal {
                 debug!(target: DHCP_SERVER, iface, mac, "ACK {ip}: renewed for {}s", self.cfg.lease_secs);
             } else {
@@ -244,7 +245,12 @@ impl Server {
     }
 
     fn record(&mut self, m: &Message, ip: Ipv4Addr, state: LeaseState, expires: u64) {
-        let hostname = m.text(dhcp::OPT_HOSTNAME).filter(|h| !h.is_empty());
+        // Whatever the client calls itself is stored, logged and shown in
+        // the portal and ephctl: cleaned first.
+        let hostname = m
+            .text(dhcp::OPT_HOSTNAME)
+            .filter(|h| !h.is_empty())
+            .map(|h| untrusted(&h));
         self.leases.retain(|l| l.mac != m.chaddr && l.ip != ip);
         self.leases.push(Lease {
             mac: m.chaddr,
@@ -403,6 +409,24 @@ mod tests {
         assert!(s.handle(&c, 2000).0.is_none());
         // Once A's lease expires, the third client gets it.
         assert!(s.handle(&c, 1000 + 3600 * 2).0.is_some());
+    }
+
+    #[test]
+    fn a_hostile_hostname_is_stored_clean() {
+        let mut s = server();
+        let offer = parse(s.handle(&client_msg(A, dhcp::DISCOVER, |_| {}), 1000).0);
+        let forged = b"nas\nINFO  audit       admin password changed\x1b[2J";
+        s.handle(
+            &client_msg(A, dhcp::REQUEST, |m| {
+                m.set_ip(dhcp::OPT_SERVER_ID, ip("10.0.0.1"))
+                    .set_ip(dhcp::OPT_REQUESTED_IP, offer.msg.yiaddr)
+                    .set(dhcp::OPT_HOSTNAME, forged.to_vec());
+            }),
+            1000,
+        );
+        let h = s.leases[0].hostname.clone().unwrap();
+        assert!(!h.chars().any(char::is_control), "{h:?}");
+        assert!(h.starts_with("nas\\n"));
     }
 
     #[test]

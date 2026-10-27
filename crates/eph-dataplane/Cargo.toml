@@ -4,12 +4,17 @@ description = "Ephemeris forwarding pipeline: pure packet logic, no I/O"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 eph-packet.workspace = true
 eph-fib.workspace = true
 rustc-hash.workspace = true
 chacha20poly1305.workspace = true
+
+[features]
+# Test router and input driver for fuzzing (fuzz/ and the random-packet test).
+fuzzing = []
 
 [lints]
 workspace = true

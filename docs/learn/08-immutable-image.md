@@ -90,7 +90,7 @@ the VM's firmware tables (SMBIOS type 11, set with `qm set --args`):
 | `ssh.authorized_keys.root` | `/var/lib/ephemeris/ssh/authorized_keys.root`, refreshed every boot |
 | `system.hostname` | the hostname |
 | `ephemeris.config` | `/var/lib/ephemeris/ephemeris.toml`, written on first boot only |
-| `ephemeris.admin_password_hash` | the admin password (SHA-512 crypt hash; the plain password is printed by the deploy script and never reaches the VM) |
+| `ephemeris.admin_password_hash` | the admin password (a SHA-512 crypt or yescrypt hash; the plain password is printed by the deploy script and never reaches the VM; stored as yescrypt from the first login) |
 
 Inside the image, [`tmpfiles.d/ephemeris.conf`](../../image/mkosi.extra/usr/lib/tmpfiles.d/ephemeris.conf)
 does the writing. It's a declarative list: "this file, from that credential".

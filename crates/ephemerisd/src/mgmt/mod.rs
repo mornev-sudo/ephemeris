@@ -19,6 +19,7 @@ pub mod history;
 pub mod logapi;
 pub mod nics;
 pub mod paths;
+pub mod ssh;
 pub mod sysinfo;
 
 use crate::config::Config;
@@ -108,6 +109,7 @@ impl Shared {
         let fib = Arc::new(cfg.fib(&ports)?);
         let nat = Arc::new(cfg.nat()?);
         crate::logging::control().apply_config(&cfg.logging);
+        ssh::apply(&cfg.ssh);
         for tx in self.control.lock().unwrap().iter() {
             // A worker that has exited (shutdown) just doesn't get it.
             let _ = tx.send(Control::SetPorts(ports.clone()));

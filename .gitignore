@@ -9,3 +9,4 @@
 /image/mkosi.key
 /ci/node_modules
 /.playwright
+/image/rust.cdx.json

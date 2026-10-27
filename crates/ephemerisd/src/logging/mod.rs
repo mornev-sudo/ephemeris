@@ -575,6 +575,41 @@ pub fn fmt_duration(d: Duration) -> String {
     out
 }
 
+/// Control characters escaped (`\n` becomes `\\n`, ESC becomes
+/// `\\u{1b}`): a log line stays one line, and nothing reaches a terminal
+/// as an escape sequence.
+pub fn escape_controls(s: &str) -> String {
+    if !s.chars().any(char::is_control) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Longest text from the network kept as is.
+pub const UNTRUSTED_MAX: usize = 64;
+
+/// Text from the network (a DHCP client's hostname, an ISP's name or error
+/// message): made safe to log, store and show. Control characters are
+/// escaped and it's cut to [`UNTRUSTED_MAX`] characters, so whoever sent it
+/// can't forge log lines, send escape sequences to a terminal, or fill the
+/// log with one field (ASVS V16.4.1).
+pub fn untrusted(s: &str) -> String {
+    let cut: String = s.chars().take(UNTRUSTED_MAX).collect();
+    let mut out = escape_controls(&cut);
+    if s.chars().count() > UNTRUSTED_MAX {
+        out.push('…');
+    }
+    out
+}
+
 /// "10m", "2h", "90s", "1d", or "forever" (zero: until reset).
 pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
@@ -692,6 +727,31 @@ mod tests {
         assert!(bad(|c| c.debug_file_mb = 1).contains("debug_file_mb"));
         assert!(bad(|c| c.dir = "logs".into()).contains("absolute"));
         assert!(LoggingCfg::default().validate().is_ok());
+    }
+
+    #[test]
+    fn network_text_cannot_forge_lines_or_reach_a_terminal() {
+        let forged = "laptop\n2026-10-27T10:00:00.000Z INFO  audit       admin password changed";
+        let s = untrusted(forged);
+        assert!(!s.contains('\n'), "{s}");
+        assert!(s.starts_with("laptop\\n2026"));
+        assert_eq!(
+            untrusted("evil\x1b[2J"),
+            "evil\\u{1b}[2J",
+            "no terminal escapes"
+        );
+        assert_eq!(
+            untrusted("printer-2nd-floor"),
+            "printer-2nd-floor",
+            "ordinary names untouched"
+        );
+        assert_eq!(untrusted("café"), "café");
+        let long = "x".repeat(500);
+        assert_eq!(
+            untrusted(&long).chars().count(),
+            UNTRUSTED_MAX + 1,
+            "cut, with an ellipsis"
+        );
     }
 
     #[test]

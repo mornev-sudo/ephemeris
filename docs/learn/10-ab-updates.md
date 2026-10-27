@@ -141,7 +141,10 @@ showing where things stand:
 | Install failed | the reason, and where to look (`journalctl -u ephemeris-update`) |
 
 **Install never reboots by itself.** You choose when the minute of downtime
-happens. "Ready" is read from the boot loader itself: its default entry is a
+happens. Nor does the router update by itself: Debian's own automatic
+update and reboot timers (`systemd-sysupdate.timer`,
+`systemd-sysupdate-reboot.timer`) are masked in the image, and CI checks
+that they stay that way. "Ready" is read from the boot loader itself: its default entry is a
 version other than the one running. Clicking Reboot during an install asks
 first. Rebooting then is safe, because the new boot entry is only written at
 the very end: the router simply comes back on the current version.

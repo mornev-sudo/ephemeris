@@ -4,6 +4,7 @@ description = "Command-line client for the Ephemeris router's management API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true

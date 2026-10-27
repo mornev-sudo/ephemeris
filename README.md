@@ -115,6 +115,14 @@ cargo test --workspace
 cargo run -p ephemerisd -- --check -c config/ephemeris.example.toml
 ```
 
+Hostile input: `cargo test` already pushes a few hundred thousand malformed
+packets through the pipeline. For coverage-guided fuzzing (needs nightly
+and `cargo install cargo-fuzz`):
+
+```bash
+cd fuzz && cargo +nightly fuzz run pipeline
+```
+
 In Proxmox, you deploy a pre-built image. [CI](.github/workflows/image.yml) builds and boot-tests
 an image for every push to `main`. Tagging a commit `v*` promotes that tested image to a GitHub
 Release ([release.yml](.github/workflows/release.yml)) without rebuilding it.
@@ -192,6 +200,12 @@ a browser.
   - [x] Sites: hub / spoke / mesh roles decide who connects, tethers generated per WAN, routing through hubs, per-pair keys managed in the portal and `ephctl`, peers without a fixed address learned from their packets (works behind NAT)
   - [ ] 4b (second half): WireGuard-style handshake (forward secrecy, key rotation)
   - [ ] 4c: central controller; FRR/BGP for LAN-side routes
+
+## Security
+
+How to report a vulnerability, and how to verify a release (signatures,
+build provenance, SBOM): [SECURITY.md](SECURITY.md). What the router
+protects and how: [docs/threat-model.md](docs/threat-model.md).
 
 ## License
 

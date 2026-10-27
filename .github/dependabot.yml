@@ -1,0 +1,33 @@
+# Weekly pull requests for dependency updates (OWASP DevSecOps: dependency
+# management). Security fixes come as soon as an advisory is published,
+# whatever the schedule. CI (cargo-deny, tests, the boot test) checks
+# every one before it can be merged.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Patch and minor updates together in one PR; majors one by one.
+      rust-minor:
+        update-types: [minor, patch]
+    # A few days' delay before taking a new release: most malicious or
+    # broken versions are caught and yanked within that time.
+    cooldown:
+      default-days: 5
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+
+  # The Actions in .github/workflows, pinned to commits: Dependabot moves
+  # the pin and the version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

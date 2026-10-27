@@ -17,7 +17,10 @@ else
     # 20 characters from an alphabet without look-alikes (0/O, 1/l/I): ~115 bits.
     pw=$(head -c 600 /dev/urandom | LC_ALL=C tr -dc 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789' | cut -c1-20 |
         sed 's/\(.....\)\(.....\)\(.....\)\(.....\)/\1-\2-\3-\4/')
-    hash=$(printf '%s' "$pw" | openssl passwd -6 -stdin)
+    # yescrypt, as ephemerisd stores it; SHA-512 crypt if that fails (it's
+    # replaced by yescrypt at the first web login).
+    hash=$(printf '%s\n' "$pw" | /usr/bin/ephemerisd --hash-password) ||
+        hash=$(printf '%s' "$pw" | openssl passwd -6 -stdin)
     mkdir -p /run/ephemeris
     printf '%s\n' "$pw" > /run/ephemeris/first-boot-password   # tmpfs: gone after reboot
     echo "admin password generated; shown on the console"

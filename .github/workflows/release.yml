@@ -22,7 +22,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       # History is needed to tell docs-only commits from code changes.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -92,4 +92,4 @@ jobs:
           # existing routers download to update themselves (systemd-sysupdate).
           gh release create "$GITHUB_REF_NAME" --title "Ephemeris $GITHUB_REF_NAME" \
             --notes "$notes" --generate-notes \
-            *.qcow2 *.raw.xz *.efi SHA256SUMS SHA256SUMS.gpg VERSION
+            *.qcow2 *.raw.xz *.efi SHA256SUMS SHA256SUMS.gpg VERSION *.manifest *.cdx.json

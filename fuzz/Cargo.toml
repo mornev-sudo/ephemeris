@@ -1,0 +1,37 @@
+# Coverage-guided fuzzing (libFuzzer via cargo-fuzz; needs nightly):
+#
+#   cargo +nightly fuzz run pipeline     # packets through a full router
+#   cargo +nightly fuzz run parsers      # every packet parser on raw bytes
+#
+# Its own workspace, so the main build never needs nightly or libFuzzer.
+# CI runs each target for a short while on every change.
+[package]
+name = "eph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+eph-dataplane = { path = "../crates/eph-dataplane", features = ["fuzzing"] }
+eph-packet = { path = "../crates/eph-packet" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "pipeline"
+path = "fuzz_targets/pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parsers"
+path = "fuzz_targets/parsers.rs"
+test = false
+doc = false
+bench = false

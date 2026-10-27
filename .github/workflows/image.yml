@@ -23,19 +23,53 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # Known vulnerabilities (RustSec), licences, sources: deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  # Coverage-guided fuzzing (fuzz/): hostile packets through the full
+  # pipeline, and raw bytes into every parser. A panic there would let one
+  # packet restart the router, so each target gets a few minutes on every
+  # change; a crash fails the job and its input is kept to reproduce it.
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - name: Fuzz the pipeline
+        run: cd fuzz && cargo +nightly fuzz run pipeline -- -max_total_time=120 -rss_limit_mb=4096
+      - name: Fuzz the parsers
+        run: cd fuzz && cargo +nightly fuzz run parsers -- -max_total_time=120
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
 
   image:
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # main uses the environment holding the real signing keys (only main
+    # may); everything else a key-less one.
+    environment: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'release-signing' || 'ci-test' }}
+    permissions:
+      contents: read
+      id-token: write      # build provenance attestation (main only)
+      attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 1
 
@@ -58,22 +92,48 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
-      - uses: systemd/mkosi@v27.1
+      - uses: systemd/mkosi@ecf7f5702bb2052b7a69cab3fe7d37bc3b9ad77b # v27.1
 
       - name: Tools for converting and booting the image
         run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-utils qemu-system-x86 ovmf xz-utils
 
-      # Private keys come from repository secrets and only exist on the
-      # runner for the duration of the job.
+      # Builds of main (the only ones that can become a release) are signed
+      # with the real keys, which live in the "release-signing" environment:
+      # only main may use it, so a pull request can't reach them, whatever
+      # its workflow file says. Every other build gets throwaway keys made
+      # here, built into that image instead of the real ones, so the boot
+      # test still checks Secure Boot and signed updates end to end.
       - name: Signing keys
         env:
           SECUREBOOT_KEY: ${{ secrets.SECUREBOOT_KEY }}
           RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_BUILD: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
-          [[ -n $SECUREBOOT_KEY && -n $RELEASE_GPG_KEY ]] || { echo "::error::signing secrets missing"; exit 1; }
           umask 077
-          printf '%s\n' "$SECUREBOOT_KEY" > image/mkosi.key
-          printf '%s\n' "$RELEASE_GPG_KEY" | gpg --batch --import
+          if [[ $RELEASE_BUILD == true ]]; then
+            [[ -n $SECUREBOOT_KEY && -n $RELEASE_GPG_KEY ]] || { echo "::error::signing secrets missing from the release-signing environment"; exit 1; }
+            printf '%s\n' "$SECUREBOOT_KEY" > image/mkosi.key
+            printf '%s\n' "$RELEASE_GPG_KEY" | gpg --batch --import
+          else
+            echo "Test build: throwaway signing keys (this image can never be released)"
+            openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
+              -subj "/CN=Ephemeris CI test key (not for release)/" \
+              -keyout image/mkosi.key -out image/mkosi.crt 2>/dev/null
+            gpg --batch --passphrase '' --quick-gen-key "Ephemeris CI test key (not for release) <ci@invalid>" ed25519 sign 2d
+            gpg --export > image/mkosi.extra/etc/systemd/import-pubring.gpg
+          fi
+
+      # SBOM of the Rust side (every crate in Cargo.lock), CycloneDX. The
+      # build adds it, and mkosi's package manifest, to SHA256SUMS, so both
+      # are signed and attested with the image.
+      - name: SBOM (Rust dependencies)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: image/rust.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Build image
         env:
@@ -86,6 +146,15 @@ jobs:
           SIGN_RELEASE: "1"
         run: |
           OUT=update-v2 image/build.sh "${{ steps.version.outputs.version }}.1" > build-v2.log 2>&1 || { tail -50 build-v2.log; exit 1; }
+
+      # Build provenance (SLSA): a signed statement, kept by GitHub, that
+      # these exact files were built by this workflow from this commit.
+      # Check one with: gh attestation verify <file> -R <owner>/<repo>
+      - name: Attest build provenance
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: image/mkosi.output/SHA256SUMS
 
       # Everything below runs on this CI machine, against the unmodified
       # production image: see ci/e2e.sh.
@@ -102,14 +171,14 @@ jobs:
 
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs
           path: e2e-logs
           if-no-files-found: ignore
 
       - name: Upload image
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Fixed name, so release.yml can find it.
           name: ephemeris-image
@@ -120,3 +189,5 @@ jobs:
             image/mkosi.output/SHA256SUMS
             image/mkosi.output/SHA256SUMS.gpg
             image/mkosi.output/VERSION
+            image/mkosi.output/*.manifest
+            image/mkosi.output/*.cdx.json

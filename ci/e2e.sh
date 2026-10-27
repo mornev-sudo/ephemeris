@@ -168,6 +168,9 @@ check "no failed services"                 sh -c "[ -z \"\$(${SSH[*]} systemctl 
 check "ephemerisd runs as a service"         on_router systemctl is-active --quiet ephemerisd.service
 check "Secure Boot is enabled"             sh -c "${SSH[*]} od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c | grep -q 1"
 check "root filesystem is read-only"       sh -c "! ${SSH[*]} touch /usr/bin/test-write"
+# The router never updates or reboots by itself: Debian's sysupdate timers
+# and services are masked (updates are started by an operator).
+check "no automatic updates or reboots"    on_router 'for u in systemd-sysupdate.timer systemd-sysupdate.service systemd-sysupdate-reboot.timer systemd-sysupdate-reboot.service; do [ "$(systemctl is-enabled $u 2>/dev/null)" = masked ] || { echo "$u: $(systemctl is-enabled $u 2>&1)"; exit 1; }; done; ! systemctl list-timers --all --no-legend | grep -q sysupdate'
 check "SSH with the admin password"        sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true
 check "wrong password refused"             sh -c "! sshpass -p wrong-password ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true"
 check "ephctl on the router"                sh -c "${SSH[*]} ephctl status | grep -q lan-b"
@@ -182,9 +185,65 @@ check "API refuses anonymous requests"     sh -c "[ \"\$(curl -sk -o /dev/null -
 check "unknown host names refused"         sh -c "[ \"\$(curl -sk -o /dev/null -w '%{http_code}' -H 'Host: rebind.example' $WEB/)\" = 421 ]"
 check "security headers sent"              sh -c "curl -skI $WEB/ | grep -qi \"content-security-policy: default-src 'none'; script-src 'self'\" && curl -skI $WEB/ | grep -qi strict-transport-security"
 check "web login with the admin password"  sh -c "curl -skf -c '$WORK/cookies' -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"$PASSWORD\"}' $WEB/api/v1/login && curl -skf -b '$WORK/cookies' $WEB/api/v1/status | grep -q lan-a"
+# Deployed with a SHA-512 crypt hash; the first login stores it as yescrypt
+# (ASVS V11.4.2), for the web and for root's /etc/shadow alike.
+check "password hash upgraded to yescrypt"  on_router 'grep -q "^[\$]y[\$]" /var/lib/ephemeris/admin.hash && grep -q "^root:[\$]y[\$]" /etc/shadow'
+check "SSH password still works after it"   sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 true
 check "session cookie is Secure"           grep -q '^#HttpOnly_127.0.0.1.*TRUE' "$WORK/cookies"
 check "config file is private"             sh -c "[ \"\$(${SSH[*]} stat -c %a /var/lib/ephemeris/ephemeris.toml)\" = 600 ]"
 check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="$PASSWORD" SHOTS="$LOGS" node "$HERE/portal-test.mjs"
+
+# Automated security testing of the portal (OWASP WSTG): a passive ZAP
+# baseline scan, and a TLS scan. Each fails on anything rated high; the
+# full reports are kept with the test logs.
+mkdir -p "$LOGS/scans" && chmod 777 "$LOGS/scans"
+# Both images come from GitHub's registry (Docker Hub rate-limits shared CI
+# runners), pinned to a version. Each scanner's own output is kept next to
+# its report; if no report appears, its last lines say why. The mkosi
+# action removes AppArmor's tools but the kernel still has it on, so Docker
+# can't load its default profile: the scanners run without one.
+ZAP_IMAGE=ghcr.io/zaproxy/zaproxy:2.17.0
+TESTSSL_IMAGE=ghcr.io/testssl/testssl.sh:3.2
+no_report() { # name log
+    echo "$1 wrote no report. Last lines of its output:"
+    tail -25 "$2"
+    return 1
+}
+zap_scan() { # passive scan of the portal; fails on any High risk alert
+    docker run --rm --network host --security-opt apparmor=unconfined -v "$LOGS/scans:/zap/wrk:rw" "$ZAP_IMAGE" \
+        zap-baseline.py -t "$WEB/" -I -J zap.json -r zap.html > "$LOGS/scans/zap.log" 2>&1
+    [[ -s $LOGS/scans/zap.json ]] || { no_report ZAP "$LOGS/scans/zap.log"; return; }
+    python3 - "$LOGS/scans/zap.json" <<'PY'
+import json, sys
+alerts = [a for s in json.load(open(sys.argv[1])).get("site", []) for a in s.get("alerts", [])]
+high = [a["name"] for a in alerts if int(a.get("riskcode", 0)) >= 3]
+print(f"{len(alerts)} alert type(s); high risk: {high or 'none'}")
+sys.exit(1 if high else 0)
+PY
+}
+tls_scan() { # testssl.sh against the portal; fails on HIGH or CRITICAL
+    docker run --rm --network host --security-opt apparmor=unconfined -v "$LOGS/scans:/out:rw" "$TESTSSL_IMAGE" \
+        --quiet --color 0 --warnings off --jsonfile /out/testssl.json 127.0.0.1:8443 > "$LOGS/scans/testssl.log" 2>&1
+    [[ -s $LOGS/scans/testssl.json ]] || { no_report testssl "$LOGS/scans/testssl.log"; return; }
+    python3 - "$LOGS/scans/testssl.json" <<'PY'
+import json, sys
+# The certificate is self-signed on purpose (made on the router at first
+# boot; its fingerprint is on the console): findings that follow from that
+# are expected. No CA means no CRL or OCSP; it lasts ten years because
+# nothing renews it; and testssl grades any untrusted certificate "T".
+# Everything else counts: protocols, ciphers, known TLS vulnerabilities.
+expected = ("cert_chain_of_trust", "cert_trust", "cert_caIssuers",
+            "cert_revocation", "cert_extlifeSpan")
+def ok(f):
+    return f["id"].startswith(expected) or (f["id"] == "overall_grade" and f["finding"] == "T")
+bad = [f"{f['id']}: {f['finding']}" for f in json.load(open(sys.argv[1]))
+       if f.get("severity") in ("HIGH", "CRITICAL") and not ok(f)]
+print("\n".join(bad) or "no high or critical findings")
+sys.exit(1 if bad else 0)
+PY
+}
+check "ZAP baseline: nothing high risk"     zap_scan
+check "TLS scan: nothing high or critical"  tls_scan
 
 # ------------------------------------------------------------ forwarding
 echo "DHCP:"
@@ -251,6 +310,15 @@ on_router "cat > /run/access-wan.toml" < "$WORK/access-wan.toml"
 check "outside access is refused"           sh -c "${SSH[*]} ephctl config load /run/access-wan.toml 2>&1 | grep -q 'only be reached on inside interfaces'"
 check "turn it off again"                   on_router "ephctl config rollback 1"
 check "portal from lan-a closed again"      wait_for 15 "lan-a closed" sh -c "! ip netns exec ci-ha curl -sk -o /dev/null --max-time 3 https://10.10.1.1:8443/"
+
+# ------------------------------------------------------------ SSH keys only
+echo "SSH keys only:"
+{ cat "$WORK/ephemeris.toml"; printf '\n[ssh]\npassword_login = false\n'; } > "$WORK/sshkeys.toml"
+on_router "cat > /run/sshkeys.toml" < "$WORK/sshkeys.toml"
+check "turn SSH passwords off"              on_router "ephctl config load /run/sshkeys.toml && ephctl config commit"
+check "SSH password refused"                wait_for 15 "sshd to reload" sh -c "! sshpass -p '$PASSWORD' ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o ConnectTimeout=5 root@127.0.0.1 true"
+check "SSH key still works"                 on_router true
+check "passwords back after rollback"       sh -c "${SSH[*]} ephctl config rollback 1 && sleep 2 && sshpass -p '$PASSWORD' ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o ConnectTimeout=5 root@127.0.0.1 true"
 
 # ------------------------------------------------------------ logging
 # Categories, levels changed at run time, the files under /var/log/ephemeris

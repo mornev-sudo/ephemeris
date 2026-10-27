@@ -17,6 +17,8 @@
 
 mod config;
 mod filter;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing;
 pub mod host;
 pub mod nat;
 pub mod overlay;
@@ -37,6 +39,8 @@ pub use stats::{DropReason, PortCounters, Stats};
 mod tests;
 #[cfg(test)]
 mod tests_filter;
+#[cfg(test)]
+mod tests_fuzz;
 #[cfg(test)]
 mod tests_nat;
 #[cfg(test)]

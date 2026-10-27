@@ -69,6 +69,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     };
     let cfg = manager.running().clone();
     crate::logging::control().apply_config(&cfg.logging);
+    crate::mgmt::ssh::apply(&cfg.ssh);
     let state_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let dp = match start_dataplane(&cfg, &state_dir) {
         Ok(dp) => {

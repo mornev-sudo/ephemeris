@@ -22,6 +22,9 @@ pub struct Config {
     /// Log levels per category, and the log files (see `logging`).
     #[serde(default)]
     pub logging: crate::logging::LoggingCfg,
+    /// SSH logins: keys only, or keys and the admin password.
+    #[serde(default)]
+    pub ssh: SshCfg,
     #[serde(rename = "interface")]
     pub interfaces: Vec<InterfaceCfg>,
     #[serde(default, rename = "route")]
@@ -632,6 +635,24 @@ impl SessionsCfg {
 pub struct RouteCfg {
     pub prefix: String,
     pub via: String,
+}
+
+/// `[ssh]` in the config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SshCfg {
+    /// May the admin password be used to log in over SSH? false: keys only
+    /// (refused while no key is installed). The console always takes the
+    /// password.
+    pub password_login: bool,
+}
+
+impl Default for SshCfg {
+    fn default() -> Self {
+        SshCfg {
+            password_login: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

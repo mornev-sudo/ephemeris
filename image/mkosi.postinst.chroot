@@ -9,9 +9,15 @@ systemctl enable systemd-networkd.service systemd-resolved.service \
 # nginx serves only the HTTPS portal (/etc/nginx/nginx.conf), no default site.
 rm -f /etc/nginx/sites-enabled/default
 # Debian enables automatic updates *and automatic reboots* by default. A
-# router must not reboot on its own schedule: updates are started by an
-# operator (ephctl system update / the portal), and so is the reboot.
-systemctl disable systemd-sysupdate.timer systemd-sysupdate-reboot.timer
+# router must not update or reboot on its own schedule: updates are started
+# by an operator (ephctl system update / the portal), and so is the reboot.
+# Masked, not just disabled: a disabled unit is enabled again by presets
+# (applied after this script) or by a link elsewhere; a masked one points at
+# /dev/null in the read-only /etc and can't be started at all. The router's
+# own updates don't need these: ephemeris-update.service runs
+# systemd-sysupdate directly.
+systemctl mask systemd-sysupdate.timer systemd-sysupdate.service \
+    systemd-sysupdate-reboot.timer systemd-sysupdate-reboot.service
 # Package install generated SSH host keys and a hostname on the build machine.
 # Every router must get its own, so remove them; see sshd_config.d/ephemeris.conf.
 rm -f /etc/ssh/ssh_host_* /etc/hostname

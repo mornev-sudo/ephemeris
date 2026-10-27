@@ -333,6 +333,11 @@ impl<S: Subscriber> Layer<S> for RecordLayer {
         let mut t = Text::default();
         event.record(&mut t);
         t.message.push_str(&t.fields);
+        // One record, one line, whatever a message carries (ASVS V16.4.1).
+        let t = Text {
+            message: super::escape_controls(&t.message),
+            fields: String::new(),
+        };
         self.0.push(Record {
             seq: 0,
             unix_ms: crate::report::unix_ms(),
