@@ -199,7 +199,9 @@ check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="
 mkdir -p "$LOGS/scans" && chmod 777 "$LOGS/scans"
 # Both images come from GitHub's registry (Docker Hub rate-limits shared CI
 # runners), pinned to a version. Each scanner's own output is kept next to
-# its report; if no report appears, its last lines say why.
+# its report; if no report appears, its last lines say why. The mkosi
+# action removes AppArmor's tools but the kernel still has it on, so Docker
+# can't load its default profile: the scanners run without one.
 ZAP_IMAGE=ghcr.io/zaproxy/zaproxy:2.17.0
 TESTSSL_IMAGE=ghcr.io/testssl/testssl.sh:3.2
 no_report() { # name log
@@ -208,7 +210,7 @@ no_report() { # name log
     return 1
 }
 zap_scan() { # passive scan of the portal; fails on any High risk alert
-    docker run --rm --network host -v "$LOGS/scans:/zap/wrk:rw" "$ZAP_IMAGE" \
+    docker run --rm --network host --security-opt apparmor=unconfined -v "$LOGS/scans:/zap/wrk:rw" "$ZAP_IMAGE" \
         zap-baseline.py -t "$WEB/" -I -J zap.json -r zap.html > "$LOGS/scans/zap.log" 2>&1
     [[ -s $LOGS/scans/zap.json ]] || { no_report ZAP "$LOGS/scans/zap.log"; return; }
     python3 - "$LOGS/scans/zap.json" <<'PY'
@@ -220,7 +222,7 @@ sys.exit(1 if high else 0)
 PY
 }
 tls_scan() { # testssl.sh against the portal; fails on HIGH or CRITICAL
-    docker run --rm --network host -v "$LOGS/scans:/out:rw" "$TESTSSL_IMAGE" \
+    docker run --rm --network host --security-opt apparmor=unconfined -v "$LOGS/scans:/out:rw" "$TESTSSL_IMAGE" \
         --quiet --color 0 --warnings off --jsonfile /out/testssl.json 127.0.0.1:8443 > "$LOGS/scans/testssl.log" 2>&1
     [[ -s $LOGS/scans/testssl.json ]] || { no_report testssl "$LOGS/scans/testssl.log"; return; }
     python3 - "$LOGS/scans/testssl.json" <<'PY'
