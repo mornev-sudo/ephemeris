@@ -17,7 +17,7 @@ pub(crate) const HOST_A: Mac = [0x52, 0, 0, 0, 0, 0x0a];
 pub(crate) const HOST_B: Mac = [0x52, 0, 0, 0, 0, 0x0b];
 pub(crate) const OFF: usize = 128; // headroom, like a real UMEM frame
 /// The pre-shared key both routers' tethers use.
-const KEY: TetherKey = TetherKey([7; 32]);
+pub(crate) const KEY: TetherKey = TetherKey([7; 32]);
 
 pub(crate) fn ip(s: &str) -> Ipv4Addr {
     s.parse().unwrap()
@@ -27,7 +27,7 @@ pub(crate) fn mac(site: u8, port: u8) -> Mac {
 }
 
 /// Router for `site` (1 or 2).
-fn router(site: u8) -> Pipeline {
+pub(crate) fn router(site: u8) -> Pipeline {
     router_with_key(site, Some(KEY))
 }
 
@@ -137,7 +137,7 @@ pub(crate) fn router_full(
     r
 }
 
-fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
+pub(crate) fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
     let (a, l) = addr.split_once('/').unwrap();
     Port {
         id,
@@ -159,7 +159,7 @@ fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
     }
 }
 
-fn health(up: bool, rtt_ms: u64) -> TetherHealth {
+pub(crate) fn health(up: bool, rtt_ms: u64) -> TetherHealth {
     TetherHealth {
         up,
         rtt_ns: rtt_ms * 1_000_000,

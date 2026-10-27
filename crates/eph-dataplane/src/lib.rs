@@ -38,6 +38,8 @@ pub use stats::{DropReason, PortCounters, Stats};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_dynamic;
+#[cfg(test)]
 mod tests_filter;
 #[cfg(test)]
 mod tests_fuzz;

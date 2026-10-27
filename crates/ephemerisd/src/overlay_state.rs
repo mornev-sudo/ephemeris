@@ -5,12 +5,45 @@
 //!   packet is sealed with it, so a nonce is never used twice under a key.
 //! * `overlay-peers`: the newest run seen from each peer sender, so after a
 //!   restart packets captured from a peer's earlier runs are still refused.
+//! * `overlay-moved`: peers found at another address than the one
+//!   configured (a hub's PPPoE address changed), so a restart doesn't send
+//!   to the stale one again.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
 const RUN_FILE: &str = "overlay-run";
 const PEERS_FILE: &str = "overlay-peers";
+const MOVED_FILE: &str = "overlay-moved";
+
+/// A tether whose peer moved: (tether name, its configured address, where
+/// the peer is now, its port).
+pub type Moved = (String, std::net::Ipv4Addr, std::net::Ipv4Addr, u16);
+
+pub fn load_moved(dir: &Path) -> Vec<Moved> {
+    let Ok(text) = std::fs::read_to_string(dir.join(MOVED_FILE)) else {
+        return vec![];
+    };
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((
+                f.next()?.to_string(),
+                f.next()?.parse().ok()?,
+                f.next()?.parse().ok()?,
+                f.next()?.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+pub fn save_moved(dir: &Path, moved: &[Moved]) -> Result<()> {
+    let text: String = moved
+        .iter()
+        .map(|(n, conf, now, port)| format!("{n} {conf} {now} {port}\n"))
+        .collect();
+    crate::files::write_private_atomic(&dir.join(MOVED_FILE), text.as_bytes())
+}
 
 /// Claim this start's run number (1, 2, ...).
 pub fn claim_run(dir: &Path) -> Result<u16> {
@@ -83,6 +116,22 @@ mod tests {
             claim_run(&d).is_err(),
             "never guess: a reused run reuses nonces"
         );
+    }
+
+    #[test]
+    fn moved_peers_round_trip() {
+        let d = dir("moved");
+        assert!(load_moved(&d).is_empty());
+        let m = vec![(
+            "jhb-wan".to_string(),
+            "192.0.2.2".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+            4800,
+        )];
+        save_moved(&d, &m).unwrap();
+        assert_eq!(load_moved(&d), m);
+        std::fs::write(d.join(MOVED_FILE), "jhb-wan 192.0.2.2 nonsense 1\n").unwrap();
+        assert!(load_moved(&d).is_empty());
     }
 
     #[test]

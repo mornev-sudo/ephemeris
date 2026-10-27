@@ -160,6 +160,9 @@ pub struct Pipeline {
     handshake_last_refill: u64,
     /// Learned addresses of peers without a fixed one, shared by all workers.
     endpoints: Arc<Endpoints>,
+    /// Our outside addresses that changed recently, (old, new): announced
+    /// to every peer (see `overlay::TYPE_ADDRESSES`).
+    announce: Arc<[(Ipv4Addr, Ipv4Addr)]>,
     next_probe_ns: u64,
     probe_seq: u32,
     sessions: SessionTable,
@@ -223,6 +226,7 @@ impl Pipeline {
             handshake_tokens: HANDSHAKE_RATE_PER_SEC,
             handshake_last_refill: 0,
             endpoints,
+            announce: Arc::from([]),
             next_probe_ns: 0,
             probe_seq: 0,
             sessions: SessionTable::new(sessions),
@@ -368,6 +372,11 @@ impl Pipeline {
         self.keys = keys;
     }
 
+    /// Our outside addresses that changed recently, to announce.
+    pub fn set_announce(&mut self, announce: Arc<[(Ipv4Addr, Ipv4Addr)]>) {
+        self.announce = announce;
+    }
+
     /// Share one learned-endpoints table between all workers.
     pub fn set_endpoints(&mut self, endpoints: Arc<Endpoints>) {
         self.endpoints = endpoints;
@@ -380,6 +389,11 @@ impl Pipeline {
 
     pub fn set_paths(&mut self, paths: Arc<PathTable>) {
         self.paths = paths;
+    }
+
+    /// Where tethers send now (learned and announced addresses).
+    pub fn endpoints(&self) -> &Arc<Endpoints> {
+        &self.endpoints
     }
 
     pub fn overlay(&self) -> &Arc<Overlay> {
@@ -1373,19 +1387,22 @@ impl Pipeline {
     /// from a peer's overlay port: a peer that learned our address (we have
     /// no fixed one, e.g. behind NAT) replies to whichever port we sent
     /// from, and from its overlay port, so a NAT along the way lets it in.
-    fn is_overlay(&self, ingress: PortId, src: Ipv4Addr, udp: &[u8]) -> bool {
+    fn is_overlay(&self, ingress: PortId, udp: &[u8]) -> bool {
         let (sport, dport) = (
             u16::from_be_bytes([udp[0], udp[1]]),
             u16::from_be_bytes([udp[2], udp[3]]),
         );
         let port = self.overlay.udp_port;
-        dport == port
-            || (sport == port
-                && self
-                    .overlay
-                    .tethers
-                    .iter()
-                    .any(|t| t.port == ingress && t.remote == src))
+        // From a peer's overlay port: a reply to what we sent from another
+        // port. Not only from the address configured for it: a peer that
+        // moved is followed (authentication decides, see `overlay_rx`).
+        dport == port || (sport == port && self.overlay.tethers.iter().any(|t| t.port == ingress))
+    }
+
+    /// Where a tether's peer is now: the learned or announced address, else
+    /// the configured one.
+    fn peer_addr(&self, t: &overlay::Tether) -> Ipv4Addr {
+        self.endpoints.get(t.id).map_or(t.remote, |(ip, _)| ip)
     }
 
     /// Packets addressed to the router: ping, and overlay tether traffic.
@@ -1403,7 +1420,7 @@ impl Pipeline {
         if h.proto == ipv4::PROTO_UDP
             && self.overlay.enabled()
             && len >= ETH + h.hdr_len + l4::UDP_HDR_LEN
-            && self.is_overlay(ingress, h.src, &frame[l4..l4 + 4])
+            && self.is_overlay(ingress, &frame[l4..l4 + 4])
         {
             // A tether packet inside a tether packet is never legitimate.
             if via.is_some() {
@@ -1825,7 +1842,10 @@ impl Pipeline {
         let (remote, dport) = if t.remote.is_unspecified() {
             self.endpoints.get(tether)?
         } else {
-            (t.remote, self.overlay.udp_port)
+            // Configured: unless the peer has moved since (see `Endpoints`).
+            self.endpoints
+                .get(tether)
+                .unwrap_or((t.remote, self.overlay.udp_port))
         };
         Some((
             t.port,
@@ -1951,24 +1971,52 @@ impl Pipeline {
         if h.hdr_len != ipv4::MIN_HDR_LEN || len < OUTER_LEN + TAG_LEN {
             return Verdict::Drop(DropReason::BadOverlay);
         }
-        // Which tether: the one to this sender's address, or else the one
-        // to a peer without a fixed address whose site id the header claims
-        // (the claim is checked when the packet is authenticated below).
-        let claimed = u16::from_be_bytes([
-            frame[off + OUTER_LEN - overlay::HDR_LEN + 2],
-            frame[off + OUTER_LEN - overlay::HDR_LEN + 3],
-        ]);
+        // Which tether: the one to this sender's address, or else a slot
+        // for a peer without a fixed address whose site id the header claims:
+        // the one following the sender's tether, else a free one, else one
+        // gone quiet (see `Endpoints`). The claims are checked when the
+        // packet is authenticated below; only then is a slot bound.
+        let hdr_at = off + OUTER_LEN - overlay::HDR_LEN;
+        let claimed = u16::from_be_bytes([frame[hdr_at + 2], frame[hdr_at + 3]]);
+        let sender = u16::from_be_bytes([frame[hdr_at + 4], frame[hdr_at + 5]]);
+        let now_s = self.now_ns / 1_000_000_000;
         let tethers = &self.overlay.tethers;
+        let learned = |t: &overlay::Tether| {
+            t.port == ingress && t.remote.is_unspecified() && t.peer_site == claimed
+        };
         let Some(tether) = tethers
             .iter()
-            .position(|t| t.port == ingress && t.remote == h.src)
+            .position(|t| {
+                t.port == ingress && !t.remote.is_unspecified() && self.peer_addr(t) == h.src
+            })
             .or_else(|| {
+                // The peer's tether we followed before, wherever it is now
+                // (configured or learned: a hub's PPPoE address changes too).
                 tethers.iter().position(|t| {
-                    t.port == ingress && t.remote.is_unspecified() && t.peer_site == claimed
+                    t.port == ingress
+                        && t.peer_site == claimed
+                        && self.endpoints.sender(t.id) == Some(sender)
                 })
             })
+            .or_else(|| {
+                tethers
+                    .iter()
+                    .position(|t| learned(t) && self.endpoints.fits(t.id, sender, now_s, false))
+            })
+            .or_else(|| {
+                tethers
+                    .iter()
+                    .position(|t| learned(t) && self.endpoints.fits(t.id, sender, now_s, true))
+            })
         else {
-            return Verdict::Drop(DropReason::UnknownTether);
+            // A peer we learn sending from more links than it has slots
+            // (`links` in its [[site]]) lands here too.
+            let any = tethers.iter().any(learned);
+            return Verdict::Drop(if any {
+                DropReason::OverlayLinksFull
+            } else {
+                DropReason::UnknownTether
+            });
         };
         let dynamic = tethers[tether].remote.is_unspecified();
         let t = &self.overlay.tethers[tether];
@@ -2021,12 +2069,17 @@ impl Pipeline {
                 return Verdict::Drop(DropReason::OverlayReplay);
             }
         }
-        if dynamic {
-            // Authentic and fresh: the peer is (now) at this address/port.
-            let u = off + ETH + ipv4::MIN_HDR_LEN;
-            let sport = u16::from_be_bytes([frame[u], frame[u + 1]]);
-            self.endpoints.learn(tid, h.src, sport);
-        }
+        // Authentic and fresh: the peer's tether is (now) at this address
+        // and port. Followed for configured peers too; their own sender
+        // port varies by flow, so for them only the address counts.
+        let u = off + ETH + ipv4::MIN_HDR_LEN;
+        let sport = u16::from_be_bytes([frame[u], frame[u + 1]]);
+        let port = if dynamic {
+            sport
+        } else {
+            self.overlay.udp_port
+        };
+        self.endpoints.learn_from(tid, sender, h.src, port, now_s);
         let inner = body.len();
         match typ {
             overlay::TYPE_DATA => {
@@ -2063,6 +2116,30 @@ impl Pipeline {
                     off,
                     len: total,
                 }
+            }
+            overlay::TYPE_ADDRESSES => {
+                let p = &frame[off + OUTER_LEN..off + OUTER_LEN + inner];
+                let n = p.first().map_or(0, |&n| n as usize);
+                if n > overlay::ANNOUNCE_MAX || p.len() != 1 + 8 * n {
+                    return Verdict::Drop(DropReason::BadOverlay);
+                }
+                for pair in p[1..].chunks(8) {
+                    let old = Ipv4Addr::new(pair[0], pair[1], pair[2], pair[3]);
+                    let new = Ipv4Addr::new(pair[4], pair[5], pair[6], pair[7]);
+                    if new.is_unspecified() || new.is_broadcast() || new.is_multicast() {
+                        continue;
+                    }
+                    // Our tethers to that site still sending to the old one.
+                    for t in self.overlay.tethers.iter() {
+                        if t.peer_site == peer_site
+                            && !t.remote.is_unspecified()
+                            && self.peer_addr(t) == old
+                        {
+                            self.endpoints.retarget(t.id, new, self.overlay.udp_port);
+                        }
+                    }
+                }
+                Verdict::Drop(DropReason::OverlayControl)
             }
             overlay::TYPE_PROBE_REPLY if inner == overlay::PROBE_LEN => {
                 let p = off + OUTER_LEN;
@@ -2211,6 +2288,50 @@ impl Pipeline {
             e.len = total;
             self.push_emit(e);
             self.tether_stats[i].probes_sent += 1;
+            self.stats.originated += 1;
+            // Once a second, while one of our outside addresses changed
+            // recently: tell the peer (see `overlay::TYPE_ADDRESSES`).
+            if !self.announce.is_empty() && self.probe_seq.is_multiple_of(5) {
+                self.send_announcement(i as TetherId, port, remote, mac, dport);
+            }
+        }
+    }
+
+    fn send_announcement(
+        &mut self,
+        tether: TetherId,
+        port: PortId,
+        remote: Ipv4Addr,
+        mac: Mac,
+        dport: u16,
+    ) {
+        let mut e = Emit {
+            port,
+            len: 0,
+            frame: [0; EMIT_MAX],
+        };
+        let pairs = &self.announce[..self.announce.len().min(overlay::ANNOUNCE_MAX)];
+        let body = &mut e.frame[OUTER_LEN..];
+        body[0] = pairs.len() as u8;
+        for (k, (old, new)) in pairs.iter().enumerate() {
+            body[1 + k * 8..5 + k * 8].copy_from_slice(&old.octets());
+            body[5 + k * 8..9 + k * 8].copy_from_slice(&new.octets());
+        }
+        let len = 1 + 8 * pairs.len();
+        let udp = self.overlay.udp_port;
+        if let Some(total) = self.write_outer(
+            &mut e.frame,
+            port,
+            remote,
+            mac,
+            (udp, dport),
+            overlay::TYPE_ADDRESSES,
+            0,
+            tether,
+            len,
+        ) {
+            e.len = total;
+            self.push_emit(e);
             self.stats.originated += 1;
         }
     }

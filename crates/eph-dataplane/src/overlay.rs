@@ -66,6 +66,11 @@ pub const VERSION_HANDSHAKE: u8 = 3;
 /// Handshake messages, handled by the control plane.
 pub const TYPE_HANDSHAKE_INIT: u8 = 4;
 pub const TYPE_HANDSHAKE_RESPONSE: u8 = 5;
+/// "My outside address changed": a count, then (old, new) pairs of IPv4
+/// addresses. Sealed like data; whoever still sends to `old` moves to `new`.
+pub const TYPE_ADDRESSES: u8 = 6;
+/// Address changes announced at most (the newest).
+pub const ANNOUNCE_MAX: usize = 8;
 /// A session key is replaced after two minutes, and never used after three.
 pub const REKEY_AFTER_NS: u64 = 120_000_000_000;
 pub const REJECT_AFTER_NS: u64 = 180_000_000_000;
@@ -86,11 +91,34 @@ pub const MAX_SENDER_WORKERS: usize = 256;
 pub const PROBE_INTERVAL_NS: u64 = 200_000_000;
 pub const DOWN_AFTER_NS: u64 = 1_000_000_000;
 
-/// Where tethers to peers without a fixed address send: learned from the
+/// Where tethers send: for peers without a fixed address, learned from the
 /// peer's authenticated packets (its address and UDP port, so a peer behind
-/// NAT works too). One slot per tether, shared by all workers.
+/// NAT works too); for the rest, the configured address until the peer
+/// turns up somewhere else (its PPPoE address changed) or announces a new
+/// one. One slot per tether, shared by all workers.
+///
+/// A peer with several WAN links (fibre and LTE, each behind its own NAT)
+/// reaches the same WAN of ours from each, so we keep a tether per link of
+/// its (`links` in its `[[site]]`). Each slot is *bound* to one of the
+/// peer's tethers (the sender tether id in the header) by its first
+/// authenticated packet, and keeps following that link: its address, its
+/// NAT port, and their changes. A slot silent for [`STALE_SECS`] can be
+/// taken by another of the peer's links (its tethers were renumbered).
 pub struct Endpoints {
-    slots: Vec<std::sync::atomic::AtomicU64>,
+    slots: Vec<Slot>,
+}
+
+/// A slot not heard from for this long may be rebound.
+pub const STALE_SECS: u64 = 30;
+
+#[derive(Default)]
+struct Slot {
+    /// KNOWN | address << 16 | port.
+    addr: AtomicU64,
+    /// The peer's tether id this slot follows, + 1 (0: not bound yet).
+    sender: std::sync::atomic::AtomicU32,
+    /// When it was last heard from, seconds (the workers' clock).
+    heard_s: AtomicU64,
 }
 
 impl Endpoints {
@@ -98,9 +126,7 @@ impl Endpoints {
 
     pub fn new(tethers: usize) -> Self {
         Endpoints {
-            slots: (0..tethers)
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
+            slots: (0..tethers).map(|_| Slot::default()).collect(),
         }
     }
 
@@ -108,18 +134,95 @@ impl Endpoints {
         let v = self
             .slots
             .get(tether as usize)?
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .addr
+            .load(Ordering::Relaxed);
         (v & Self::KNOWN != 0).then(|| (Ipv4Addr::from((v >> 16) as u32), v as u16))
     }
 
-    /// Remember where the peer was last heard from. Only ever called after
-    /// the packet was authenticated.
+    /// The peer's tether this slot follows, if bound.
+    pub fn sender(&self, tether: TetherId) -> Option<u16> {
+        let v = self
+            .slots
+            .get(tether as usize)?
+            .sender
+            .load(Ordering::Relaxed);
+        v.checked_sub(1).map(|v| v as u16)
+    }
+
+    /// When the slot was last heard from (seconds), if ever.
+    pub fn heard_s(&self, tether: TetherId) -> Option<u64> {
+        let s = self.slots.get(tether as usize)?;
+        (s.sender.load(Ordering::Relaxed) != 0).then(|| s.heard_s.load(Ordering::Relaxed))
+    }
+
+    /// Could a packet from the peer's tether `sender` use this slot? Yes if
+    /// it follows that tether, is free, or (`stale_ok`) has gone quiet.
+    pub fn fits(&self, tether: TetherId, sender: u16, now_s: u64, stale_ok: bool) -> bool {
+        let Some(s) = self.slots.get(tether as usize) else {
+            return false;
+        };
+        match s.sender.load(Ordering::Relaxed) {
+            0 => true,
+            v if v == sender as u32 + 1 => true,
+            _ => stale_ok && now_s.saturating_sub(s.heard_s.load(Ordering::Relaxed)) >= STALE_SECS,
+        }
+    }
+
+    /// An authenticated packet from the peer's tether `sender` arrived at
+    /// `ip:port` on this slot: bind it (if it's free or stale) and follow
+    /// the peer there. Only ever called after the packet was authenticated.
+    /// False if another worker bound the slot to another link meanwhile.
+    pub fn learn_from(
+        &self,
+        tether: TetherId,
+        sender: u16,
+        ip: Ipv4Addr,
+        port: u16,
+        now_s: u64,
+    ) -> bool {
+        let Some(s) = self.slots.get(tether as usize) else {
+            return false;
+        };
+        let want = sender as u32 + 1;
+        let cur = s.sender.load(Ordering::Relaxed);
+        if cur != want
+            && (!self.fits(tether, sender, now_s, true)
+                || s.sender
+                    .compare_exchange(cur, want, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err())
+        {
+            return false;
+        }
+        if s.heard_s.load(Ordering::Relaxed) != now_s {
+            s.heard_s.store(now_s, Ordering::Relaxed);
+        }
+        let v = Self::KNOWN | (u32::from(ip) as u64) << 16 | port as u64;
+        if s.addr.load(Ordering::Relaxed) != v {
+            s.addr.store(v, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// The peer announced it moved: send to `ip:port` from now on, and let
+    /// the next authenticated packet bind the slot again.
+    pub fn retarget(&self, tether: TetherId, ip: Ipv4Addr, port: u16) {
+        if let Some(s) = self.slots.get(tether as usize) {
+            s.sender.store(0, Ordering::Relaxed);
+            s.addr.store(
+                Self::KNOWN | (u32::from(ip) as u64) << 16 | port as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Remember where the peer is (for tests, and addresses saved before a
+    /// restart; packets use [`Endpoints::learn_from`]).
     pub fn learn(&self, tether: TetherId, ip: Ipv4Addr, port: u16) {
         if let Some(s) = self.slots.get(tether as usize) {
-            let v = Self::KNOWN | (u32::from(ip) as u64) << 16 | port as u64;
-            if s.load(std::sync::atomic::Ordering::Relaxed) != v {
-                s.store(v, std::sync::atomic::Ordering::Relaxed);
-            }
+            s.addr.store(
+                Self::KNOWN | (u32::from(ip) as u64) << 16 | port as u64,
+                Ordering::Relaxed,
+            );
         }
     }
 }

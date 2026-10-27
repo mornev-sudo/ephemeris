@@ -85,6 +85,7 @@ router); per-person accounts and roles are future work.
 | **I** A key stolen later decrypting recorded traffic | Sites with a public key: fresh session keys every two minutes from ephemeral X25519 keys that are then forgotten (forward secrecy) |
 | **T** Replay | Per-sender counters within each session key; nonces never reused (new keys per session; run numbers for pre-shared keys). A replayed initiation gets an answer, but its keys are never used: the responder only switches to keys a packet has proven |
 | **D** Handshake floods (each costs key exchanges) | mac1 (keyed with the receiver's public key) drops junk before any key exchange; at most 20 handshake messages a second per worker reach the control plane, and at most 5 initiations a second per site are answered |
+| **T** Redirecting a tether to another address | A tether only follows its peer on packets that authenticate and aren't replays; handshake messages never move one; address announcements are sealed like data |
 | **E** A tether used to reach the router's SSH or portal | The host path refuses anything that came through a tether |
 
 **Residual:** sites still on a pre-shared key have no forward secrecy (a

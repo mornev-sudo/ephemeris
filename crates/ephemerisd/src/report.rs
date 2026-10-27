@@ -31,6 +31,9 @@ pub enum Control {
     Transmit { port: PortId, frame: Vec<u8> },
     /// New SD-WAN session keys.
     SetKeys(Arc<KeyTable>),
+    /// Our outside addresses that changed recently, (old, new): announced
+    /// to every SD-WAN peer.
+    SetAnnounce(Arc<[(std::net::Ipv4Addr, std::net::Ipv4Addr)]>),
     /// Send an SD-WAN handshake message on a tether (to `to`, or else to its
     /// peer).
     Handshake {

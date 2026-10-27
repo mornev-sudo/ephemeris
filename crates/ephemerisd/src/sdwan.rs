@@ -177,13 +177,6 @@ pub enum Action {
         to: Option<(Ipv4Addr, u16)>,
         payload: Vec<u8>,
     },
-    /// An authenticated message came from here: the peer (without a fixed
-    /// address) is there now.
-    Learn {
-        tether: TetherId,
-        ip: Ipv4Addr,
-        port: u16,
-    },
 }
 
 /// A log line: (debug?, text). Routine rekeys are debug; the rest info.
@@ -464,7 +457,11 @@ impl Handshakes {
         let Some(t) = self.overlay.tethers.get(msg.tether as usize) else {
             return out;
         };
-        let (idx, dynamic) = (t.site_idx, t.remote.is_unspecified());
+        // A peer's address is never learned from a handshake message: a
+        // captured initiation, replayed from elsewhere, still verifies. The
+        // data plane follows the peer on its first sealed packet instead;
+        // only the answer goes back to where the initiation came from.
+        let idx = t.site_idx;
         let m = &msg.payload;
         if m.len() < HDR_LEN + MAC_LEN {
             return out;
@@ -480,11 +477,6 @@ impl Handshakes {
             return out;
         };
         let name = p.name.clone();
-        let learn = dynamic.then_some(Action::Learn {
-            tether: msg.tether,
-            ip: msg.src,
-            port: msg.sport,
-        });
         match typ {
             TYPE_HANDSHAKE_INIT => {
                 let sec = now / 1_000_000_000;
@@ -542,7 +534,6 @@ impl Handshakes {
                 let public = p.public;
                 p.install(s, now);
                 let payload = self.message(TYPE_HANDSHAKE_RESPONSE, msg.tether, &buf[..n], &public);
-                out.actions.extend(learn);
                 out.actions.push(Action::Send {
                     tether: msg.tether,
                     to: Some((msg.src, msg.sport)),
@@ -579,7 +570,6 @@ impl Handshakes {
                 );
                 p.install(s, now);
                 p.next_try_ns = 0;
-                out.actions.extend(learn);
                 self.completed(idx, now, true, &mut out);
             }
             _ => {}
@@ -687,13 +677,12 @@ mod tests {
     fn sends(o: &Output) -> Vec<Sent> {
         o.actions
             .iter()
-            .filter_map(|a| match a {
+            .map(|a| match a {
                 Action::Send {
                     tether,
                     to,
                     payload,
-                } => Some((*tether, *to, payload.clone())),
-                _ => None,
+                } => (*tether, *to, payload.clone()),
             })
             .collect()
     }
@@ -933,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_without_a_fixed_address_is_learned_from_its_initiation() {
+    fn the_answer_goes_where_the_initiation_came_from() {
         let (ia, ib) = (Identity::generate().unwrap(), Identity::generate().unwrap());
         let mut a = Handshakes::new(ia.clone(), overlay(1, &ib, None, false), &[]);
         let mut hub = Handshakes::new(ib, overlay(2, &ia, None, true), &[]);
@@ -945,11 +934,9 @@ mod tests {
             payload: init[0].2.clone(),
         };
         let out = hub.receive(&msg, S);
-        assert!(out.actions.contains(&Action::Learn {
-            tether: 0,
-            ip: "203.0.113.7".parse().unwrap(),
-            port: 61000
-        }));
+        // Only the answer: where the peer is gets learned from its sealed
+        // packets (a replayed initiation must not move it).
+        assert_eq!(out.actions.len(), 1);
         assert_eq!(
             sends(&out)[0].1,
             Some(("203.0.113.7".parse().unwrap(), 61000))
