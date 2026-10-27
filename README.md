@@ -194,6 +194,12 @@ Plain-language explanations of everything in here, in reading order:
   - [ ] 4b (second half): WireGuard-style handshake (forward secrecy, key rotation)
   - [ ] 4c: central controller; FRR/BGP for LAN-side routes
 
+## Security
+
+How to report a vulnerability, and how to verify a release (signatures,
+build provenance, SBOM): [SECURITY.md](SECURITY.md). What the router
+protects and how: [docs/threat-model.md](docs/threat-model.md).
+
 ## License
 
 Licensed under either of

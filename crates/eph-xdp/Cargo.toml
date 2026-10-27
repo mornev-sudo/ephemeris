@@ -4,6 +4,7 @@ description = "Minimal AF_XDP sockets and XDP redirect program, straight on top 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

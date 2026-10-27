@@ -8,6 +8,8 @@ members = ["crates/*"]
 version = "0.10.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+# Built into the router image, never published to crates.io.
+publish = false
 rust-version = "1.88"
 
 [workspace.dependencies]

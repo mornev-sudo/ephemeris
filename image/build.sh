@@ -66,7 +66,16 @@ for f in "$base".root-*.raw; do
 done
 
 echo "$VERSION" > VERSION
-sha256sum "$base.qcow2" "$base".root-*.raw.xz "$base.efi" > SHA256SUMS
+# The SBOM: mkosi's package manifest (Debian packages) and, if CI made one,
+# the Rust dependencies (image/rust.cdx.json, CycloneDX). Listed in
+# SHA256SUMS, so they're signed with the image.
+sbom=()
+[[ -f $base.manifest ]] && sbom+=("$base.manifest")
+if [[ -f $IMAGE/rust.cdx.json ]]; then
+    cp "$IMAGE/rust.cdx.json" "$base.rust.cdx.json"
+    sbom+=("$base.rust.cdx.json")
+fi
+sha256sum "$base.qcow2" "$base".root-*.raw.xz "$base.efi" "${sbom[@]}" > SHA256SUMS
 # Sign the manifest: routers only install updates whose SHA256SUMS.gpg
 # verifies against the release key baked into the image.
 if [[ ${SIGN_RELEASE:-0} == 1 ]]; then

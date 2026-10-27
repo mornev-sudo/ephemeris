@@ -129,6 +129,13 @@ impl ConfigManager {
     /// file: every interface's card exists, and isn't the management NIC.
     fn check_devices(&self, cfg: &Config) -> Result<()> {
         let Some(list) = self.nics else { return Ok(()) };
+        if !cfg.ssh.password_login && !super::ssh::key_installed() {
+            bail!(
+                "ssh.password_login = false needs an SSH key for root first \
+                 (/var/lib/ephemeris/ssh/authorized_keys.root): without one, \
+                 SSH would let nobody in"
+            );
+        }
         let nics = list();
         for i in &cfg.interfaces {
             match nics.iter().find(|n| n.name == i.device) {

@@ -193,6 +193,39 @@ check "session cookie is Secure"           grep -q '^#HttpOnly_127.0.0.1.*TRUE' 
 check "config file is private"             sh -c "[ \"\$(${SSH[*]} stat -c %a /var/lib/ephemeris/ephemeris.toml)\" = 600 ]"
 check "portal works in a real browser"     env ROUTER_URL=$WEB/ ADMIN_PASSWORD="$PASSWORD" SHOTS="$LOGS" node "$HERE/portal-test.mjs"
 
+# Automated security testing of the portal (OWASP WSTG): a passive ZAP
+# baseline scan, and a TLS scan. Each fails on anything rated high; the
+# full reports are kept with the test logs.
+mkdir -p "$LOGS/scans" && chmod 777 "$LOGS/scans"
+zap_scan() { # passive scan of the portal; fails on any High risk alert
+    docker run --rm --network host -v "$LOGS/scans:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable \
+        zap-baseline.py -t "$WEB/" -I -J zap.json -r zap.html >/dev/null 2>&1
+    python3 - "$LOGS/scans/zap.json" <<'PY'
+import json, sys
+alerts = [a for s in json.load(open(sys.argv[1])).get("site", []) for a in s.get("alerts", [])]
+high = [a["name"] for a in alerts if int(a.get("riskcode", 0)) >= 3]
+print(f"{len(alerts)} alert type(s); high risk: {high or 'none'}")
+sys.exit(1 if high else 0)
+PY
+}
+tls_scan() { # testssl.sh against the portal; fails on HIGH or CRITICAL
+    docker run --rm --network host -v "$LOGS/scans:/out" drwetter/testssl.sh:3.2 \
+        --quiet --color 0 --warnings off --jsonfile /out/testssl.json 127.0.0.1:8443 >/dev/null 2>&1
+    python3 - "$LOGS/scans/testssl.json" <<'PY'
+import json, sys
+# The certificate is self-signed on purpose (made on the router at first
+# boot; its fingerprint is on the console): trust findings are expected.
+# Everything else counts: protocols, ciphers, known TLS vulnerabilities.
+expected = ("cert_chain_of_trust", "cert_trust", "cert_caIssuers")
+bad = [f"{f['id']}: {f['finding']}" for f in json.load(open(sys.argv[1]))
+       if f.get("severity") in ("HIGH", "CRITICAL") and not f["id"].startswith(expected)]
+print("\n".join(bad) or "no high or critical findings")
+sys.exit(1 if bad else 0)
+PY
+}
+check "ZAP baseline: nothing high risk"     zap_scan
+check "TLS scan: nothing high or critical"  tls_scan
+
 # ------------------------------------------------------------ forwarding
 echo "DHCP:"
 check "lan-b gets its address by DHCP"     wait_for 90 "a lease on lan-b" on_router "ephctl dhcp | grep 'lan-b' | grep 'bound' | grep -q '10.10.2.1/24'"
@@ -258,6 +291,15 @@ on_router "cat > /run/access-wan.toml" < "$WORK/access-wan.toml"
 check "outside access is refused"           sh -c "${SSH[*]} ephctl config load /run/access-wan.toml 2>&1 | grep -q 'only be reached on inside interfaces'"
 check "turn it off again"                   on_router "ephctl config rollback 1"
 check "portal from lan-a closed again"      wait_for 15 "lan-a closed" sh -c "! ip netns exec ci-ha curl -sk -o /dev/null --max-time 3 https://10.10.1.1:8443/"
+
+# ------------------------------------------------------------ SSH keys only
+echo "SSH keys only:"
+{ cat "$WORK/ephemeris.toml"; printf '\n[ssh]\npassword_login = false\n'; } > "$WORK/sshkeys.toml"
+on_router "cat > /run/sshkeys.toml" < "$WORK/sshkeys.toml"
+check "turn SSH passwords off"              on_router "ephctl config load /run/sshkeys.toml && ephctl config commit"
+check "SSH password refused"                wait_for 15 "sshd to reload" sh -c "! sshpass -p '$PASSWORD' ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o ConnectTimeout=5 root@127.0.0.1 true"
+check "SSH key still works"                 on_router true
+check "passwords back after rollback"       sh -c "${SSH[*]} ephctl config rollback 1 && sleep 2 && sshpass -p '$PASSWORD' ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o ConnectTimeout=5 root@127.0.0.1 true"
 
 # ------------------------------------------------------------ logging
 # Categories, levels changed at run time, the files under /var/log/ephemeris

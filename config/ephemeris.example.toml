@@ -48,6 +48,12 @@ udp_timeout_secs = 30          # one-way UDP
 udp_stream_timeout_secs = 180  # UDP that has seen replies
 icmp_timeout_secs = 30
 
+[ssh]
+# true: log in over SSH with an SSH key or the admin password. false: keys
+# only (refused until a key is installed; the console always takes the
+# password). Recommended once SSH is offered on an interface (management).
+password_login = true
+
 [logging]
 # Each category logs at its own level: error, warn, info, debug, trace
 # (`ephctl log levels` lists them). Set here, a level stays; raised with

@@ -24,6 +24,11 @@ ReadWritePaths=/var/lib/ephemeris
 # makes it writable inside the sandbox.
 LogsDirectory=ephemeris
 LogsDirectoryMode=0700
+# /run/ephemeris-ssh: the SSH policy from the config ([ssh]), which sshd
+# includes. Kept across restarts so sshd always has it.
+RuntimeDirectory=ephemeris-ssh
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 ProtectHome=yes
 PrivateTmp=yes
 # Everything ephemerisd creates is private (configs can hold tether keys).

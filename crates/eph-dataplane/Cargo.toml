@@ -4,6 +4,7 @@ description = "Ephemeris forwarding pipeline: pure packet logic, no I/O"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 eph-packet.workspace = true

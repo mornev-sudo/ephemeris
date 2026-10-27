@@ -125,6 +125,9 @@ impl Auth {
         if password.chars().count() < MIN_PASSWORD_LEN {
             bail!("the password must be at least {MIN_PASSWORD_LEN} characters");
         }
+        if let Some(why) = weak_password(password) {
+            bail!("that password is too easy to guess: {why}");
+        }
         if password.len() > MAX_PASSWORD_LEN {
             bail!("the password must be at most {MAX_PASSWORD_LEN} bytes");
         }
@@ -182,6 +185,102 @@ impl Auth {
     pub fn end_all_sessions(&self) {
         self.sessions.lock().unwrap().clear();
     }
+}
+
+/// Words that make up a large share of guessed passwords, and the obvious
+/// ones for this device. A password that is one of these (or one repeated)
+/// with digits and symbols around it is refused.
+const COMMON_WORDS: &[&str] = &[
+    "password",
+    "passw0rd",
+    "p@ssword",
+    "p@ssw0rd",
+    "admin",
+    "administrator",
+    "root",
+    "router",
+    "ephemeris",
+    "letmein",
+    "welcome",
+    "changeme",
+    "default",
+    "secret",
+    "master",
+    "qwerty",
+    "iloveyou",
+    "dragon",
+    "monkey",
+    "football",
+    "baseball",
+    "sunshine",
+    "princess",
+    "superman",
+    "batman",
+    "trustno1",
+    "login",
+    "access",
+    "shadow",
+    "michael",
+    "jennifer",
+    "charlie",
+    "computer",
+    "internet",
+    "network",
+    "firewall",
+    "abc",
+    "test",
+    "guest",
+    "user",
+];
+
+/// Rows and diagonals people walk along on a keyboard.
+const KEYBOARD_WALKS: &[&str] = &[
+    "qwertyuiop",
+    "asdfghjkl",
+    "zxcvbnm",
+    "1234567890",
+    "1qaz2wsx3edc4rfv5tgb",
+    "qazwsxedcrfvtgb",
+    "zaq12wsxcde34rfv",
+    "1q2w3e4r5t6y7u8i9o0p",
+];
+
+/// Why `pw` is too easy to guess, if it is (ASVS V6.2.4: refuse common
+/// passwords). Not a full breach-list check: rules that catch the patterns
+/// those lists are full of, on top of the length minimum.
+pub fn weak_password(pw: &str) -> Option<&'static str> {
+    let lower = pw.to_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    if chars.windows(2).all(|w| w[0] == w[1]) {
+        return Some("one character repeated");
+    }
+    let steps: Vec<i64> = chars
+        .windows(2)
+        .map(|w| w[1] as i64 - w[0] as i64)
+        .collect();
+    if steps.iter().all(|&d| d == 1) || steps.iter().all(|&d| d == -1) {
+        return Some("a run of characters like 1234567890 or abcdefghij");
+    }
+    let compact: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
+    for walk in KEYBOARD_WALKS {
+        let rev: String = walk.chars().rev().collect();
+        if compact.len() >= 6 && (walk.contains(&compact) || rev.contains(&compact)) {
+            return Some("a walk along the keyboard");
+        }
+    }
+    // The letters left once leading and trailing digits and symbols go.
+    let core = lower.trim_matches(|c: char| !c.is_alphabetic());
+    let core_compact: String = core
+        .chars()
+        .filter(|c| c.is_alphanumeric() || "@$".contains(*c))
+        .collect();
+    for w in COMMON_WORDS {
+        let n = core_compact.len() / w.len().max(1);
+        if !core_compact.is_empty() && n >= 1 && core_compact == w.repeat(n) {
+            return Some("a common word with digits or symbols added");
+        }
+    }
+    None
 }
 
 /// Hash a password the way the admin password is stored (yescrypt); used
@@ -527,6 +626,40 @@ mod crypt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn easy_passwords_are_refused() {
+        for weak in [
+            "aaaaaaaaaaaa",
+            "1234567890",
+            "0987654321",
+            "abcdefghijk",
+            "qwertyuiop",
+            "asdfghjkl;'",
+            "1qaz2wsx3edc",
+            "Password123!",
+            "P@ssw0rd2026",
+            "admin2026!!",
+            "ephemeris1234",
+            "adminadmin12",
+            "!!Welcome2026",
+            "iloveyou1234",
+        ] {
+            assert!(weak_password(weak).is_some(), "{weak} should be refused");
+        }
+        for fine in [
+            "correct horse battery staple",
+            "Tq9-xR4m-Lp2v-Wk7d",
+            "my router lives in the attic",
+            "passwordless-login-is-nice", // contains a common word, but isn't just it
+            "qwertyuiop is not my password",
+        ] {
+            assert_eq!(weak_password(fine), None, "{fine} should be accepted");
+        }
+        let a = Auth::new(std::env::temp_dir());
+        let e = a.set_password("Password123!").unwrap_err().to_string();
+        assert!(e.contains("too easy to guess"), "{e}");
+    }
 
     #[test]
     fn shadow_edit_keeps_other_entries() {

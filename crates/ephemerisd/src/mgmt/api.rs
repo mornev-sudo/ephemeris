@@ -232,6 +232,24 @@ async fn front(State(s): St, mut req: Request, next: Next) -> Response {
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // No other site's window may keep a handle on the portal, and no other
+    // site may load its responses (ASVS V3.4). The portal uses no camera,
+    // microphone, location or similar, so none of it is allowed.
+    h.insert(
+        "cross-origin-opener-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    h.insert(
+        "cross-origin-resource-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    h.insert(
+        "permissions-policy",
+        HeaderValue::from_static(
+            "camera=(), microphone=(), geolocation=(), usb=(), serial=(), payment=(), \
+             display-capture=(), clipboard-read=()",
+        ),
+    );
     if client.https {
         h.insert(
             header::STRICT_TRANSPORT_SECURITY,
@@ -1959,6 +1977,12 @@ address = "10.10.2.1/24"
         assert!(!csp.contains("script-src 'unsafe-inline'"));
         assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
         assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(h["cross-origin-opener-policy"], "same-origin");
+        assert_eq!(h["cross-origin-resource-policy"], "same-origin");
+        assert!(h["permissions-policy"]
+            .to_str()
+            .unwrap()
+            .contains("camera=()"));
         assert_eq!(h[header::CACHE_CONTROL], "no-store");
         assert!(
             h.get(header::STRICT_TRANSPORT_SECURITY).is_none(),

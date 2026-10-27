@@ -44,6 +44,23 @@ enforced twice:
    Replies go out only from those two services, and only towards an inside
    interface.
 
+## Keys only for SSH
+
+The admin password works for SSH by default, because a router deployed
+without an SSH key must still be reachable. Once SSH is offered on a LAN,
+keys only is the better choice:
+
+```toml
+[ssh]
+password_login = false
+```
+
+ephemerisd writes the setting where sshd picks it up
+(`/run/ephemeris-ssh/`, included first by the image's sshd config) and
+reloads sshd, without a restart. A commit that turns passwords off is
+refused while no key is installed for root, because SSH would then let
+nobody in. The console always takes the password.
+
 ## How it works
 
 The usual way for a software router to reach its own services is a **tap**
