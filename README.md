@@ -152,6 +152,13 @@ Plain-language explanations of everything in here, in reading order:
 18. [Logging: what the router says, and how to make it say more](docs/learn/18-logging.md)
 19. [Reaching the router itself: the host path](docs/learn/19-router-access.md)
 
+To see the whole data path at once: [docs/packet-walk.html](docs/packet-walk.html),
+an interactive packet walk. It shows every stage in code order, the function
+that runs it and where a packet can be dropped, with scenarios to step
+through (NAT and PPPoE out, the reply, SSH to the router, SD-WAN, an ARP
+miss…). GitHub shows it as source: download it, or open it from a clone, in
+a browser.
+
 ## Roadmap
 
 - [x] **Phase 0: packet path.** AF_XDP I/O, ARP, static routes with LPM, ICMP, per-core workers, Proxmox lab

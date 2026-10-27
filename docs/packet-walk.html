@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- The Ephemeris data path, step by step. Open this file in a browser.
+     Kept in step with crates/eph-dataplane/src/pipeline.rs: a change to the
+     order of checks or the drop reasons there belongs here too. -->
+<title>Ephemeris Packet Walk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a vertical pipeline (the real order of the code) on the left, the
+   current step on the right; packet headers drawn as stacked layers. */
+:root {
+  --bg: #edf1f3; --panel: #ffffff; --ink: #14202a; --muted: #586874; --line: #d2dbe1;
+  --wire: #0c7880; --wire-soft: #d6eced;
+  --drop: #b3262d; --drop-soft: #f8e1e1;
+  --punt: #946000; --punt-soft: #f5e9cf;
+  --host: #4a4fb5; --host-soft: #e2e3f6;
+  --tag: #6b4aa6; --tag-soft: #ebe3f6;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e151b; --panel: #15202a; --ink: #e2eaef; --muted: #8fa0ad; --line: #26343f;
+  --wire: #3fbfc7; --wire-soft: #12333a; --drop: #f07a80; --drop-soft: #3a1e22;
+  --punt: #e2a940; --punt-soft: #352a14; --host: #a0a4f6; --host-soft: #25274b;
+  --tag: #c3a6f2; --tag-soft: #2d2442; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0e151b; --panel: #15202a; --ink: #e2eaef; --muted: #8fa0ad; --line: #26343f;
+  --wire: #3fbfc7; --wire-soft: #12333a; --drop: #f07a80; --drop-soft: #3a1e22;
+  --punt: #e2a940; --punt-soft: #352a14; --host: #a0a4f6; --host-soft: #25274b;
+  --tag: #c3a6f2; --tag-soft: #2d2442; color-scheme: dark; }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--body); }
+.wrap { max-width: 1240px; margin: 0 auto; padding-block: 28px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+h1 { font: 700 clamp(28px, 4vw, 40px)/1.05 var(--display); letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+h2 { font: 600 13px/1.2 var(--display); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 10px; }
+.lede { max-width: 68ch; color: var(--muted); margin: 10px 0 0; }
+code, .mono { font-family: var(--mono); font-size: 0.86em; }
+
+header { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr) auto; align-items: end; margin-bottom: 22px; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+@media (max-width: 760px) { header { grid-template-columns: 1fr; } }
+
+.scen { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+.scen button { font: 500 14px/1.2 var(--body); color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 999px; padding: 8px 14px; cursor: pointer; }
+.scen button[aria-pressed="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.scen button:focus-visible, .ctrl button:focus-visible, .stage:focus-visible { outline: 2px solid var(--wire); outline-offset: 2px; }
+
+.grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 22px; align-items: start; }
+@media (max-width: 920px) { .grid { grid-template-columns: 1fr; } .panel { order: -1; } }
+
+/* The pipeline */
+.pipe { position: relative; display: grid; gap: 10px; }
+.pipe::before { content: ""; position: absolute; left: 21px; top: 14px; bottom: 14px; width: 2px; background: var(--line); }
+.stage { position: relative; display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 0 10px; cursor: pointer; }
+.dot { position: relative; z-index: 1; width: 44px; height: 44px; border-radius: 50%; background: var(--panel);
+  border: 2px solid var(--line); display: grid; place-items: center; font: 600 13px var(--mono); color: var(--muted); }
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px 12px; min-width: 0; }
+.box h3 { font: 600 17px/1.25 var(--display); margin: 0; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.box h3 .fn { font: 400 12.5px var(--mono); color: var(--muted); }
+.box p { margin: 4px 0 8px; font-size: 13.5px; color: var(--muted); }
+.exits { display: flex; flex-wrap: wrap; gap: 6px; }
+.exit { font: 500 12px/1.3 var(--mono); padding: 3px 8px; border-radius: 5px; border: 1px solid transparent; }
+.exit.drop { color: var(--drop); background: var(--drop-soft); }
+.exit.punt { color: var(--punt); background: var(--punt-soft); }
+.exit.local { color: var(--host); background: var(--host-soft); }
+.exit.next { color: var(--wire); background: var(--wire-soft); }
+.stage.zone::after { content: attr(data-zone); position: absolute; right: 10px; top: 10px; font: 600 10.5px var(--display);
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.stage.on .dot { border-color: var(--wire); color: var(--wire); }
+.stage.on .box { border-color: var(--wire); }
+.stage.now .dot { background: var(--wire); color: var(--panel); border-color: var(--wire); box-shadow: 0 0 0 5px var(--wire-soft); }
+.stage.now .box { box-shadow: 0 0 0 2px var(--wire); }
+.stage.off { opacity: 0.45; }
+.stage.off:hover { opacity: 0.8; }
+.exit.hit { border-color: currentColor; box-shadow: 0 0 0 2px currentColor inset; font-weight: 600; }
+.stage.end-drop.now .dot { background: var(--drop); border-color: var(--drop); box-shadow: 0 0 0 5px var(--drop-soft); }
+.stage.end-drop.now .box { box-shadow: 0 0 0 2px var(--drop); border-color: var(--drop); }
+.stage.end-host.now .dot { background: var(--host); border-color: var(--host); box-shadow: 0 0 0 5px var(--host-soft); }
+.stage.end-host.now .box { box-shadow: 0 0 0 2px var(--host); border-color: var(--host); }
+.stage.end-punt.now .dot { background: var(--punt); border-color: var(--punt); box-shadow: 0 0 0 5px var(--punt-soft); }
+.stage.end-punt.now .box { box-shadow: 0 0 0 2px var(--punt); border-color: var(--punt); }
+.sub { margin-left: 54px; }
+.sub .dot { width: 30px; height: 30px; font-size: 11px; margin-left: 7px; }
+.stage.sub { grid-template-columns: 44px minmax(0, 1fr); }
+
+/* The step panel */
+.panel { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 16px); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; padding: 18px; display: grid; gap: 14px; min-width: 0; }
+@media (max-width: 920px) { .panel { position: static; } }
+.scenario-blurb { margin: 0; color: var(--muted); font-size: 14px; }
+.stepline { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.stepline .count { font: 500 13px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.stepline h3 { font: 700 22px/1.15 var(--display); margin: 0; }
+.where { font: 400 13px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.does { margin: 0; }
+.decision { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; align-items: start; padding: 10px 12px;
+  border-radius: 8px; background: var(--wire-soft); color: var(--ink); font-size: 14px; }
+.decision b { font: 600 12px var(--display); letter-spacing: 0.06em; text-transform: uppercase; color: var(--wire); padding-top: 2px; }
+.decision.drop { background: var(--drop-soft); } .decision.drop b { color: var(--drop); }
+.decision.local { background: var(--host-soft); } .decision.local b { color: var(--host); }
+.decision.punt { background: var(--punt-soft); } .decision.punt b { color: var(--punt); }
+
+.frame { display: grid; gap: 4px; }
+.frame-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+.layers { display: flex; flex-wrap: wrap; gap: 4px; }
+.layer { font: 500 12px/1.35 var(--mono); padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); min-width: 0; overflow-wrap: anywhere; }
+.layer small { display: block; font: 600 10px var(--display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.layer.vlan { background: var(--tag-soft); border-color: transparent; }
+.layer.vlan small { color: var(--tag); }
+.layer.ppp { background: var(--punt-soft); border-color: transparent; }
+.layer.ppp small { color: var(--punt); }
+.layer.outer { background: var(--host-soft); border-color: transparent; }
+.layer.outer small { color: var(--host); }
+.layer.changed { border-color: var(--wire); box-shadow: 0 0 0 1px var(--wire) inset; }
+.layer.gone { opacity: 0.5; text-decoration: line-through; }
+
+.ctrl { display: flex; gap: 8px; align-items: center; }
+.ctrl button { font: 600 14px var(--body); padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+.ctrl button.primary { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.ctrl button:disabled { opacity: 0.4; cursor: default; }
+.ctrl .hint { margin-left: auto; font-size: 12px; color: var(--muted); }
+.trail { display: flex; flex-wrap: wrap; gap: 4px; }
+.trail button { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--muted);
+  font: 500 11px var(--mono); cursor: pointer; padding: 0; }
+.trail button.done { background: var(--wire-soft); color: var(--wire); border-color: transparent; }
+.trail button.cur { background: var(--wire); color: var(--panel); border-color: var(--wire); }
+
+section.ref { margin-top: 40px; }
+.reftable { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 600 11.5px var(--display); letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td.mono { white-space: nowrap; }
+.note { color: var(--muted); font-size: 13px; max-width: 75ch; }
+@media (prefers-reduced-motion: no-preference) {
+  .dot, .box, .layer, .exit { transition: background-color .2s, border-color .2s, box-shadow .2s, opacity .2s; }
+}
+</style>
+<style>body { margin: 0; } [hidden] { display: none !important; }</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Ephemeris Packet Walk</h1>
+      <p class="lede">How a frame moves through the router's data plane, in the order the code runs it. Pick a scenario,
+        then step through: each step names the function, what it decides, and what the packet looks like at that point.</p>
+    </div>
+    <div class="legend" aria-label="Legend">
+      <span><i style="background:var(--wire)"></i>forwarding path</span>
+      <span><i style="background:var(--drop)"></i>dropped (counter name)</span>
+      <span><i style="background:var(--punt)"></i>handed to the control plane</span>
+      <span><i style="background:var(--host)"></i>for the router itself</span>
+    </div>
+  </header>
+
+  <div class="scen" id="scen" role="group" aria-label="Scenarios"></div>
+
+  <div class="grid">
+    <div class="pipe" id="pipe" aria-label="The data path, stage by stage"></div>
+
+    <aside class="panel" aria-live="polite">
+      <p class="scenario-blurb" id="blurb"></p>
+      <div class="stepline"><h3 id="stepTitle"></h3><span class="count" id="count"></span></div>
+      <div class="where" id="where"></div>
+      <p class="does" id="does"></p>
+      <div class="decision" id="decision"><b>Decides</b><span id="decisionText"></span></div>
+      <div class="frame">
+        <div class="frame-label"><span>The frame at this point (outermost first)</span><span id="bytes"></span></div>
+        <div class="layers" id="layers"></div>
+      </div>
+      <div class="trail" id="trail" aria-label="Steps"></div>
+      <div class="ctrl">
+        <button id="prev" type="button">Back</button>
+        <button id="next" type="button" class="primary">Next step</button>
+        <span class="hint">← → keys</span>
+      </div>
+    </aside>
+  </div>
+
+  <section class="ref">
+    <h2>Where a packet can leave the pipeline</h2>
+    <div class="reftable">
+      <table>
+        <thead><tr><th>Stage</th><th>Counter</th><th>Why</th></tr></thead>
+        <tbody id="drops"></tbody>
+      </table>
+    </div>
+    <p class="note">Counters are the names <code>ephctl status</code> shows under drops. "Handed over" entries aren't losses: the
+      packet went to the control plane (DHCP, PPPoE) or to the router's own SSH and portal. With a packet category at debug
+      (<code>ephctl log set route debug</code>), every drop is also logged with its reason and addresses.</p>
+  </section>
+</div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- the stages, in code order
+// zone: which part of the system runs it. exits: where a packet can leave here.
+const STAGES = [
+  { id: "rx", n: "1", zone: "worker", title: "Receive from the card", fn: "worker.rs · Worker::run",
+    text: "The NIC wrote the frame into a UMEM buffer and the XDP program redirected it to this worker's AF_XDP socket for that RX queue. The worker pops up to 64 descriptors per card, then hands each frame to the pipeline with its offset (the space before it is headroom).",
+    exits: [["Pipeline::process(card, frame)", "next"]] },
+  { id: "ingress", n: "2", zone: "pipeline", title: "Which interface?", fn: "pipeline.rs · Pipeline::ingress",
+    text: "The card plus the 802.1Q tag (or its absence) picks the interface. A tag is taken off by moving the MAC addresses 4 bytes forward. Per-interface RX counters count here.",
+    exits: [["vlan", "drop"], ["malformed", "drop"], ["port found", "next"]] },
+  { id: "classify", n: "3", zone: "pipeline", title: "For us? What protocol?", fn: "pipeline.rs · Pipeline::classify",
+    text: "The destination MAC must be the interface's or broadcast. Then the EtherType decides: IPv4, ARP, PPPoE (on a PPPoE interface), or nothing the router handles.",
+    exits: [["not-for-us", "drop"], ["unsupported-ethertype", "drop"], ["IPv4", "next"], ["ARP", "next"], ["PPPoE", "next"]] },
+  { id: "arp", n: "3a", sub: true, zone: "pipeline", title: "ARP", fn: "pipeline.rs · Pipeline::arp, insert_neighbor",
+    text: "Learns or refreshes the sender if it's on this link and the request concerns us; a sender that disagrees with a known neighbour isn't believed (a fresh request checks it). Requests for our address, or a NAT pool address on an outside interface, are answered in place.",
+    exits: [["arp-consumed", "local"], ["reply sent", "next"]] },
+  { id: "pppoe", n: "3b", sub: true, zone: "pipeline", title: "PPPoE in", fn: "pipeline.rs · Pipeline::pppoe_rx",
+    text: "IPv4 inside our session, from our concentrator, is unwrapped: a plain Ethernet header is written 8 bytes further on, and the packet continues as IPv4. Discovery and PPP control go to the control plane.",
+    exits: [["pppoe-to-control", "punt"], ["not-for-us", "drop"], ["unwrapped IPv4", "next"]] },
+  { id: "ip", n: "4", zone: "pipeline", title: "IPv4 header and handovers", fn: "pipeline.rs · Pipeline::ipv4 · ipv4::parse, is_dhcp",
+    text: "Version, lengths and header checksum are checked and Ethernet padding is trimmed. DHCP to a port that serves or requests leases goes to the control plane before any other check (a client asking for an address has none yet).",
+    exits: [["bad-ip-header", "drop"], ["dhcp-to-control", "punt"], ["valid", "next"]] },
+  { id: "filter", n: "5", zone: "pipeline", title: "Packet filter and anti-spoofing", fn: "filter.rs · check · Pipeline::source_ok",
+    text: "Martian addresses, sources that are the router's own, IP options (source route, record route…), invalid fragments. Then RFC 3704: a source from a connected subnet must arrive on that subnet's interface; out of a tether, from that tether's site.",
+    exits: [["martian", "drop"], ["spoofed-source", "drop"], ["ip-option", "drop"], ["bad-fragment", "drop"], ["clean", "next"]] },
+  { id: "ours", n: "6", zone: "pipeline", title: "Addressed to the router?", fn: "pipeline.rs · Pipeline::ipv4 · is_nat_reply",
+    text: "To one of the router's addresses (or a NAT pool address)? A reply to a NATed session also arrives at the outside address: that one is forwarded, everything else for the router goes to local delivery. Fragments to the router are refused (it never reassembles).",
+    exits: [["fragment-to-router", "drop"], ["for the router", "local"], ["NAT reply", "next"], ["passing through", "next"]] },
+  { id: "local", n: "6a", sub: true, zone: "router", title: "Local delivery", fn: "pipeline.rs · Pipeline::local · overlay_rx · punt_to_host",
+    text: "In order: SD-WAN tether traffic (decrypted, replay-checked, then back into step 4 as the inner packet); SSH and the portal on an inside interface's own address (handed to the host); ICMP echo (answered in place). Anything else stops here.",
+    exits: [["overlay-auth", "drop"], ["overlay-replay", "drop"], ["to-host", "local"], ["echo reply", "next"], ["local-unhandled", "drop"]] },
+  { id: "ttl", n: "7", zone: "pipeline", title: "TTL and MTU", fn: "pipeline.rs · Pipeline::ipv4 · mtu_towards · icmp_error",
+    text: "TTL 1 or less: Time Exceeded goes back to the sender. Too big for the way out (a PPPoE 1492, a configured MTU) with Don't Fragment set: Fragmentation Needed. Checked before NAT, so the error reaches the real sender.",
+    exits: [["ttl-exceeded", "drop"], ["too-big", "drop"], ["fits", "next"]] },
+  { id: "session", n: "8", zone: "pipeline", title: "Sessions, policy and NAT", fn: "pipeline.rs · Pipeline::track · SessionTable",
+    text: "The 5-tuple finds the session. Known: the direction must arrive where it did before, TCP must fit the session's state, NAT is applied, and the next hop comes from the session's cache. New: only from an interface that may start sessions; the route is looked up, source NAT decided and a port reserved, then the session is created. ICMP errors about a known session are let through (translated).",
+    exits: [["no-session", "drop"], ["invalid-tcp-state", "drop"], ["session-mismatch", "drop"], ["nat-exhausted", "drop"], ["session-table-full", "drop"], ["no-route", "drop"], ["next hop", "next"]] },
+  { id: "fwd", n: "9", zone: "pipeline", title: "Last checks and edits", fn: "pipeline.rs · Pipeline::ipv4 · clamp_mss · decrement_ttl",
+    text: "No directed broadcasts (RFC 2644). Through a tether, the overlay MTU applies (Fragmentation Needed). TCP SYNs get their MSS clamped to the smallest link on the way. Then the TTL goes down by one, with an incremental checksum update.",
+    exits: [["martian", "drop"], ["too-big", "drop"], ["edited", "next"]] },
+  { id: "deliver", n: "10", zone: "pipeline", title: "Deliver to the next hop", fn: "pipeline.rs · Pipeline::deliver · neighbor · resolve · encap",
+    text: "Out of an interface: the neighbour's MAC (the gateway's, the host's, or the PPPoE concentrator's) goes into a fresh Ethernet header. Not known yet: an ARP request is sent and this packet dropped. To another site: the session's tether (or the path table's choice for its class) and encapsulation, encrypted.",
+    exits: [["neighbor-miss", "drop"], ["no-path", "drop"], ["Ethernet written", "next"], ["sealed into a tether", "next"]] },
+  { id: "wrap", n: "11", zone: "pipeline", title: "Wrap for the link", fn: "pipeline.rs · Pipeline::wrap_for_link · pppoe_wrap · eth::push_vlan",
+    text: "PPPoE first (the 8-byte session header), then the VLAN tag outside it, both written into the headroom in front of the packet. The packet itself never moves.",
+    exits: [["no-route (PPPoE not up)", "drop"], ["ready", "next"]] },
+  { id: "tx", n: "12", zone: "worker", title: "Transmit", fn: "worker.rs · Worker::run · card_of · tx.push · kick_tx",
+    text: "The same UMEM buffer goes onto the TX ring of the egress interface's card: forwarding without a copy. After the batch, the worker publishes the ring and wakes the kernel if it needs it.",
+    exits: [["tx-ring-full", "drop"], ["on the wire", "next"]] },
+];
+
+// ---------------------------------------------------------------- packets
+const L = (kind, label, value, extra) => ({ kind, label, value, ...(extra || {}) });
+
+// ---------------------------------------------------------------- scenarios
+// Each step: stage, what happens, the decision (kind: next | drop | local | punt), the exit it takes, the frame.
+const SCENARIOS = [
+  {
+    id: "outbound", name: "LAN to the internet",
+    blurb: "A laptop (10.10.1.10) opens an HTTPS connection to 93.184.216.34. The WAN is PPPoE on VLAN 7, so the packet gets NAT, an MSS clamp, a PPPoE header and a tag on the way out.",
+    steps: [
+      { s: "rx", does: "The SYN arrives on card 0 (the LAN NIC), queue 0, at offset 256 in its buffer.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "10.10.1.10 → 93.184.216.34 · TTL 64"), L("tcp", "TCP", "51000 → 443 · SYN · MSS 1460")] },
+      { s: "ingress", does: "No tag on the frame, and card 0's untagged interface is lan.", d: ["next", "Interface lan", "port found"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "10.10.1.10 → 93.184.216.34 · TTL 64"), L("tcp", "TCP", "51000 → 443 · SYN · MSS 1460")] },
+      { s: "classify", does: "Destination MAC is lan's own; EtherType 0x0800.", d: ["next", "IPv4", "IPv4"] , f: "same" },
+      { s: "ip", does: "Header checksum and lengths are fine. TCP to port 443 isn't DHCP.", d: ["next", "A valid IPv4 packet", "valid"], f: "same" },
+      { s: "filter", does: "No martian addresses or options, not a fragment. 10.10.1.10 is lan's subnet and it came in on lan.", d: ["next", "Clean", "clean"], f: "same" },
+      { s: "ours", does: "93.184.216.34 isn't one of the router's addresses.", d: ["next", "Passing through", "passing through"], f: "same" },
+      { s: "ttl", does: "TTL 64. A SYN of 60 bytes fits every link, so the MTU lookup is skipped.", d: ["next", "Fits", "fits"], f: "same" },
+      { s: "session", does: "No session for this 5-tuple. lan may start sessions, and a SYN may open one. The FIB says: default route via 203.0.113.1 on isp. isp is outside, so masquerade: source port 40001 is reserved on 203.0.113.50 and the session created with both keys.",
+        d: ["next", "New session, NAT to 203.0.113.50:40001", "next hop"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "203.0.113.50 → 93.184.216.34 · TTL 64", { changed: true }), L("tcp", "TCP", "40001 → 443 · SYN · MSS 1460", { changed: true })] },
+      { s: "fwd", does: "isp's MSS adjust is 1452 (PPPoE): the SYN's MSS is lowered, so the server never sends segments too big for the link. TTL down by one.",
+        d: ["next", "MSS 1460 → 1452, TTL 64 → 63", "edited"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "203.0.113.50 → 93.184.216.34 · TTL 63", { changed: true }), L("tcp", "TCP", "40001 → 443 · SYN · MSS 1452", { changed: true })] },
+      { s: "deliver", does: "isp is a PPPoE link: the neighbour is always the concentrator, whose MAC came from discovery. A new Ethernet header is written.",
+        d: ["next", "To the concentrator", "Ethernet written"],
+        f: [L("eth", "Ethernet", "router → concentrator · 0800", { changed: true }), L("ip", "IPv4", "203.0.113.50 → 93.184.216.34 · TTL 63"), L("tcp", "TCP", "40001 → 443 · SYN · MSS 1452")] },
+      { s: "wrap", does: "PPPoE header (session 0x42, PPP protocol IPv4) in the 8 bytes before the packet, then the VLAN 7 tag in 4 more.",
+        d: ["next", "PPPoE in VLAN 7", "ready"],
+        f: [L("eth", "Ethernet", "router → concentrator · 8100"), L("vlan", "802.1Q", "VLAN 7 · 8864", { changed: true }), L("ppp", "PPPoE", "session 0x42 · IPv4", { changed: true }), L("ip", "IPv4", "203.0.113.50 → 93.184.216.34 · TTL 63"), L("tcp", "TCP", "40001 → 443 · SYN · MSS 1452")] },
+      { s: "tx", does: "isp lives on card 2: the same buffer goes onto card 2's TX ring. No byte of the payload was copied.",
+        d: ["next", "Sent", "on the wire"], f: "same" },
+    ] },
+  {
+    id: "reply", name: "Reply from the internet",
+    blurb: "The server's SYN-ACK comes back through the ISP: tagged VLAN 7, inside PPPoE, addressed to the router's public address. The session finds it and turns the address back.",
+    steps: [
+      { s: "rx", does: "The frame arrives on card 2.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "concentrator → router · 8100"), L("vlan", "802.1Q", "VLAN 7 · 8864"), L("ppp", "PPPoE", "session 0x42 · IPv4"), L("ip", "IPv4", "93.184.216.34 → 203.0.113.50 · TTL 52"), L("tcp", "TCP", "443 → 40001 · SYN-ACK · MSS 1460")] },
+      { s: "ingress", does: "Tag VLAN 7 on card 2 is the isp interface. The tag comes off: the MAC addresses move 4 bytes forward over it.",
+        d: ["next", "Interface isp", "port found"],
+        f: [L("eth", "Ethernet", "concentrator → router · 8864"), L("vlan", "802.1Q", "VLAN 7", { gone: true }), L("ppp", "PPPoE", "session 0x42 · IPv4"), L("ip", "IPv4", "93.184.216.34 → 203.0.113.50 · TTL 52"), L("tcp", "TCP", "443 → 40001 · SYN-ACK · MSS 1460")] },
+      { s: "classify", does: "EtherType 0x8864 (PPPoE session) on a PPPoE interface.", d: ["next", "PPPoE", "PPPoE"], f: "same" },
+      { s: "pppoe", does: "Session 0x42, from our concentrator, carrying IPv4: unwrapped. A plain Ethernet header is written 8 bytes further on and the packet continues as IPv4.",
+        d: ["next", "Unwrapped", "unwrapped IPv4"],
+        f: [L("eth", "Ethernet", "concentrator → router · 0800", { changed: true }), L("ip", "IPv4", "93.184.216.34 → 203.0.113.50 · TTL 52"), L("tcp", "TCP", "443 → 40001 · SYN-ACK · MSS 1460")] },
+      { s: "ip", does: "A valid IPv4 header; not DHCP.", d: ["next", "Valid", "valid"], f: "same" },
+      { s: "filter", does: "Nothing suspicious; the source isn't on a connected subnet.", d: ["next", "Clean", "clean"], f: "same" },
+      { s: "ours", does: "203.0.113.50 is the router's own address, but the translated 5-tuple belongs to a NATed session: a reply, to be forwarded.", d: ["next", "A NAT reply", "NAT reply"], f: "same" },
+      { s: "ttl", does: "TTL 52; a small packet.", d: ["next", "Fits", "fits"], f: "same" },
+      { s: "session", does: "Found by its translated key: the reverse direction, arriving on isp as expected. The SYN-ACK fits the TCP state. Destination translated back to 10.10.1.10:51000, before routing, and the cached next hop for this direction is used.",
+        d: ["next", "Known session, back to 10.10.1.10:51000", "next hop"],
+        f: [L("eth", "Ethernet", "concentrator → router · 0800"), L("ip", "IPv4", "93.184.216.34 → 10.10.1.10 · TTL 52", { changed: true }), L("tcp", "TCP", "443 → 51000 · SYN-ACK · MSS 1460", { changed: true })] },
+      { s: "fwd", does: "The SYN-ACK's MSS is clamped too (it came in through isp), so the laptop also sends segments that fit. TTL down by one.",
+        d: ["next", "MSS 1460 → 1452, TTL 52 → 51", "edited"],
+        f: [L("eth", "Ethernet", "concentrator → router · 0800"), L("ip", "IPv4", "93.184.216.34 → 10.10.1.10 · TTL 51", { changed: true }), L("tcp", "TCP", "443 → 51000 · SYN-ACK · MSS 1452", { changed: true })] },
+      { s: "deliver", does: "10.10.1.10 is on lan, and its MAC is in the neighbour table.", d: ["next", "To the laptop", "Ethernet written"],
+        f: [L("eth", "Ethernet", "router → laptop · 0800", { changed: true }), L("ip", "IPv4", "93.184.216.34 → 10.10.1.10 · TTL 51"), L("tcp", "TCP", "443 → 51000 · SYN-ACK · MSS 1452")] },
+      { s: "wrap", does: "lan is untagged and not PPPoE: nothing to add.", d: ["next", "As it is", "ready"], f: "same" },
+      { s: "tx", does: "Onto card 0's TX ring.", d: ["next", "Sent", "on the wire"], f: "same" },
+    ] },
+  {
+    id: "wan-ssh", name: "SSH from the internet",
+    blurb: "Someone on the internet tries SSH on the router's public address. It's refused: SSH and the portal are never offered on an outside interface.",
+    steps: [
+      { s: "rx", does: "The SYN arrives on card 2.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "concentrator → router · 8100"), L("vlan", "802.1Q", "VLAN 7 · 8864"), L("ppp", "PPPoE", "session 0x42 · IPv4"), L("ip", "IPv4", "198.51.100.9 → 203.0.113.50"), L("tcp", "TCP", "33000 → 22 · SYN")] },
+      { s: "ingress", does: "VLAN 7 on card 2: isp. Tag off.", d: ["next", "Interface isp", "port found"],
+        f: [L("eth", "Ethernet", "concentrator → router · 8864"), L("ppp", "PPPoE", "session 0x42 · IPv4"), L("ip", "IPv4", "198.51.100.9 → 203.0.113.50"), L("tcp", "TCP", "33000 → 22 · SYN")] },
+      { s: "classify", does: "PPPoE session traffic.", d: ["next", "PPPoE", "PPPoE"], f: "same" },
+      { s: "pppoe", does: "Unwrapped to plain IPv4.", d: ["next", "Unwrapped", "unwrapped IPv4"],
+        f: [L("eth", "Ethernet", "concentrator → router · 0800"), L("ip", "IPv4", "198.51.100.9 → 203.0.113.50"), L("tcp", "TCP", "33000 → 22 · SYN")] },
+      { s: "ip", does: "Valid.", d: ["next", "Valid", "valid"], f: "same" },
+      { s: "filter", does: "Clean.", d: ["next", "Clean", "clean"], f: "same" },
+      { s: "ours", does: "203.0.113.50 is the router's, and no NATed session has this tuple.", d: ["local", "For the router", "for the router"], f: "same" },
+      { s: "local", does: "Not tether traffic. The host path checks: isp is an outside interface, so SSH isn't offered here, whatever the config says. Not an echo request either.",
+        d: ["drop", "Refused, counted as local-unhandled", "local-unhandled"], f: "same", end: "drop" },
+    ] },
+  {
+    id: "lan-ssh", name: "SSH to the router from the LAN",
+    blurb: "An admin on the LAN connects to ssh 10.10.1.1, with lan configured as management = [\"ssh\"]. The packet goes to Linux's sshd through the eph-host tun device, and the reply comes back through the data plane.",
+    steps: [
+      { s: "rx", does: "The SYN arrives on card 0.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "10.10.1.10 → 10.10.1.1"), L("tcp", "TCP", "50500 → 22 · SYN")] },
+      { s: "ingress", does: "Untagged on card 0: lan.", d: ["next", "Interface lan", "port found"], f: "same" },
+      { s: "classify", does: "IPv4 for lan's MAC.", d: ["next", "IPv4", "IPv4"], f: "same" },
+      { s: "ip", does: "Valid; not DHCP.", d: ["next", "Valid", "valid"], f: "same" },
+      { s: "filter", does: "Clean; the source belongs on lan.", d: ["next", "Clean", "clean"], f: "same" },
+      { s: "ours", does: "10.10.1.1 is lan's own address.", d: ["local", "For the router", "for the router"], f: "same" },
+      { s: "local", does: "TCP to lan's own address, port 22, lan is inside and offers SSH, and the source is allowed. The destination becomes lan's host-side address, 169.254.240.1 (port 0 + 1); the source stays the laptop's, so sshd logs the real client. The worker queues it to the host path, which writes it into eph-host.",
+        d: ["local", "Handed to sshd (to-host)", "to-host"],
+        f: [L("ip", "IPv4", "10.10.1.10 → 169.254.240.1", { changed: true }), L("tcp", "TCP", "50500 → 22 · SYN")], end: "host" },
+      { s: "deliver", does: "sshd's SYN-ACK leaves Linux from 169.254.240.1, and a routing rule sends that range back into eph-host. The host-path thread hands it to worker 0: Pipeline::inject_host checks it comes from port 22 or 8443 and goes back out of an inside interface, puts lan's real address back as the source, clamps the MSS, then routes it like any packet the router sends.",
+        d: ["next", "Source back to 10.10.1.1, to the laptop", "Ethernet written"],
+        f: [L("eth", "Ethernet", "router → laptop · 0800", { changed: true }), L("ip", "IPv4", "10.10.1.1 → 10.10.1.10", { changed: true }), L("tcp", "TCP", "22 → 50500 · SYN-ACK")] },
+      { s: "wrap", does: "lan is untagged: nothing to add.", d: ["next", "As it is", "ready"], f: "same" },
+      { s: "tx", does: "Onto card 0's TX ring.", d: ["next", "Sent", "on the wire"], f: "same" },
+    ] },
+  {
+    id: "sdwan", name: "To another site (SD-WAN)",
+    blurb: "A LAN host sends to 10.2.0.9 at site 2. The forwarding table points at a site, not an interface: the packet is sealed into a tether over the best WAN path for its application class.",
+    steps: [
+      { s: "rx", does: "Arrives on card 0.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "10.10.1.10 → 10.2.0.9 · TTL 64"), L("tcp", "TCP", "51200 → 5201 · SYN · MSS 1460")] },
+      { s: "ingress", does: "lan.", d: ["next", "Interface lan", "port found"], f: "same" },
+      { s: "classify", does: "IPv4.", d: ["next", "IPv4", "IPv4"], f: "same" },
+      { s: "ip", does: "Valid.", d: ["next", "Valid", "valid"], f: "same" },
+      { s: "filter", does: "Clean.", d: ["next", "Clean", "clean"], f: "same" },
+      { s: "ours", does: "Not the router's.", d: ["next", "Passing through", "passing through"], f: "same" },
+      { s: "ttl", does: "TTL fine; fits.", d: ["next", "Fits", "fits"], f: "same" },
+      { s: "session", does: "A new session. The FIB says 10.2.0.0/16 is site 2 (NextHop::Site). No NAT towards a site. The first packet sets the session's application class from its destination port: 5201 is the bulk class.",
+        d: ["next", "New session, next hop: site 2", "next hop"], f: "same" },
+      { s: "fwd", does: "The tether adds headers, so the overlay MTU applies (a bigger packet with DF would get Fragmentation Needed). The SYN's MSS is clamped to the overlay MTU minus 40. TTL down by one.",
+        d: ["next", "MSS clamped to fit the tether, TTL 63", "edited"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "10.10.1.10 → 10.2.0.9 · TTL 63", { changed: true }), L("tcp", "TCP", "51200 → 5201 · SYN · MSS 1400", { changed: true })] },
+      { s: "deliver", does: "pick_tether: the session's tether if the path table hasn't changed, else the path table's choice for (site 2, bulk), decided from probe results. encap writes outer Ethernet, IPv4 and UDP plus the Ephemeris header into the headroom and seals the inner packet with ChaCha20-Poly1305, tag after it.",
+        d: ["next", "Sealed into the fibre tether", "sealed into a tether"],
+        f: [L("eth", "Ethernet", "router → WAN gateway · 0800", { changed: true }), L("outer", "Outer IPv4 / UDP", "192.0.2.1:49xxx → 198.51.100.2:4800", { changed: true }), L("outer", "Ephemeris", "site 1 · tether · counter · sealed", { changed: true }), L("ip", "IPv4 (encrypted)", "10.10.1.10 → 10.2.0.9"), L("tcp", "TCP (encrypted)", "51200 → 5201 · SYN")] },
+      { s: "wrap", does: "The WAN interface is plain Ethernet here: nothing to add.", d: ["next", "As it is", "ready"], f: "same" },
+      { s: "tx", does: "Onto the WAN card's TX ring.", d: ["next", "Sent", "on the wire"], f: "same" },
+    ] },
+  {
+    id: "miss", name: "Neighbour not known yet",
+    blurb: "The first packet to a host the router hasn't talked to yet. Ephemeris doesn't queue packets waiting for ARP: it drops this one and asks.",
+    steps: [
+      { s: "rx", does: "A packet for 10.10.1.77 arrives from the guest VLAN.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "guest → router · 8100"), L("vlan", "802.1Q", "VLAN 10 · 0800"), L("ip", "IPv4", "10.10.10.10 → 10.10.1.77"), L("udp", "UDP", "5353 → 53")] },
+      { s: "ingress", does: "VLAN 10 on card 0: guest. Tag off.", d: ["next", "Interface guest", "port found"],
+        f: [L("eth", "Ethernet", "guest → router · 0800"), L("vlan", "802.1Q", "VLAN 10", { gone: true }), L("ip", "IPv4", "10.10.10.10 → 10.10.1.77"), L("udp", "UDP", "5353 → 53")] },
+      { s: "classify", does: "IPv4.", d: ["next", "IPv4", "IPv4"], f: [L("eth", "Ethernet", "guest → router · 0800"), L("ip", "IPv4", "10.10.10.10 → 10.10.1.77"), L("udp", "UDP", "5353 → 53")] },
+      { s: "ip", does: "Valid.", d: ["next", "Valid", "valid"], f: "same" },
+      { s: "filter", does: "Clean.", d: ["next", "Clean", "clean"], f: "same" },
+      { s: "ours", does: "Passing through.", d: ["next", "Passing through", "passing through"], f: "same" },
+      { s: "ttl", does: "Fine.", d: ["next", "Fits", "fits"], f: "same" },
+      { s: "session", does: "A new UDP session; next hop: lan, directly connected.", d: ["next", "New session, out of lan", "next hop"], f: "same" },
+      { s: "fwd", does: "Not TCP, so no MSS clamp. TTL down by one.", d: ["next", "TTL 63", "edited"], f: "same" },
+      { s: "deliver", does: "No neighbour entry for 10.10.1.77 on lan. resolve() queues an ARP request (at most one a second per address) to go out after this batch, and the packet is dropped. The application retries, and by then the reply has been learned (and shared with the other workers).",
+        d: ["drop", "Dropped, ARP request sent (neighbor-miss)", "neighbor-miss"], f: "same", end: "drop" },
+    ] },
+  {
+    id: "ttl", name: "TTL runs out (traceroute)",
+    blurb: "A traceroute probe with TTL 1. The router answers with ICMP Time Exceeded from the interface it arrived on, rate-limited to 100 a second per worker.",
+    steps: [
+      { s: "rx", does: "Arrives on card 0.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "laptop → router · 0800"), L("ip", "IPv4", "10.10.1.10 → 8.8.8.8 · TTL 1"), L("udp", "UDP", "33434 → 33435")] },
+      { s: "ingress", does: "lan.", d: ["next", "Interface lan", "port found"], f: "same" },
+      { s: "classify", does: "IPv4.", d: ["next", "IPv4", "IPv4"], f: "same" },
+      { s: "ip", does: "Valid.", d: ["next", "Valid", "valid"], f: "same" },
+      { s: "filter", does: "Clean.", d: ["next", "Clean", "clean"], f: "same" },
+      { s: "ours", does: "Passing through.", d: ["next", "Passing through", "passing through"], f: "same" },
+      { s: "ttl", does: "TTL is 1: it can't be forwarded. icmp_error builds the error in the same buffer: an ICMP header and a quote of the original IP header plus 8 bytes, from lan's address back to the sender, then routes it out.",
+        d: ["drop", "Time Exceeded sent back (ttl-exceeded)", "ttl-exceeded"],
+        f: [L("eth", "Ethernet", "router → laptop · 0800", { changed: true }), L("ip", "IPv4", "10.10.1.1 → 10.10.1.10 · TTL 64", { changed: true }), L("icmp", "ICMP", "Time Exceeded · quotes the probe", { changed: true })], end: "drop" },
+    ] },
+  {
+    id: "vlan", name: "Unknown VLAN",
+    blurb: "A frame tagged with a VLAN no interface is configured for. It stops at the first stage.",
+    steps: [
+      { s: "rx", does: "Arrives on card 0 tagged VLAN 30.", d: ["next", "Hand it to the pipeline", "Pipeline::process(card, frame)"],
+        f: [L("eth", "Ethernet", "host → router · 8100"), L("vlan", "802.1Q", "VLAN 30 · 0800"), L("ip", "IPv4", "10.30.0.5 → 10.10.1.10")] },
+      { s: "ingress", does: "Card 0 has an untagged interface (lan) and VLAN 10 (guest), but nothing for VLAN 30.",
+        d: ["drop", "Dropped (vlan)", "vlan"], f: "same", end: "drop" },
+    ] },
+];
+
+// ---------------------------------------------------------------- reference table
+const DROPS = [
+  ["2 Which interface?", "vlan", "a VLAN no interface is configured for, or untagged on a card with only VLAN interfaces"],
+  ["3 For us?", "not-for-us", "unicast to another MAC address"],
+  ["3 For us?", "unsupported-ethertype", "not IPv4, ARP or (on a PPPoE interface) PPPoE: IPv6, LLDP…"],
+  ["3a ARP", "arp-consumed", "handled: learned from, or answered (not a loss)"],
+  ["3b PPPoE in", "pppoe-to-control", "handed over: discovery and PPP control go to the PPPoE client"],
+  ["4 IPv4 header", "bad-ip-header", "wrong version, lengths or header checksum"],
+  ["4 IPv4 header", "dhcp-to-control", "handed over: DHCP for the server or client"],
+  ["5 Packet filter", "martian · spoofed-source · ip-option · bad-fragment", "addresses that never belong on the wire, sources pretending to be the router or the wrong subnet, IP options, impossible fragments"],
+  ["6 To the router?", "fragment-to-router", "the router never reassembles"],
+  ["6a Local", "to-host", "handed over: SSH or the portal on an inside interface"],
+  ["6a Local", "overlay-auth · overlay-replay · unknown-tether · bad-overlay", "tether traffic that doesn't decrypt, was seen before, or comes from no known peer"],
+  ["6a Local", "local-unhandled", "for the router, but not something it answers (e.g. SSH on an outside interface)"],
+  ["7 TTL and MTU", "ttl-exceeded · too-big", "Time Exceeded or Fragmentation Needed sent back instead"],
+  ["8 Sessions", "no-session · invalid-tcp-state · session-mismatch", "unsolicited on an outside interface, TCP out of state, a direction arriving somewhere it shouldn't"],
+  ["8 Sessions", "no-route · nat-exhausted · session-table-full", "no route (Net Unreachable sent back), no free NAT port, a full table"],
+  ["9 Last checks", "martian · too-big", "a directed broadcast; too big for a tether"],
+  ["10 Deliver", "neighbor-miss · no-path", "the next hop's MAC isn't known yet (an ARP request goes out); no tether up to that site"],
+  ["12 Transmit", "tx-ring-full", "the card's transmit ring is full"],
+];
+
+// ---------------------------------------------------------------- rendering
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+let scen = SCENARIOS[0], step = 0;
+
+// Resolve "same" frames to the previous step's frame (without change marks).
+for (const s of SCENARIOS) {
+  let last = [];
+  for (const st of s.steps) {
+    if (st.f === "same") st.f = last.filter(l => !l.gone).map(l => ({ ...l, changed: false }));
+    last = st.f;
+  }
+}
+
+function renderPipe() {
+  const pipe = $("pipe");
+  pipe.replaceChildren();
+  for (const st of STAGES) {
+    const row = el("div", "stage" + (st.sub ? " sub" : "") + " zone");
+    row.dataset.id = st.id;
+    row.dataset.zone = st.zone === "worker" ? "worker thread" : st.zone === "router" ? "router itself" : "";
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-label", `Stage ${st.n}: ${st.title}`);
+    const dot = el("div", "dot", st.n);
+    const box = el("div", "box");
+    const h = el("h3"); h.append(el("span", null, st.title), el("span", "fn", st.fn));
+    const ex = el("div", "exits");
+    for (const [label, kind] of st.exits) { const x = el("span", "exit " + kind, label); x.dataset.label = label; ex.append(x); }
+    box.append(h, el("p", null, st.text), ex);
+    row.append(dot, box);
+    row.onclick = () => jumpToStage(st.id);
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); jumpToStage(st.id); } };
+    pipe.append(row);
+  }
+}
+
+function jumpToStage(id) {
+  const i = scen.steps.findIndex(s => s.s === id);
+  if (i >= 0) { step = i; render(); }
+}
+
+function renderScenarios() {
+  const box = $("scen");
+  box.replaceChildren();
+  for (const s of SCENARIOS) {
+    const b = el("button", null, s.name);
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(s === scen));
+    b.onclick = () => { scen = s; step = 0; try { history.replaceState(null, "", "#" + s.id); } catch (e) {} renderScenarios(); render(); };
+    box.append(b);
+  }
+}
+
+function render() {
+  const st = scen.steps[step];
+  const stage = STAGES.find(x => x.id === st.s);
+  const path = new Set(scen.steps.slice(0, step + 1).map(x => x.s));
+  const visits = new Set(scen.steps.map(x => x.s));
+  for (const row of document.querySelectorAll(".stage")) {
+    const id = row.dataset.id;
+    row.classList.toggle("on", path.has(id));
+    row.classList.toggle("now", id === st.s);
+    row.classList.toggle("off", !visits.has(id));
+    row.classList.remove("end-drop", "end-host", "end-punt");
+    if (id === st.s && st.end) row.classList.add("end-" + st.end);
+    for (const x of row.querySelectorAll(".exit")) x.classList.remove("hit");
+  }
+  // Mark the exit each visited stage took.
+  for (const s of scen.steps.slice(0, step + 1)) {
+    const row = document.querySelector(`.stage[data-id="${s.s}"]`);
+    const x = row && [...row.querySelectorAll(".exit")].find(e => e.dataset.label === s.d[2]);
+    if (x) x.classList.add("hit");
+  }
+  $("blurb").textContent = scen.blurb;
+  $("stepTitle").textContent = `${stage.n} · ${stage.title}`;
+  $("count").textContent = `step ${step + 1} of ${scen.steps.length}`;
+  $("where").textContent = stage.fn;
+  $("does").textContent = st.does;
+  const dec = $("decision");
+  dec.className = "decision" + (st.d[0] !== "next" ? " " + st.d[0] : "");
+  dec.querySelector("b").textContent = st.d[0] === "drop" ? "Stops" : st.d[0] === "local" ? "Router" : st.d[0] === "punt" ? "Hands over" : "Decides";
+  $("decisionText").textContent = st.d[1];
+  const layers = $("layers");
+  layers.replaceChildren();
+  for (const l of st.f) {
+    const d = el("div", "layer " + l.kind + (l.changed ? " changed" : "") + (l.gone ? " gone" : ""));
+    d.append(el("small", null, l.label + (l.changed ? " · changed" : l.gone ? " · removed" : "")), el("span", null, l.value));
+    layers.append(d);
+  }
+  $("bytes").textContent = st.end === "drop" ? "not sent" : st.end === "host" ? "to Linux" : "";
+  const trail = $("trail");
+  trail.replaceChildren();
+  scen.steps.forEach((s, i) => {
+    const b = el("button", i === step ? "cur" : i < step ? "done" : "", String(i + 1));
+    b.type = "button";
+    b.setAttribute("aria-label", `Step ${i + 1}: ${STAGES.find(x => x.id === s.s).title}`);
+    b.onclick = () => { step = i; render(); };
+    trail.append(b);
+  });
+  $("prev").disabled = step === 0;
+  $("next").disabled = step === scen.steps.length - 1;
+}
+
+function renderDrops() {
+  const tb = $("drops");
+  for (const [stage, counter, why] of DROPS) {
+    const tr = el("tr");
+    tr.append(el("td", null, stage), el("td", "mono", counter), el("td", null, why));
+    tb.append(tr);
+  }
+}
+
+$("prev").onclick = () => { if (step > 0) { step--; render(); } };
+$("next").onclick = () => { if (step < scen.steps.length - 1) { step++; render(); } };
+document.addEventListener("keydown", (e) => {
+  if (e.target.closest && e.target.closest("button, input, textarea, select")) { if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return; }
+  if (e.key === "ArrowRight") $("next").click();
+  if (e.key === "ArrowLeft") $("prev").click();
+});
+
+const fromHash = SCENARIOS.find(s => "#" + s.id === location.hash);
+if (fromHash) scen = fromHash;
+renderScenarios();
+renderPipe();
+renderDrops();
+render();
+</script>
+
+</body>
+</html>
