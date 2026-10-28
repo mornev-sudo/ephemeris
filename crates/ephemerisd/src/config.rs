@@ -69,6 +69,15 @@ pub struct OverlayCfg {
     /// This router's role: which other sites it builds tethers to.
     #[serde(default)]
     pub role: SiteRole,
+    /// The cipher for session keys (sites with a public key): "auto"
+    /// (AES-256-GCM when both routers have AES in hardware, else
+    /// ChaCha20-Poly1305), or only "aes-256-gcm" or "chacha20-poly1305".
+    #[serde(default, skip_serializing_if = "is_auto")]
+    pub cipher: crate::sdwan::CipherPref,
+}
+
+fn is_auto(c: &crate::sdwan::CipherPref) -> bool {
+    *c == crate::sdwan::CipherPref::Auto
 }
 
 /// Who builds tethers to whom. Hubs connect to every site; spokes only to

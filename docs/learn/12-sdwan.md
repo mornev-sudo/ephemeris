@@ -114,6 +114,25 @@ from the [`snow`](https://docs.rs/snow) library:
 - **Each packet number used once.** New keys come with every session and
   count from 0, so the run numbers above aren't needed. Packets captured
   before a restart can't be replayed either: their keys are gone.
+- **The cipher is chosen too.** The initiation lists the ciphers the router
+  accepts and whether its AES is in hardware; the answer names the one
+  chosen. With `[overlay] cipher = "auto"` (the default) that's
+  **AES-256-GCM** when both routers have AES in hardware (AES-NI and
+  PCLMULQDQ on x86, Atom C3000 included; the crypto extensions on ARMv8),
+  and **ChaCha20-Poly1305** otherwise. `"aes-256-gcm"` or
+  `"chacha20-poly1305"` accepts only that one: a router that can't use it
+  gets no keys, and the log says why. The choice travels inside the
+  handshake's encrypted, authenticated messages, so nobody in between can
+  downgrade it.
+
+Why two ciphers: AES-256-GCM is the industry's default (IPsec, TLS,
+MACsec; FIPS-approved, in NSA's CNSA suite) and several times faster
+where the CPU has AES instructions. Without them it's done in constant-time
+software, safe but slow, and ChaCha20, fast in plain software, is the
+better choice. `ephemerisd --bench-crypto` measures both on the router
+itself. (The handshake's X25519 and BLAKE2s aren't FIPS-approved, so the
+cipher alone doesn't make the tunnel FIPS-compliant.) Pre-shared-key sites
+stay on ChaCha20: they have no handshake to agree in.
 
 With no session (yet), a site's tethers are down: no probes, no data.
 `overlay-no-key` counts packets sealed with a key the router doesn't have

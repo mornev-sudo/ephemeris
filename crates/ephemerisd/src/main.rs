@@ -46,6 +46,10 @@ struct Args {
     /// isn't one. The key pair lives next to the config file.
     #[arg(long)]
     sdwan_identity: bool,
+    /// Measure how fast this machine seals SD-WAN packets with each cipher
+    /// (one core), and whether it has AES in hardware.
+    #[arg(long)]
+    bench_crypto: bool,
     /// Development only (not in Linux builds): serve the web portal on
     /// 127.0.0.1:8080 against the config file, without a data plane.
     /// Sign in as admin / dev.
@@ -61,6 +65,10 @@ fn main() -> anyhow::Result<()> {
         std::io::stdin().read_line(&mut pw)?;
         let pw = pw.strip_suffix('\n').unwrap_or(&pw);
         println!("{}", mgmt::auth::hash_password(pw)?);
+        return Ok(());
+    }
+    if args.bench_crypto {
+        sdwan::bench_crypto();
         return Ok(());
     }
     if args.sdwan_identity {

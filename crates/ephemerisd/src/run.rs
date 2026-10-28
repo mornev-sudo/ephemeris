@@ -227,7 +227,13 @@ pub fn run(config_path: &Path) -> Result<()> {
     let names: Vec<(u16, String)> = cfg.sites.iter().map(|s| (s.id, s.name.clone())).collect();
     let handshaker = match (identity, handshakes) {
         (Some(me), Some(rx)) if workers > 0 => {
-            let hs = Handshakes::new(me, overlay.clone(), &names);
+            let pref = cfg.overlay.as_ref().map(|o| o.cipher).unwrap_or_default();
+            let aes_hw = eph_dataplane::overlay::Cipher::aes_in_hardware();
+            let hs = Handshakes::new(me, overlay.clone(), &names).with_ciphers(pref, aes_hw);
+            if hs.active() {
+                info!(target: crate::logging::cat::SDWAN,
+                    "SD-WAN ciphers: {pref:?}; AES in hardware: {}", if aes_hw { "yes" } else { "no" });
+            }
             hs.active().then(|| {
                 let shared = shared.clone();
                 std::thread::Builder::new()

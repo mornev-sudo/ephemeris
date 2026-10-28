@@ -80,7 +80,7 @@ router); per-person accounts and roles are future work.
 
 | Threat | Mitigation |
 |---|---|
-| **S/T** Forged or altered tether packets | ChaCha20-Poly1305 on every packet, probes included; packets that don't authenticate are dropped |
+| **S/T** Forged or altered tether packets | An AEAD on every packet, probes included (AES-256-GCM or ChaCha20-Poly1305, chosen inside the authenticated handshake, so it can't be downgraded); packets that don't authenticate are dropped |
 | **S** Posing as another site | Sites with a public key: a Noise `IKpsk2` handshake (WireGuard's pattern) proves the peer holds that key pair's private key, plus the pre-shared key if set. Sites without one: per-pair pre-shared keys |
 | **I** A key stolen later decrypting recorded traffic | Sites with a public key: fresh session keys every two minutes from ephemeral X25519 keys that are then forgotten (forward secrecy) |
 | **T** Replay | Per-sender counters within each session key; nonces never reused (new keys per session; run numbers for pre-shared keys). A replayed initiation gets an answer, but its keys are never used: the responder only switches to keys a packet has proven |

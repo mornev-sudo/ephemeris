@@ -43,7 +43,7 @@ use blake2::digest::consts::U16;
 use blake2::digest::{Digest, KeyInit, Mac};
 use blake2::{Blake2s256, Blake2sMac};
 use eph_dataplane::overlay::{
-    KeyTable, Overlay, PeerCrypto, Session, TetherId, TetherKey, HDR_LEN, REKEY_AFTER_NS,
+    Cipher, KeyTable, Overlay, PeerCrypto, Session, TetherId, TetherKey, HDR_LEN, REKEY_AFTER_NS,
     TYPE_HANDSHAKE_INIT, TYPE_HANDSHAKE_RESPONSE, VERSION_HANDSHAKE,
 };
 use eph_dataplane::HandshakeIn;
@@ -168,6 +168,87 @@ fn prologue(initiator: u16, responder: u16) -> Vec<u8> {
     p
 }
 
+/// Which cipher a router accepts for session keys (`[overlay] cipher`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CipherPref {
+    /// AES-256-GCM when both routers have AES in hardware, else ChaCha20.
+    #[default]
+    Auto,
+    /// Only this one: a router that can't use it gets no keys.
+    #[serde(rename = "aes-256-gcm")]
+    Aes256Gcm,
+    #[serde(rename = "chacha20-poly1305")]
+    ChaCha20Poly1305,
+}
+
+// In an initiation (after our key id): what we accept. In the response:
+// the cipher chosen. The payloads travel inside the Noise messages, so
+// they're encrypted and authenticated: nobody can downgrade the choice.
+const OFFER_CHACHA: u8 = 1;
+const OFFER_AES: u8 = 2;
+/// "My AES is in hardware": AES only pays off when both ends have it.
+const OFFER_AES_FAST: u8 = 4;
+const CHOSE_CHACHA: u8 = 1;
+const CHOSE_AES: u8 = 2;
+
+fn offer(pref: CipherPref, aes_hw: bool) -> u8 {
+    let fast = if aes_hw { OFFER_AES_FAST } else { 0 };
+    match pref {
+        CipherPref::Auto => OFFER_CHACHA | OFFER_AES | fast,
+        CipherPref::Aes256Gcm => OFFER_AES | fast,
+        CipherPref::ChaCha20Poly1305 => OFFER_CHACHA,
+    }
+}
+
+/// The responder's choice for an initiator's `offer`, or `None`: nothing
+/// both accept.
+fn choose(offer: u8, pref: CipherPref, aes_hw: bool) -> Option<Cipher> {
+    let (chacha, aes) = (offer & OFFER_CHACHA != 0, offer & OFFER_AES != 0);
+    match pref {
+        CipherPref::Aes256Gcm => aes.then_some(Cipher::Aes256Gcm),
+        CipherPref::ChaCha20Poly1305 => chacha.then_some(Cipher::ChaCha20Poly1305),
+        CipherPref::Auto if aes && aes_hw && offer & OFFER_AES_FAST != 0 => Some(Cipher::Aes256Gcm),
+        CipherPref::Auto if chacha => Some(Cipher::ChaCha20Poly1305),
+        CipherPref::Auto => aes.then_some(Cipher::Aes256Gcm),
+    }
+}
+
+/// Seal full-size tether packets with each cipher for about a second each,
+/// on one core, and print the rates (`ephemerisd --bench-crypto`).
+pub fn bench_crypto() {
+    use eph_dataplane::overlay::SessionKey;
+    println!(
+        "AES in hardware: {}",
+        if Cipher::aes_in_hardware() {
+            "yes"
+        } else {
+            "no (software AES is slow)"
+        }
+    );
+    let mut hdr = [0u8; HDR_LEN];
+    let mut buf = vec![0u8; eph_dataplane::overlay::DEFAULT_MTU as usize];
+    for cipher in [Cipher::ChaCha20Poly1305, Cipher::Aes256Gcm] {
+        let key = SessionKey::new(cipher, TetherKey([7; 32]));
+        let (mut n, start) = (0u64, std::time::Instant::now());
+        while start.elapsed() < std::time::Duration::from_secs(1) {
+            for _ in 0..1000 {
+                hdr[8..16].copy_from_slice(&n.to_be_bytes());
+                std::hint::black_box(key.seal(&hdr, &mut buf));
+                n += 1;
+            }
+        }
+        let s = start.elapsed().as_secs_f64();
+        println!(
+            "{:<18} {:>6.0} ns per {}-byte packet, {:>6.2} Gbit/s per core",
+            cipher.name(),
+            s * 1e9 / n as f64,
+            buf.len(),
+            n as f64 * buf.len() as f64 * 8.0 / s / 1e9
+        );
+    }
+}
+
 /// What the I/O around this should do.
 #[derive(Debug, PartialEq)]
 pub enum Action {
@@ -194,6 +275,8 @@ pub struct Output {
 struct Pending {
     hs: snow::HandshakeState,
     local_id: u8,
+    /// What we offered (the answer must be one of these).
+    offered: u8,
 }
 
 struct Peer {
@@ -284,6 +367,8 @@ pub struct PeerStatus {
     pub public_key: String,
     /// Keys to send with right now.
     pub established: bool,
+    /// Their cipher.
+    pub cipher: Option<&'static str>,
     /// Age of those keys, seconds.
     pub key_age_s: Option<u64>,
     pub handshakes: u64,
@@ -301,6 +386,8 @@ pub struct Handshakes {
     /// Per site_idx (None: that site uses its pre-shared key).
     peers: Vec<Option<Peer>>,
     serial: u64,
+    pref: CipherPref,
+    aes_hw: bool,
 }
 
 impl Handshakes {
@@ -343,7 +430,16 @@ impl Handshakes {
             overlay,
             peers,
             serial: 0,
+            pref: CipherPref::Auto,
+            aes_hw: Cipher::aes_in_hardware(),
         }
+    }
+
+    /// Which ciphers to accept, and whether this CPU has AES in hardware.
+    pub fn with_ciphers(mut self, pref: CipherPref, aes_hw: bool) -> Self {
+        self.pref = pref;
+        self.aes_hw = aes_hw;
+        self
     }
 
     /// Any site using handshakes?
@@ -416,7 +512,8 @@ impl Handshakes {
                 }
             };
             let mut buf = [0u8; 256];
-            let n = match hs.write_message(&[local_id], &mut buf) {
+            let offered = offer(self.pref, self.aes_hw);
+            let n = match hs.write_message(&[local_id, offered], &mut buf) {
                 Ok(n) => n,
                 Err(e) => {
                     out.events.push((
@@ -428,7 +525,11 @@ impl Handshakes {
             };
             let payload = self.message(TYPE_HANDSHAKE_INIT, tether, &buf[..n], &public);
             let p = self.peers[idx].as_mut().unwrap();
-            p.pending = Some(Pending { hs, local_id });
+            p.pending = Some(Pending {
+                hs,
+                local_id,
+                offered,
+            });
             out.events.push((
                 p.had_keys,
                 format!(
@@ -514,10 +615,27 @@ impl Handshakes {
                     return out;
                 }
                 let peer_id = pl[0];
+                // An initiation without an offer (from before ciphers were
+                // chosen) means ChaCha20.
+                let their_offer = if n >= 2 { pl[1] } else { OFFER_CHACHA };
+                let Some(cipher) = choose(their_offer, self.pref, self.aes_hw) else {
+                    out.events.push((
+                        false,
+                        format!(
+                            "SD-WAN {name}: refused a handshake: no cipher both accept (ours: {:?})",
+                            self.pref
+                        ),
+                    ));
+                    return out;
+                };
+                let chose = match cipher {
+                    Cipher::Aes256Gcm => CHOSE_AES,
+                    Cipher::ChaCha20Poly1305 => CHOSE_CHACHA,
+                };
                 p.pending = None;
                 let local_id = p.alloc_id();
                 let mut buf = [0u8; 256];
-                let Ok(n) = hs.write_message(&[local_id], &mut buf) else {
+                let Ok(n) = hs.write_message(&[local_id, chose], &mut buf) else {
                     return out;
                 };
                 let (to_us, to_them) = hs.dangerously_get_raw_split();
@@ -526,6 +644,7 @@ impl Handshakes {
                     self.serial,
                     local_id,
                     peer_id,
+                    cipher,
                     TetherKey(to_them),
                     TetherKey(to_us),
                     now,
@@ -556,13 +675,25 @@ impl Handshakes {
                         return out; // it times out and is tried again
                     }
                 };
-                let _ = n;
+                // The cipher chosen, which must be one we offered.
+                let cipher = match if n >= 2 { pl[1] } else { CHOSE_CHACHA } {
+                    CHOSE_AES if pending.offered & OFFER_AES != 0 => Cipher::Aes256Gcm,
+                    CHOSE_CHACHA if pending.offered & OFFER_CHACHA != 0 => Cipher::ChaCha20Poly1305,
+                    _ => {
+                        out.events.push((
+                            false,
+                            format!("SD-WAN {name}: ignored a response choosing a cipher we didn't offer"),
+                        ));
+                        return out;
+                    }
+                };
                 let (to_them, to_us) = pending.hs.dangerously_get_raw_split();
                 self.serial += 1;
                 let s = Session::new(
                     self.serial,
                     pending.local_id,
                     pl[0],
+                    cipher,
                     TetherKey(to_them),
                     TetherKey(to_us),
                     now,
@@ -608,6 +739,7 @@ impl Handshakes {
                     name: p.name.clone(),
                     public_key: hex(&p.public),
                     established: s.is_some(),
+                    cipher: s.map(|s| s.tx.cipher().name()),
                     key_age_s: s.map(|s| now.saturating_sub(s.created_ns) / 1_000_000_000),
                     handshakes: p.handshakes,
                     last_handshake_s: p
@@ -742,10 +874,40 @@ mod tests {
     }
 
     #[test]
+    fn the_cipher_is_chosen_in_the_handshake() {
+        use CipherPref::*;
+        let agreed = |a: (CipherPref, bool), b: (CipherPref, bool)| {
+            let mut p = pair(None, None);
+            p.a = std::mem::replace(&mut p.a, pair(None, None).a).with_ciphers(a.0, a.1);
+            p.b = std::mem::replace(&mut p.b, pair(None, None).b).with_ciphers(b.0, b.1);
+            let init = sends(&p.a.tick(S, &all));
+            let resp = sends(&p.b.receive(&arrive(1, &init[0].2), S));
+            if resp.is_empty() {
+                return None;
+            }
+            p.a.receive(&arrive(2, &resp[0].2), S);
+            let (a, b) = (sessions(&p.a), sessions(&p.b));
+            assert_eq!(a[0].tx, b[0].rx, "both use the same");
+            Some(a[0].tx.cipher())
+        };
+        let (aes, chacha) = (Some(Cipher::Aes256Gcm), Some(Cipher::ChaCha20Poly1305));
+        // AES when both do it in hardware; otherwise ChaCha20.
+        assert_eq!(agreed((Auto, true), (Auto, true)), aes);
+        assert_eq!(agreed((Auto, true), (Auto, false)), chacha);
+        assert_eq!(agreed((Auto, false), (Auto, true)), chacha);
+        // Forcing one: the other router goes along if it can...
+        assert_eq!(agreed((Aes256Gcm, false), (Auto, false)), aes);
+        assert_eq!(agreed((Auto, true), (ChaCha20Poly1305, true)), chacha);
+        // ...and if both force different ones, there are no keys.
+        assert_eq!(agreed((Aes256Gcm, true), (ChaCha20Poly1305, true)), None);
+        assert_eq!(agreed((ChaCha20Poly1305, true), (Aes256Gcm, true)), None);
+    }
+
+    #[test]
     fn each_handshake_gives_new_keys() {
         let mut p = pair(None, None);
         shake(&mut p, S);
-        let first = sessions(&p.a)[0].tx;
+        let first = sessions(&p.a)[0].clone();
         // Nothing due yet.
         assert!(sends(&p.a.tick(2 * S, &all)).is_empty());
         // ...but after two minutes A (which started the first) starts again.
@@ -766,8 +928,8 @@ mod tests {
             2,
             "the old keys stay for packets still on their way"
         );
-        assert_ne!(a[0].tx, first);
-        assert_eq!(a[1].tx, first);
+        assert_ne!(a[0].tx, first.tx);
+        assert_eq!(a[1].tx, first.tx);
         // Expired keys are dropped.
         let out = p.a.tick(S + REJECT_AFTER_NS, &all);
         assert!(out.keys.is_some());

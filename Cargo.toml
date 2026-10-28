@@ -34,6 +34,10 @@ ureq = { version = "2", default-features = false }
 # Overlay encryption (RustCrypto, pure Rust). No default features: no
 # allocation or OS randomness is needed for sealing packets in place.
 chacha20poly1305 = { version = "0.11", default-features = false }
+# AES-256-GCM for tethers between routers that both have AES in hardware
+# (AES-NI and PCLMULQDQ, or ARMv8 crypto): chosen in the handshake. Found
+# at run time; a constant-time software version otherwise.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
 # SD-WAN handshakes: the Noise protocol framework (Noise_IKpsk2, the
 # pattern WireGuard uses), with only the primitives that pattern needs. Not
 # its "std" feature: that also pulls in ring, which we don't use.

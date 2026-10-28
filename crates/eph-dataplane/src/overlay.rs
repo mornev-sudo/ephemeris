@@ -47,6 +47,7 @@
 //! can't be faked either.
 
 use crate::config::PortId;
+use aes_gcm::Aes256Gcm;
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use std::fmt;
@@ -378,6 +379,109 @@ impl TetherKey {
     }
 }
 
+/// The AEAD a session's keys are for, agreed in its handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cipher {
+    /// RFC 8439: fast in software everywhere.
+    ChaCha20Poly1305,
+    /// NIST SP 800-38D: several times faster where the CPU has AES and
+    /// carry-less multiply instructions (AES-NI and PCLMULQDQ on x86,
+    /// including Atom C3000; the crypto extensions on ARMv8).
+    Aes256Gcm,
+}
+
+impl Cipher {
+    pub fn name(self) -> &'static str {
+        match self {
+            Cipher::ChaCha20Poly1305 => "ChaCha20-Poly1305",
+            Cipher::Aes256Gcm => "AES-256-GCM",
+        }
+    }
+
+    /// Does this CPU do AES-GCM in hardware? (Otherwise the software AES is
+    /// constant-time but much slower than ChaCha20.)
+    pub fn aes_in_hardware() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("aes")
+                && std::arch::is_x86_feature_detected!("pclmulqdq")
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::is_aarch64_feature_detected!("aes")
+                && std::arch::is_aarch64_feature_detected!("pmull")
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+}
+
+/// One direction of a session: its key, made ready for its cipher once
+/// (AES expands its key into round keys; ChaCha20 needs nothing). The same
+/// nonce rules as [`TetherKey`].
+pub struct SessionKey {
+    key: TetherKey,
+    aes: Option<Box<Aes256Gcm>>,
+}
+
+impl SessionKey {
+    pub fn new(cipher: Cipher, key: TetherKey) -> Self {
+        let aes = (cipher == Cipher::Aes256Gcm)
+            .then(|| Box::new(Aes256Gcm::new(&aes_gcm::Key::<Aes256Gcm>::from(key.0))));
+        SessionKey { key, aes }
+    }
+
+    pub fn cipher(&self) -> Cipher {
+        if self.aes.is_some() {
+            Cipher::Aes256Gcm
+        } else {
+            Cipher::ChaCha20Poly1305
+        }
+    }
+
+    /// Encrypt `payload` in place, authenticating `hdr` too; returns the tag.
+    pub fn seal(&self, hdr: &[u8; HDR_LEN], payload: &mut [u8]) -> [u8; TAG_LEN] {
+        let Some(aes) = &self.aes else {
+            return self.key.seal(hdr, payload);
+        };
+        let (site, worker, counter) = header_nonce_parts(hdr);
+        let nonce = aes_gcm::Nonce::from(TetherKey::nonce(site, worker, counter));
+        aes.encrypt_inout_detached(&nonce, hdr, payload.into())
+            .expect("payload within the AEAD's size limit")
+            .into()
+    }
+
+    /// Check `tag` and decrypt `payload` in place. On failure the payload is
+    /// left untouched and must be dropped.
+    pub fn open(&self, hdr: &[u8; HDR_LEN], payload: &mut [u8], tag: &[u8]) -> bool {
+        let Some(aes) = &self.aes else {
+            return self.key.open(hdr, payload, tag);
+        };
+        let Ok(tag) = aes_gcm::Tag::try_from(tag) else {
+            return false;
+        };
+        let (site, worker, counter) = header_nonce_parts(hdr);
+        let nonce = aes_gcm::Nonce::from(TetherKey::nonce(site, worker, counter));
+        aes.decrypt_inout_detached(&nonce, hdr, payload.into(), &tag)
+            .is_ok()
+    }
+}
+
+/// Same cipher and key (the expanded AES key follows from the key).
+impl PartialEq for SessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cipher() == other.cipher() && self.key == other.key
+    }
+}
+
+impl fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SessionKey({}, redacted)", self.cipher().name())
+    }
+}
+
 fn header_nonce_parts(hdr: &[u8; HDR_LEN]) -> (u16, u8, u64) {
     let site = u16::from_be_bytes([hdr[2], hdr[3]]);
     let counter = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
@@ -403,8 +507,8 @@ pub struct Session {
     pub local_id: u8,
     /// The peer's id for it: we put it in byte 7.
     pub peer_id: u8,
-    pub tx: TetherKey,
-    pub rx: TetherKey,
+    pub tx: SessionKey,
+    pub rx: SessionKey,
     /// When it was agreed (the workers' clock).
     pub created_ns: u64,
     /// Did this router start the handshake?
@@ -424,6 +528,7 @@ impl Session {
         serial: u64,
         local_id: u8,
         peer_id: u8,
+        cipher: Cipher,
         tx: TetherKey,
         rx: TetherKey,
         created_ns: u64,
@@ -433,8 +538,8 @@ impl Session {
             serial,
             local_id,
             peer_id,
-            tx,
-            rx,
+            tx: SessionKey::new(cipher, tx),
+            rx: SessionKey::new(cipher, rx),
             created_ns,
             initiator,
             confirmed: AtomicBool::new(initiator),
@@ -479,6 +584,7 @@ impl fmt::Debug for Session {
             .field("serial", &self.serial)
             .field("local_id", &self.local_id)
             .field("peer_id", &self.peer_id)
+            .field("cipher", &self.tx.cipher())
             .field("created_ns", &self.created_ns)
             .field("initiator", &self.initiator)
             .field("confirmed", &self.confirmed())

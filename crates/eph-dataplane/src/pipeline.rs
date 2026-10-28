@@ -68,6 +68,14 @@ pub struct HandshakeIn {
     pub payload: Vec<u8>,
 }
 
+/// What a tether packet is sealed with (see `Pipeline::next_seal`).
+#[derive(Clone, Copy)]
+enum SealWith {
+    PreShared(TetherKey),
+    /// The current session with the site at this index.
+    Session(usize),
+}
+
 /// A learned IP → MAC binding on a port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Neighbor {
@@ -1876,10 +1884,11 @@ impl Pipeline {
         }
     }
 
-    /// The key, header version, key id and packet number to seal the next
-    /// packet on a tether with. `None`: nothing to seal with, or this key's
-    /// packet numbers are used up (a nonce must never repeat).
-    fn next_seal(&mut self, tether: TetherId) -> Option<(TetherKey, u8, u8, u64)> {
+    /// What to seal the next packet on a tether with (the pre-shared key, or
+    /// the site's current session), and its header version, key id and
+    /// packet number. `None`: nothing to seal with, or this key's packet
+    /// numbers are used up (a nonce must never repeat).
+    fn next_seal(&mut self, tether: TetherId) -> Option<(SealWith, u8, u8, u64)> {
         let t = &self.overlay.tethers[tether as usize];
         match self.overlay.crypto(t.site_idx) {
             PeerCrypto::PreShared => {
@@ -1889,7 +1898,7 @@ impl Pipeline {
                 }
                 let counter = (self.overlay_run as u64) << 48 | self.tx_counter;
                 self.tx_counter += 1;
-                Some((key, overlay::VERSION, 0, counter))
+                Some((SealWith::PreShared(key), overlay::VERSION, 0, counter))
             }
             PeerCrypto::Handshake { .. } => {
                 let s = self.keys.sending(t.site_idx, self.now_ns)?;
@@ -1901,7 +1910,12 @@ impl Pipeline {
                     return None;
                 }
                 next.1 += 1;
-                Some((s.tx, overlay::VERSION_HANDSHAKE, s.peer_id, next.1 - 1))
+                Some((
+                    SealWith::Session(t.site_idx),
+                    overlay::VERSION_HANDSHAKE,
+                    s.peer_id,
+                    next.1 - 1,
+                ))
             }
         }
     }
@@ -1923,7 +1937,7 @@ impl Pipeline {
         tether: TetherId,
         payload_len: usize,
     ) -> Option<usize> {
-        let (key, version, key_id, counter) = self.next_seal(tether)?;
+        let (with, version, key_id, counter) = self.next_seal(tether)?;
         let p = &self.ports[port as usize];
         eth::write(buf, mac, p.mac, eth::TYPE_IPV4);
         self.ip_ident = self.ip_ident.wrapping_add(1);
@@ -1953,7 +1967,16 @@ impl Pipeline {
         let r = u + l4::UDP_HDR_LEN;
         buf[r..r + overlay::HDR_LEN].copy_from_slice(&hdr);
         let body = r + overlay::HDR_LEN;
-        let tag = key.seal(&hdr, &mut buf[body..body + payload_len]);
+        let payload = &mut buf[body..body + payload_len];
+        let tag = match with {
+            SealWith::PreShared(key) => key.seal(&hdr, payload),
+            // The session `next_seal` picked: nothing replaced it since.
+            SealWith::Session(site_idx) => self
+                .keys
+                .sending(site_idx, self.now_ns)?
+                .tx
+                .seal(&hdr, payload),
+        };
         buf[body + payload_len..body + payload_len + TAG_LEN].copy_from_slice(&tag);
         Some(body + payload_len + TAG_LEN)
     }
