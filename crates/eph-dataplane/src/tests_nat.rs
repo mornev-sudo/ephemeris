@@ -258,6 +258,19 @@ fn unsolicited_traffic_to_the_outside_address_is_not_forwarded() {
         "203.0.113.1",
         L4::Tcp(443, 40000, l4::TCP_SYN),
     );
+    // To a port NAT could have used: counted as a reply without a session.
+    assert_eq!(
+        r.process(1, &mut f, OFF, n),
+        Verdict::Drop(DropReason::NatNoSession)
+    );
+    // Below 1024 NAT never translates to: just unhandled.
+    let (mut f, n) = packet(
+        R_WAN,
+        ISP,
+        "8.8.8.8",
+        "203.0.113.1",
+        L4::Tcp(443, 23, l4::TCP_SYN),
+    );
     assert_eq!(
         r.process(1, &mut f, OFF, n),
         Verdict::Drop(DropReason::LocalUnhandled)
@@ -376,13 +389,24 @@ fn ports_are_split_between_workers_and_freed_on_expiry() {
     let (_, off, _) = tx(r.process(0, &mut f, OFF, n));
     let p = ports_of(&f, off).0;
     assert_eq!(p % 2, 1, "worker 1 of 2 uses odd ports");
-    // 31 s later the UDP session (and its port) is gone; replies are refused.
+    // A reply to it that worker 0 gets instead (the card picked the wrong
+    // queue) is named for what it is.
+    let mut other = router(NatConfig::default());
+    other.set_worker(0, 2);
+    let (mut f, n) = packet(R_WAN, ISP, "8.8.8.8", "203.0.113.1", L4::Udp(53, p));
+    assert_eq!(
+        other.process(1, &mut f, OFF, n),
+        Verdict::Drop(DropReason::NatWrongWorker)
+    );
+    // 31 s later the UDP session (and its port) is gone; replies are refused,
+    // and the session is counted as never answered.
     r.set_time(32_000_000_000);
     r.housekeeping();
+    assert_eq!(r.stats.sessions_unanswered, 1);
     let (mut f, n) = packet(R_WAN, ISP, "8.8.8.8", "203.0.113.1", L4::Udp(53, p));
     assert_eq!(
         r.process(1, &mut f, OFF, n),
-        Verdict::Drop(DropReason::LocalUnhandled)
+        Verdict::Drop(DropReason::NatNoSession)
     );
 }
 

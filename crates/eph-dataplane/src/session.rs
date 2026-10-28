@@ -23,6 +23,7 @@ use rustc_hash::FxSeededState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 const NS: u64 = 1_000_000_000;
 
@@ -179,13 +180,24 @@ impl State {
     }
 }
 
-/// No session lingers idle for longer than this: an hour (configured
-/// timeouts above it are refused).
-pub const MAX_IDLE_SECS: u64 = 3600;
+/// No session lingers idle for longer than this: a day (configured
+/// timeouts above it are capped). The defaults stay well below it.
+pub const MAX_IDLE_SECS: u64 = 86_400;
 /// Closing and closed TCP sessions are gone within ten minutes.
 pub const MAX_CLOSING_SECS: u64 = 600;
 
 /// Idle timeouts in seconds. A session expires this long after its last packet.
+///
+/// The defaults follow the NAT behaviour RFCs where an application would
+/// otherwise break, and Linux conntrack for the rest:
+///
+/// - TCP established: 2 h 4 min, RFC 5382 REQ-5 (longer than TCP's own 2 h
+///   keepalive, so an idle SSH session with keepalives survives).
+/// - UDP once answered: 3 min (RFC 4787 REQ-5: at least 2).
+/// - ICMP: 60 s (RFC 5508 REQ-1: at least 60).
+/// - Unanswered UDP and TCP handshakes: 30 s. Shorter than RFC 4787 asks for
+///   unanswered UDP, as conntrack does: these are what fills a table during
+///   a scan or flood, and anything real gets its answer within seconds.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub tcp_handshake: u64,
@@ -202,18 +214,35 @@ impl Default for Timeouts {
     fn default() -> Self {
         Timeouts {
             tcp_handshake: 30,
-            tcp_established: 3600,
+            tcp_established: 7440,
             tcp_closing: 120,
             tcp_closed: 10,
             udp: 30,
             udp_stream: 180,
-            icmp: 30,
+            icmp: 60,
             other: 60,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Timeouts for one application: sessions to these server ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppTimeout {
+    /// IP protocol (6 TCP, 17 UDP).
+    pub proto: u8,
+    /// Inclusive server (destination) port range.
+    pub ports: (u16, u16),
+    /// Once answered (TCP: established), instead of the protocol's.
+    pub idle_secs: u64,
+    /// Before the first answer (TCP: the handshake), if different.
+    pub unanswered_secs: Option<u64>,
+}
+
+/// At most this many [`AppTimeout`]s (a session keeps its rule's number in
+/// a byte).
+pub const MAX_APP_TIMEOUTS: usize = 64;
+
+#[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Hard cap per worker. All memory is reserved up front, so the fast path
     /// never allocates, and a flood of new flows can't exhaust RAM.
@@ -222,6 +251,12 @@ pub struct SessionConfig {
     /// packet is "picked up" as established (handy after a router restart).
     pub tcp_strict: bool,
     pub timeouts: Timeouts,
+    /// Per-application timeouts, first match wins (by protocol and server
+    /// port, decided when the session starts).
+    pub apps: Arc<[AppTimeout]>,
+    /// Table full: make room by dropping a session that never got an answer
+    /// (or a closing TCP one), instead of refusing the new one.
+    pub early_drop: bool,
 }
 
 impl Default for SessionConfig {
@@ -230,9 +265,27 @@ impl Default for SessionConfig {
             max_sessions: 262_144,
             tcp_strict: false,
             timeouts: Timeouts::default(),
+            apps: Arc::from([]),
+            early_drop: true,
         }
     }
 }
+
+/// A session that just expired without ever being answered, for tracing:
+/// what was tried, and how it was translated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unanswered {
+    pub proto: u8,
+    pub initiator: (Ipv4Addr, u16),
+    pub responder: (Ipv4Addr, u16),
+    pub ingress: Option<PortId>,
+    pub packets: u64,
+    pub age_secs: u64,
+    pub nat: Option<(Ipv4Addr, u16)>,
+}
+
+/// Unanswered sessions kept for tracing between two housekeeping calls.
+const UNANSWERED_LOG_MAX: usize = 256;
 
 /// A source-NAT translation: the session's initiator `orig_addr:orig_port`
 /// appears to the outside as `addr:port`.
@@ -265,6 +318,8 @@ pub struct Session {
     pub fib_gen: u64,
     /// SD-WAN application class, decided by the first packet.
     pub class: u8,
+    /// Its [`AppTimeout`] (index + 1), or 0: the protocol's timeouts.
+    pub app: u8,
     /// Overlay tether this session uses, valid for path table `path_gen`.
     /// Sticky: a session stays on its path until the path table changes.
     pub tether: Option<u16>,
@@ -332,11 +387,22 @@ pub struct SessionTable {
     pub blind: u64,
     /// Sessions with a NAT translation right now.
     pub nat_active: u64,
+    /// Expired without a single packet back.
+    pub unanswered: u64,
+    /// Dropped early to make room in a full table.
+    pub early_dropped: u64,
+    /// While set (a session trace is on), expiring unanswered sessions are
+    /// also kept in `unanswered_log` for the pipeline to trace.
+    pub log_unanswered: bool,
+    pub unanswered_log: Vec<Unanswered>,
 }
 
 /// Keys a session can have in the map: its 5-tuple, plus its translated
 /// one while it's source-NATed.
 const KEYS_PER_SESSION: usize = 2;
+/// Timer entries looked at, at most, to find a session to drop early.
+const EARLY_DROP_SCAN: usize = 256;
+
 /// The timer wheel holds about one (index, generation) entry per session,
 /// sometimes a stale one more; it grows as needed rather than up front.
 const WHEEL_BYTES_PER_SESSION: u64 = 2 * std::mem::size_of::<(u32, u32)>() as u64;
@@ -409,6 +475,10 @@ impl SessionTable {
             expired: 0,
             blind: 0,
             nat_active: 0,
+            unanswered: 0,
+            early_dropped: 0,
+            log_unanswered: false,
+            unanswered_log: Vec::new(),
         }
     }
 
@@ -483,6 +553,7 @@ impl SessionTable {
             next_hop: [None; 2],
             fib_gen: 0,
             class: 0,
+            app: self.app_of(key, lo_to_hi),
             tether: None,
             path_gen: 0,
             nat: None,
@@ -501,6 +572,14 @@ impl SessionTable {
         } else if self.slab.len() < self.cfg.max_sessions as usize {
             self.slab.push(fresh);
             (self.slab.len() - 1) as u32
+        } else if self.cfg.early_drop && self.drop_early(now_ns) {
+            let i = self.free.pop().expect("a slot was just freed");
+            let generation = self.slab[i as usize].generation;
+            self.slab[i as usize] = Session {
+                generation,
+                ..fresh
+            };
+            i
         } else {
             return None;
         };
@@ -569,8 +648,36 @@ impl SessionTable {
         Track::Ok { idx, dir }
     }
 
+    /// Which [`AppTimeout`] a new session falls under (index + 1), or 0.
+    fn app_of(&self, key: FlowKey, lo_to_hi: bool) -> u8 {
+        if self.cfg.apps.is_empty() {
+            return 0;
+        }
+        let server_port = if lo_to_hi { key.hi_port } else { key.lo_port };
+        self.cfg
+            .apps
+            .iter()
+            .take(MAX_APP_TIMEOUTS)
+            .position(|a| a.proto == key.proto && (a.ports.0..=a.ports.1).contains(&server_port))
+            .map_or(0, |i| i as u8 + 1)
+    }
+
     fn timeout_secs(&self, s: &Session) -> u64 {
         let t = &self.cfg.timeouts;
+        if let Some(a) = (s.app as usize)
+            .checked_sub(1)
+            .and_then(|i| self.cfg.apps.get(i))
+        {
+            match s.state {
+                State::Established => return a.idle_secs,
+                State::New | State::SynSent | State::SynReceived => {
+                    if let Some(u) = a.unanswered_secs {
+                        return u;
+                    }
+                }
+                _ => {}
+            }
+        }
         match s.key.proto {
             eph_packet::ipv4::PROTO_TCP => match s.state {
                 State::SynSent | State::SynReceived | State::New => t.tcp_handshake,
@@ -590,13 +697,16 @@ impl SessionTable {
         s.last_seen_ns + self.timeout_secs(s) * NS
     }
 
-    /// Put `idx` in the wheel slot for second `at_ns` (clamped to one turn).
+    /// Put `idx` in the wheel slot for second `at_ns` (clamped to one turn
+    /// from now: the wheel may be behind if `expire` wasn't called for a
+    /// while, and a slot behind now would only come round a turn later).
     fn schedule(&mut self, idx: u32, at_ns: u64, now_ns: u64) {
         if !self.wheel_started {
             self.wheel_started = true;
             self.wheel_sec = now_ns / NS;
         }
-        let sec = (at_ns / NS).clamp(self.wheel_sec, self.wheel_sec + WHEEL_SLOTS - 1);
+        let base = self.wheel_sec.max(now_ns / NS);
+        let sec = (at_ns / NS).clamp(base, base + WHEEL_SLOTS - 1);
         let generation = self.slab[idx as usize].generation;
         self.wheel[(sec % WHEEL_SLOTS) as usize].push((idx, generation));
     }
@@ -631,6 +741,7 @@ impl SessionTable {
                 }
                 let at = self.expiry_ns(idx);
                 if at <= now_ns {
+                    self.note_if_unanswered(idx, now_ns);
                     self.remove(idx);
                     removed += 1;
                 } else {
@@ -683,6 +794,62 @@ impl SessionTable {
             self.nat_active += 1;
         }
         true
+    }
+
+    /// Count (and, while asked, keep for tracing) a session that's going
+    /// without ever having been answered.
+    fn note_if_unanswered(&mut self, idx: u32, now_ns: u64) {
+        let s = &self.slab[idx as usize];
+        if s.packets[Dir::Reverse as usize] != 0 {
+            return;
+        }
+        self.unanswered += 1;
+        if self.log_unanswered && self.unanswered_log.len() < UNANSWERED_LOG_MAX {
+            let (initiator, responder) = s.endpoints();
+            self.unanswered_log.push(Unanswered {
+                proto: s.key.proto,
+                initiator,
+                responder,
+                ingress: s.ingress[Dir::Forward as usize],
+                packets: s.packets[Dir::Forward as usize],
+                age_secs: now_ns.saturating_sub(s.created_ns) / NS,
+                nat: s.nat.map(|n| (n.addr, n.port)),
+            });
+        }
+    }
+
+    /// The table is full: drop the session that's due soonest among those
+    /// that never got an answer or are closing (TCP), looking at most at
+    /// [`EARLY_DROP_SCAN`] timer entries. False if there's none: established
+    /// conversations are never dropped to make room.
+    fn drop_early(&mut self, now_ns: u64) -> bool {
+        let Some(idx) = self.early_drop_victim() else {
+            return false;
+        };
+        self.note_if_unanswered(idx, now_ns);
+        self.remove(idx);
+        self.early_dropped += 1;
+        true
+    }
+
+    fn early_drop_victim(&self) -> Option<u32> {
+        let mut seen = 0;
+        for k in 0..WHEEL_SLOTS {
+            let slot = ((self.wheel_sec + k) % WHEEL_SLOTS) as usize;
+            for &(idx, generation) in &self.wheel[slot] {
+                let s = &self.slab[idx as usize];
+                let droppable = s.packets[Dir::Reverse as usize] == 0
+                    || matches!(s.state, State::FinWait | State::TimeWait | State::Closed);
+                if s.alive && s.generation == generation && droppable {
+                    return Some(idx);
+                }
+                seen += 1;
+                if seen >= EARLY_DROP_SCAN {
+                    return None;
+                }
+            }
+        }
+        None
     }
 
     fn remove(&mut self, idx: u32) {
@@ -811,8 +978,8 @@ mod tests {
         }
         assert!(t.tcp_closing <= MAX_CLOSING_SECS && t.tcp_closed <= MAX_CLOSING_SECS);
 
-        // An established TCP session idle for an hour is gone; a closed one
-        // within seconds; one still passing traffic stays.
+        // An established TCP session idle for 2 h 4 min is gone; a closed
+        // one within seconds; one still passing traffic stays.
         let mut tb = table();
         let s = 1_000_000_000u64;
         let (k, fwd) = FlowKey::new(ip("10.0.1.10"), 40000, ip("10.0.2.10"), 80, PROTO_TCP);
@@ -825,12 +992,12 @@ mod tests {
         assert_eq!(tb.get(closed).state, State::Closed);
         tb.expire(30 * s);
         assert_eq!(tb.len(), 2, "closed: gone within its 10 s");
-        for t in (60..3600).step_by(60) {
+        for t in (60..7440).step_by(60) {
             tb.update(busy, f2, TCP_ACK, 60, t * s);
             tb.expire(t * s);
         }
-        tb.expire(3601 * s);
-        assert!(tb.lookup(&k).is_none(), "idle an hour: gone");
+        tb.expire(7441 * s);
+        assert!(tb.lookup(&k).is_none(), "idle 2 h 4 min: gone");
         assert!(tb.lookup(&k2).is_some(), "still in use: kept");
         let _ = idle;
     }
@@ -861,6 +1028,7 @@ mod tests {
     #[test]
     fn table_full_and_slot_reuse() {
         let mut t = table();
+        t.cfg.early_drop = false;
         for p in 0..4 {
             let (k, d) = FlowKey::new(ip("10.0.1.10"), 1000 + p, ip("10.0.2.10"), 53, PROTO_UDP);
             t.create(k, d, 0, 60, 0).unwrap();
@@ -895,12 +1063,95 @@ mod tests {
     fn long_idle_gap_does_not_lose_sessions() {
         let mut t = table();
         let (k, d) = FlowKey::new(ip("10.0.1.10"), 40000, ip("10.0.2.10"), 80, PROTO_TCP);
-        let i = t.create(k, d, TCP_ACK, 60, 0).unwrap(); // picked up: 3600 s timeout
+        let i = t.create(k, d, TCP_ACK, 60, 0).unwrap(); // picked up: 7440 s timeout
         assert_eq!(t.get(i).state, State::Established);
         // Called rarely and far beyond one wheel turn (1024 s).
         assert_eq!(t.expire(3000 * NS), 0);
-        assert_eq!(t.expire(3599 * NS), 0);
-        assert_eq!(t.expire(3602 * NS), 1);
+        assert_eq!(t.expire(7439 * NS), 0);
+        assert_eq!(t.expire(7442 * NS), 1);
+    }
+
+    #[test]
+    fn application_timeouts_replace_the_protocols() {
+        let mut t = SessionTable::new(SessionConfig {
+            apps: Arc::from([
+                AppTimeout {
+                    proto: PROTO_UDP,
+                    ports: (53, 53),
+                    idle_secs: 5,
+                    unanswered_secs: Some(3),
+                },
+                AppTimeout {
+                    proto: PROTO_UDP,
+                    ports: (3478, 3481),
+                    idle_secs: 600,
+                    unanswered_secs: None,
+                },
+            ]),
+            ..Default::default()
+        });
+        let udp =
+            |sport, dport| FlowKey::new(ip("10.0.1.10"), sport, ip("8.8.8.8"), dport, PROTO_UDP);
+        let (dns, d) = udp(5000, 53);
+        let dns_i = t.create(dns, d, 0, 60, 0).unwrap();
+        let (stun, d2) = udp(5001, 3479);
+        let stun_i = t.create(stun, d2, 0, 60, 0).unwrap();
+        let (other, d3) = udp(5002, 443);
+        t.create(other, d3, 0, 60, 0).unwrap();
+        // Unanswered: DNS after its 3 s, STUN and the rest after UDP's 30 s.
+        assert_eq!(t.expire(4 * NS), 1);
+        assert!(t.lookup(&dns).is_none());
+        // Answered: STUN keeps 10 minutes, not UDP's stream 3.
+        t.update(stun_i, !d2, 0, 60, 10 * NS);
+        assert_eq!(t.expire(31 * NS), 1, "the other one");
+        assert_eq!(t.expire(400 * NS), 0);
+        assert_eq!(t.expire(611 * NS), 1);
+        let _ = dns_i;
+        // The client's port doesn't count, only the server's.
+        let (k, d) = FlowKey::new(ip("10.0.1.10"), 53, ip("8.8.8.8"), 9999, PROTO_UDP);
+        let i = t.create(k, d, 0, 60, 611 * NS).unwrap();
+        assert_eq!(t.get(i).app, 0);
+    }
+
+    #[test]
+    fn unanswered_sessions_are_counted_and_kept_for_tracing() {
+        let mut t = table();
+        t.log_unanswered = true;
+        let (k, d) = FlowKey::new(ip("10.0.1.10"), 5000, ip("8.8.8.8"), 53, PROTO_UDP);
+        let i = t.create(k, d, 0, 60, 0).unwrap();
+        t.update(i, d, 0, 60, NS);
+        let (k2, d2) = FlowKey::new(ip("10.0.1.10"), 5001, ip("8.8.8.8"), 53, PROTO_UDP);
+        let j = t.create(k2, d2, 0, 60, 0).unwrap();
+        t.update(j, !d2, 0, 60, NS); // answered
+        t.expire(200 * NS);
+        assert_eq!((t.expired, t.unanswered), (2, 1));
+        let u = t.unanswered_log[0];
+        assert_eq!(u.initiator, (ip("10.0.1.10"), 5000));
+        assert_eq!(u.responder, (ip("8.8.8.8"), 53));
+        assert_eq!(u.packets, 2);
+        assert_eq!(t.unanswered_log.len(), 1);
+    }
+
+    #[test]
+    fn early_drop_takes_the_unanswered_due_soonest() {
+        let mut t = table(); // room for 4
+        let udp = |p| FlowKey::new(ip("10.0.1.10"), p, ip("8.8.8.8"), 53, PROTO_UDP);
+        let mut ids = vec![];
+        for (n, p) in [1000, 1001, 1002, 1003].into_iter().enumerate() {
+            let (k, d) = udp(p);
+            ids.push(t.create(k, d, 0, 60, n as u64 * NS).unwrap());
+        }
+        // 1000 and 1002 got answers; of the others, 1001 is due first.
+        t.update(ids[0], !udp(1000).1, 0, 60, 5 * NS);
+        t.update(ids[2], !udp(1002).1, 0, 60, 5 * NS);
+        let (k, d) = udp(2000);
+        assert!(t.create(k, d, 0, 60, 6 * NS).is_some());
+        assert!(
+            t.lookup(&udp(1001).0).is_none(),
+            "the oldest unanswered went"
+        );
+        assert!(t.lookup(&udp(1003).0).is_some());
+        assert_eq!((t.early_dropped, t.unanswered), (1, 1));
     }
 }
 

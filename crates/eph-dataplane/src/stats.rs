@@ -82,10 +82,17 @@ pub enum DropReason {
     ControlQueueFull,
     /// SSH or portal traffic handed to the router's own host (see `host`).
     ToHost,
+    /// A reply to a NAT address and port with no session: it expired, or
+    /// was never made (a stray, or a scan).
+    NatNoSession,
+    /// A reply to a NAT port another worker owns: the network card sent it
+    /// to the wrong queue. Replies need steering (see chapter 13), or one
+    /// worker.
+    NatWrongWorker,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 36] = [
+    pub const ALL: [DropReason; 38] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -122,6 +129,8 @@ impl DropReason {
         DropReason::PppoeToControl,
         DropReason::ControlQueueFull,
         DropReason::ToHost,
+        DropReason::NatNoSession,
+        DropReason::NatWrongWorker,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -163,6 +172,8 @@ impl DropReason {
             DropReason::PppoeToControl => "pppoe-to-control",
             DropReason::ControlQueueFull => "control-queue-full",
             DropReason::ToHost => "to-host",
+            DropReason::NatNoSession => "nat-no-session",
+            DropReason::NatWrongWorker => "nat-wrong-worker",
         }
     }
 }
@@ -177,6 +188,10 @@ pub struct Stats {
     pub sessions_active: u64,
     pub sessions_created: u64,
     pub sessions_expired: u64,
+    /// Of those, the ones that never got a single packet back.
+    pub sessions_unanswered: u64,
+    /// Dropped early to make room in a full table.
+    pub sessions_early_dropped: u64,
     /// TCP segments whose sequence number didn't fit their connection (any
     /// RST or FIN in them was ignored).
     pub tcp_blind: u64,
@@ -207,6 +222,8 @@ impl Default for Stats {
             sessions_active: 0,
             sessions_created: 0,
             sessions_expired: 0,
+            sessions_unanswered: 0,
+            sessions_early_dropped: 0,
             tcp_blind: 0,
             arp_conflicts: 0,
             drops: [0; DropReason::COUNT],

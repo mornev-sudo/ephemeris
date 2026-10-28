@@ -520,6 +520,37 @@ pub struct SessionsCfg {
     pub udp_timeout_secs: u64,
     pub udp_stream_timeout_secs: u64,
     pub icmp_timeout_secs: u64,
+    /// TCP after a FIN (until both sides closed), and after both FINs or a
+    /// reset (stray retransmits).
+    pub tcp_closing_timeout_secs: u64,
+    pub tcp_closed_timeout_secs: u64,
+    /// Every other IP protocol (GRE, ESP, ...).
+    pub other_timeout_secs: u64,
+    /// Table full: drop a session that never got an answer (or a closing
+    /// TCP one) to make room, instead of refusing the new session.
+    pub early_drop: bool,
+    /// Per-application timeouts (`[[sessions.timeout]]`), first match wins.
+    #[serde(rename = "timeout", skip_serializing_if = "Vec::is_empty")]
+    pub app_timeouts: Vec<AppTimeoutCfg>,
+}
+
+/// `[[sessions.timeout]]`: timeouts for sessions to some server ports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppTimeoutCfg {
+    /// What it's for, e.g. "dns" (shown in the portal, nothing else).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// "tcp" or "udp".
+    pub protocol: String,
+    /// The server port, or a range: "53", "3478-3481".
+    pub ports: String,
+    /// Idle timeout once answered (TCP: established).
+    pub idle_secs: u64,
+    /// Idle timeout before the first answer (TCP: the handshake), if not
+    /// the protocol's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unanswered_secs: Option<u64>,
 }
 
 /// `sessions.max_per_worker`: a fixed size, or sized from memory.
@@ -590,14 +621,60 @@ impl Default for SessionsCfg {
             udp_timeout_secs: s.timeouts.udp,
             udp_stream_timeout_secs: s.timeouts.udp_stream,
             icmp_timeout_secs: s.timeouts.icmp,
+            tcp_closing_timeout_secs: s.timeouts.tcp_closing,
+            tcp_closed_timeout_secs: s.timeouts.tcp_closed,
+            other_timeout_secs: s.timeouts.other,
+            early_drop: s.early_drop,
+            app_timeouts: vec![],
         }
     }
 }
 
 impl SessionsCfg {
+    /// `[[sessions.timeout]]` in the data plane's form.
+    pub fn app_timeouts(&self) -> Result<Vec<eph_dataplane::AppTimeout>> {
+        if self.app_timeouts.len() > eph_dataplane::MAX_APP_TIMEOUTS {
+            bail!(
+                "at most {} [[sessions.timeout]] entries",
+                eph_dataplane::MAX_APP_TIMEOUTS
+            );
+        }
+        self.app_timeouts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let what = || match &a.name {
+                    Some(n) => format!("sessions.timeout {n:?}"),
+                    None => format!("sessions.timeout #{}", i + 1),
+                };
+                let proto = match a.protocol.as_str() {
+                    "tcp" => eph_packet::ipv4::PROTO_TCP,
+                    "udp" => eph_packet::ipv4::PROTO_UDP,
+                    p => bail!("{}: protocol {p:?} must be \"tcp\" or \"udp\"", what()),
+                };
+                let (lo, hi) = a.ports.split_once('-').unwrap_or((&a.ports, &a.ports));
+                let ports = match (lo.trim().parse::<u16>(), hi.trim().parse::<u16>()) {
+                    (Ok(lo), Ok(hi)) if lo <= hi && lo > 0 => (lo, hi),
+                    _ => bail!("{}: ports must be like \"53\" or \"3478-3481\"", what()),
+                };
+                if a.idle_secs == 0 || a.unanswered_secs == Some(0) {
+                    bail!("{}: timeouts must be at least 1 second", what());
+                }
+                Ok(eph_dataplane::AppTimeout {
+                    proto,
+                    ports,
+                    idle_secs: a.idle_secs.min(eph_dataplane::MAX_IDLE_SECS),
+                    unanswered_secs: a
+                        .unanswered_secs
+                        .map(|u| u.min(eph_dataplane::MAX_IDLE_SECS)),
+                })
+            })
+            .collect()
+    }
+
     /// The data plane's settings, for tables of `max_sessions` (the
     /// configured size, or what `memory::plan` worked out for "auto"). No
-    /// session may sit idle for more than an hour
+    /// session may sit idle for more than a day
     /// ([`eph_dataplane::MAX_IDLE_SECS`]): longer timeouts are capped.
     pub fn to_config(&self, max_sessions: u32) -> SessionConfig {
         let cap = |name: &str, v: u64| {
@@ -624,8 +701,15 @@ impl SessionsCfg {
                 udp: cap("udp_timeout_secs", self.udp_timeout_secs),
                 udp_stream: cap("udp_stream_timeout_secs", self.udp_stream_timeout_secs),
                 icmp: cap("icmp_timeout_secs", self.icmp_timeout_secs),
-                ..Timeouts::default()
+                tcp_closing: cap("tcp_closing_timeout_secs", self.tcp_closing_timeout_secs)
+                    .min(eph_dataplane::MAX_CLOSING_SECS),
+                tcp_closed: cap("tcp_closed_timeout_secs", self.tcp_closed_timeout_secs)
+                    .min(eph_dataplane::MAX_CLOSING_SECS),
+                other: cap("other_timeout_secs", self.other_timeout_secs),
             },
+            // Checked by `validate`, so nothing is lost here.
+            apps: self.app_timeouts().unwrap_or_default().into(),
+            early_drop: self.early_drop,
         }
     }
 }
@@ -795,7 +879,7 @@ impl Config {
                 );
             }
         }
-        // Timeouts above an hour are capped when applied (`to_config`), not
+        // Timeouts above a day are capped when applied (`to_config`), not
         // refused: a config saved by an older release must still start.
         let s = &self.sessions;
         for (name, v) in [
@@ -807,11 +891,15 @@ impl Config {
             ("udp_timeout_secs", s.udp_timeout_secs),
             ("udp_stream_timeout_secs", s.udp_stream_timeout_secs),
             ("icmp_timeout_secs", s.icmp_timeout_secs),
+            ("tcp_closing_timeout_secs", s.tcp_closing_timeout_secs),
+            ("tcp_closed_timeout_secs", s.tcp_closed_timeout_secs),
+            ("other_timeout_secs", s.other_timeout_secs),
         ] {
             if v == 0 {
                 bail!("sessions.{name} must be at least 1");
             }
         }
+        self.sessions.app_timeouts()?;
         if self.management.enabled {
             self.management
                 .listen
@@ -1781,20 +1869,68 @@ mod tests {
     }
 
     #[test]
-    fn session_timeouts_are_capped_at_an_hour() {
+    fn session_timeouts_are_capped_at_a_day() {
         let text = include_str!("../../../config/ephemeris.example.toml");
         let mut c = parse(text).unwrap();
-        // A config from an older release with a long timeout still loads...
-        c.sessions.tcp_established_timeout_secs = 86_400;
-        c.sessions.udp_stream_timeout_secs = 7_200;
+        // A config with a very long timeout still loads...
+        c.sessions.tcp_established_timeout_secs = 7 * 86_400;
+        c.sessions.udp_stream_timeout_secs = 2 * 86_400;
         c.validate().unwrap();
-        // ...but no session stays idle for more than an hour.
+        // ...but no session stays idle for more than a day.
         let t = c.sessions.to_config(1000).timeouts;
         assert_eq!(t.tcp_established, eph_dataplane::MAX_IDLE_SECS);
         assert_eq!(t.udp_stream, eph_dataplane::MAX_IDLE_SECS);
         assert_eq!(t.udp, 30, "shorter ones are left alone");
         c.sessions.icmp_timeout_secs = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn per_application_session_timeouts() {
+        let base = include_str!("../../../config/ephemeris.example.toml");
+        let with = |t: &str| parse(&format!("{base}\n{t}")).and_then(|c| c.validate().map(|_| c));
+        let c = with(
+            r#"
+[[sessions.timeout]]
+name = "dns"
+protocol = "udp"
+ports = "53"
+idle_secs = 10
+unanswered_secs = 5
+
+[[sessions.timeout]]
+protocol = "udp"
+ports = "3478-3481"
+idle_secs = 600
+"#,
+        )
+        .unwrap();
+        let apps = c.sessions.to_config(1000).apps;
+        assert_eq!(apps.len(), 2);
+        assert_eq!(
+            apps[0],
+            eph_dataplane::AppTimeout {
+                proto: 17,
+                ports: (53, 53),
+                idle_secs: 10,
+                unanswered_secs: Some(5)
+            }
+        );
+        assert_eq!(
+            (apps[1].ports, apps[1].unanswered_secs),
+            ((3478, 3481), None)
+        );
+        for bad in [
+            "protocol = \"icmp\"\nports = \"1\"\nidle_secs = 1",
+            "protocol = \"udp\"\nports = \"60-50\"\nidle_secs = 1",
+            "protocol = \"udp\"\nports = \"dns\"\nidle_secs = 1",
+            "protocol = \"udp\"\nports = \"53\"\nidle_secs = 0",
+        ] {
+            assert!(
+                with(&format!("[[sessions.timeout]]\n{bad}")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     const DHCP_CFG: &str = r#"

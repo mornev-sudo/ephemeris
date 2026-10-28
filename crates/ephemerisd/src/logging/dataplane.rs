@@ -77,7 +77,26 @@ pub fn emit(ev: &TraceEvent, ports: &[Port], worker: usize) {
     let f = &ev.flow;
     let cat = ev.cat();
     match ev.kind {
-        TraceKind::Drop(r) => at!(cat, worker, "drop {}: {} in {on}", r.name(), flow(f)),
+        TraceKind::Drop(r) => at!(
+            cat,
+            worker,
+            "drop {}: {} in {on}{}",
+            r.name(),
+            flow(f),
+            drop_hint(r)
+        ),
+        TraceKind::Unanswered {
+            packets,
+            age_secs,
+            nat,
+        } => at!(
+            cat,
+            worker,
+            "no answer: {} in {on}, {packets} packet(s) out and none back in {age_secs} s{}",
+            flow(f),
+            nat.map(|(a, p)| format!(", sent as {a}:{p}"))
+                .unwrap_or_default()
+        ),
         TraceKind::SessionNew => at!(cat, worker, "new session: {} in {on}", flow(f)),
         TraceKind::NatBound { addr, port } => {
             at!(
@@ -112,6 +131,19 @@ pub fn emit(ev: &TraceEvent, ports: &[Port], worker: usize) {
             f.src,
             flow(f)
         ),
+    }
+}
+
+/// What a drop reason that needs explaining means, for its log line.
+fn drop_hint(r: eph_dataplane::DropReason) -> &'static str {
+    use eph_dataplane::DropReason::*;
+    match r {
+        NatWrongWorker => {
+            " (a reply that arrived at a worker other than the one that owns its NAT \
+             port: the network card's queue choice; see chapter 13)"
+        }
+        NatNoSession => " (a reply to a NAT port with no session: expired, or never made)",
+        _ => "",
     }
 }
 

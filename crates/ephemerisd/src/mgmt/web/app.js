@@ -184,7 +184,8 @@ async function refreshDash() {
   }));
   // The same four numbers as the Reporting graphs (last 5 s).
   $("cards").replaceChildren(
-    card("Open sessions", n(s.sessions.active), n(s.sessions.created) + " created · " + n(s.sessions.expired) + " expired"),
+    card("Open sessions", n(s.sessions.active), n(s.sessions.created) + " created · " + n(s.sessions.expired) + " expired, " +
+      n(s.sessions.unanswered) + " of them never answered" + (s.sessions.early_dropped ? " · " + n(s.sessions.early_dropped) + " dropped early" : "")),
     card("Packets per second", r ? pps(r.rx_pps + r.tx_pps) : "–", r ? `in ${pps(r.rx_pps)} · out ${pps(r.tx_pps)}` : "measuring…"),
     card("Throughput", r ? bps(r.rx_bps + r.tx_bps) : "–", r ? `in ${bps(r.rx_bps)} · out ${bps(r.tx_bps)}` : "measuring…"),
     card("Dropped packets", n(s.drops_total), r ? `${pps(r.drops_per_sec)} now · see Drops by reason` : "see Drops by reason"));
@@ -731,12 +732,24 @@ function renderCfg() {
     { key: "max_per_worker", label: "Sessions per worker", placeholder: "auto", optional: true,
       help: "\"auto\" sizes the tables from the memory free at start, or a number. Reserved up front, about 300 bytes each." },
     { key: "tcp_strict", label: "Strict TCP (only a SYN may open a session)", type: "check" },
-    { key: "tcp_handshake_timeout_secs", max: 3600, label: "TCP handshake timeout (s)", type: "number", min: 1 },
-    { key: "tcp_established_timeout_secs", max: 3600, label: "TCP established timeout (s)", type: "number", min: 1 },
-    { key: "udp_timeout_secs", max: 3600, label: "UDP timeout (s)", type: "number", min: 1 },
-    { key: "udp_stream_timeout_secs", max: 3600, label: "UDP stream timeout (s)", type: "number", min: 1 },
-    { key: "icmp_timeout_secs", max: 3600, label: "ICMP timeout (s)", type: "number", min: 1 },
+    { key: "tcp_handshake_timeout_secs", max: 86400, label: "TCP handshake timeout (s)", type: "number", min: 1 },
+    { key: "tcp_established_timeout_secs", max: 86400, label: "TCP established timeout (s)", type: "number", min: 1 },
+    { key: "udp_timeout_secs", max: 86400, label: "UDP timeout (s)", type: "number", min: 1 },
+    { key: "udp_stream_timeout_secs", max: 86400, label: "UDP stream timeout (s)", type: "number", min: 1 },
+    { key: "icmp_timeout_secs", max: 86400, label: "ICMP timeout (s)", type: "number", min: 1 },
+    { key: "tcp_closing_timeout_secs", max: 600, label: "TCP closing timeout (s)", type: "number", min: 1 },
+    { key: "tcp_closed_timeout_secs", max: 600, label: "TCP closed timeout (s)", type: "number", min: 1 },
+    { key: "other_timeout_secs", max: 86400, label: "Other protocols timeout (s)", type: "number", min: 1 },
+    { key: "early_drop", label: "Table full: drop unanswered sessions to make room", type: "check" },
   ]);
+  cfg.sessions.timeout = cfg.sessions.timeout || [];
+  formTable($("f-sesstimeouts"), cfg.sessions.timeout, [
+    { key: "name", label: "Name", placeholder: "dns", optional: true },
+    { key: "protocol", label: "Protocol", type: "select", options: [["udp", "UDP"], ["tcp", "TCP"]], empty: "udp" },
+    { key: "ports", label: "Server ports", placeholder: "53 or 3478-3481" },
+    { key: "idle_secs", label: "Idle once answered (s)", type: "number", min: 1 },
+    { key: "unanswered_secs", label: "Before an answer (s)", type: "number", min: 1, optional: true, placeholder: "the protocol's" },
+  ], () => ({ name: null, protocol: "udp", ports: "", idle_secs: 60, unanswered_secs: null }), "Add timeout");
   formFields($("f-dp"), cfg.dataplane, [
     { key: "workers", label: "Worker threads (one per NIC queue)", type: "number", min: 1 },
     { key: "xdp_mode", label: "XDP mode", type: "select", options: [["auto", "auto"], ["native", "native"], ["generic", "generic"]] },

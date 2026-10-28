@@ -86,9 +86,10 @@ the packet categories are also **bits in the data plane**
 - **Off costs one bit test.** With the bit clear, nothing else happens.
 - **On**, the pipeline records a small fixed-size event at the points
   that explain a packet's fate: every drop with its reason, a new
-  session, a NAT translation, a neighbour learned or changed, an ARP
-  request, an ICMP error sent. The worker turns the events into lines
-  after each batch.
+  session, a NAT translation, a reply that found no NAT session, a
+  session that expired without an answer, a neighbour learned or changed,
+  an ARP request, an ICMP error sent. The worker turns the events into
+  lines after each batch.
 - **A host filter**, like a router's conditional debug: only packets to
   or from one address or prefix.
 - **A rate limit**: 100 events a second per worker by default

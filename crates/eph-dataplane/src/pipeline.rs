@@ -244,10 +244,14 @@ impl Pipeline {
     /// Periodic work outside the per-packet path: expire idle sessions,
     /// refresh counters, send overlay probes. Called once per worker loop.
     pub fn housekeeping(&mut self) {
+        self.sessions.log_unanswered = self.tracer.on(TraceCat::Session);
         self.sessions.expire(self.now_ns);
+        self.trace_unanswered();
         self.stats.sessions_active = self.sessions.len() as u64;
         self.stats.sessions_created = self.sessions.created;
         self.stats.sessions_expired = self.sessions.expired;
+        self.stats.sessions_unanswered = self.sessions.unanswered;
+        self.stats.sessions_early_dropped = self.sessions.early_dropped;
         self.stats.tcp_blind = self.sessions.blind;
         if self.now_ns >= self.next_neighbor_sweep_ns {
             let now = self.now_ns;
@@ -258,6 +262,32 @@ impl Pipeline {
         if self.prober && self.overlay.enabled() && self.now_ns >= self.next_probe_ns {
             self.send_probes();
             self.next_probe_ns = self.now_ns + overlay::PROBE_INTERVAL_NS;
+        }
+    }
+
+    /// Sessions that expired (or were dropped early) without an answer,
+    /// while a session trace is on: what was tried, and how it went out.
+    fn trace_unanswered(&mut self) {
+        let now = self.now_ns;
+        for u in std::mem::take(&mut self.sessions.unanswered_log) {
+            let flow = TraceFlow {
+                proto: u.proto,
+                src: u.initiator.0,
+                dst: u.responder.0,
+                sport: u.initiator.1,
+                dport: u.responder.1,
+            };
+            let kind = TraceKind::Unanswered {
+                packets: u.packets.min(u32::MAX as u64) as u32,
+                age_secs: u.age_secs.min(u32::MAX as u64) as u32,
+                nat: u.nat,
+            };
+            // Out of a tether (no interface): reported as the first.
+            let port = u
+                .ingress
+                .filter(|&p| (p as usize) < self.ports.len())
+                .unwrap_or(0);
+            self.tracer.record(now, TraceCat::Session, kind, port, flow);
         }
     }
 
@@ -1350,7 +1380,7 @@ impl Pipeline {
             && frame[l4] == icmp::ECHO_REQUEST
             && checksum::checksum(&frame[l4..off + len]) == 0;
         if !is_echo {
-            return Verdict::Drop(DropReason::LocalUnhandled);
+            return Verdict::Drop(self.nat_miss(ingress, frame, off, len, h));
         }
         if !self.take_icmp_token() {
             return Verdict::Drop(DropReason::IcmpRateLimited);
@@ -1366,6 +1396,42 @@ impl Pipeline {
         ip[10..12].copy_from_slice(&c.to_be_bytes());
         icmp::echo_request_to_reply(&mut frame[l4..off + len]);
         self.output(frame, off, len, h.src)
+    }
+
+    /// Why a packet for the router that it has no use for stops here: a reply
+    /// to a NAT port without a session (expired, never made, or on the
+    /// wrong worker), or else plainly unhandled. NAT ports are 1024 and up
+    /// (and ICMP echo identifiers); worker w of n owns those where
+    /// `port % n == w` (see `alloc_nat`).
+    fn nat_miss(
+        &self,
+        ingress: PortId,
+        frame: &[u8],
+        off: usize,
+        len: usize,
+        h: &ipv4::Header,
+    ) -> DropReason {
+        let l4 = off + ETH + h.hdr_len;
+        let nat_port = match h.proto {
+            ipv4::PROTO_TCP | ipv4::PROTO_UDP if len >= l4 - off + 4 => {
+                Some(u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]])).filter(|&p| p >= 1024)
+            }
+            ipv4::PROTO_ICMP if len >= l4 - off + 8 && frame[l4] == icmp::ECHO_REPLY => {
+                Some(u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]))
+            }
+            _ => None,
+        };
+        let outside = self.ports[ingress as usize].role == Role::Outside;
+        match nat_port {
+            Some(p) if outside && self.nat.active() => {
+                if self.workers > 1 && p % self.workers != self.worker_id {
+                    DropReason::NatWrongWorker
+                } else {
+                    DropReason::NatNoSession
+                }
+            }
+            _ => DropReason::LocalUnhandled,
+        }
     }
 
     /// SSH or the portal on an inside port's own address: hand the packet to

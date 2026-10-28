@@ -166,6 +166,8 @@ pub struct Summary {
     pub sessions_active: u64,
     pub sessions_created: u64,
     pub sessions_expired: u64,
+    pub sessions_unanswered: u64,
+    pub sessions_early_dropped: u64,
     pub tcp_blind: u64,
     pub arp_conflicts: u64,
     pub sessions: Vec<SessionView>,
@@ -211,6 +213,8 @@ impl Summary {
             s.sessions_active += r.stats.sessions_active;
             s.sessions_created += r.stats.sessions_created;
             s.sessions_expired += r.stats.sessions_expired;
+            s.sessions_unanswered += r.stats.sessions_unanswered;
+            s.sessions_early_dropped += r.stats.sessions_early_dropped;
             s.tcp_blind += r.stats.tcp_blind;
             s.arp_conflicts += r.stats.arp_conflicts;
             if s.ports.len() < r.stats.ports.len() {
