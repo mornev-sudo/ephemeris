@@ -2,7 +2,7 @@
 //! Portable (no Linux types) so the management code builds and tests anywhere.
 
 use eph_dataplane::nat::NatConfig;
-use eph_dataplane::overlay::{PathTable, TetherStats};
+use eph_dataplane::overlay::{KeyTable, PathTable, TetherId, TetherStats};
 use eph_dataplane::{Dir, Neighbor, NextHop, Port, PortId, Session, Stats};
 use eph_fib::Fib;
 use std::fmt;
@@ -29,6 +29,15 @@ pub enum Control {
     InjectHost(Vec<u8>),
     /// Send this frame out of `port` (DHCP replies and requests).
     Transmit { port: PortId, frame: Vec<u8> },
+    /// New SD-WAN session keys.
+    SetKeys(Arc<KeyTable>),
+    /// Send an SD-WAN handshake message on a tether (to `to`, or else to its
+    /// peer).
+    Handshake {
+        tether: TetherId,
+        to: Option<(std::net::Ipv4Addr, u16)>,
+        payload: Vec<u8>,
+    },
 }
 
 /// AF_XDP socket counters kept by the kernel.

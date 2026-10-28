@@ -3,7 +3,8 @@ use crate::filter;
 use crate::host;
 use crate::nat::{self, NatConfig};
 use crate::overlay::{
-    self, Endpoints, Overlay, PathTable, ReplayGuard, TetherId, TetherStats, OUTER_LEN, TAG_LEN,
+    self, Endpoints, KeyTable, Overlay, PathTable, PeerCrypto, ReplayGuard, TetherId, TetherKey,
+    TetherStats, OUTER_LEN, TAG_LEN,
 };
 use crate::session::{
     Dir, FlowKey, NatBinding, SessionConfig, SessionTable, TcpSegment, Track, OVERLAY_INGRESS,
@@ -33,8 +34,9 @@ pub enum Verdict {
     },
 }
 
-/// Largest frame the router generates on its own (ARP, overlay probes).
-pub const EMIT_MAX: usize = 128;
+/// Largest frame the router generates on its own (ARP, overlay probes and
+/// handshakes, with room for a VLAN tag and a PPPoE header).
+pub const EMIT_MAX: usize = 256;
 
 /// A frame the router generated on its own, to be copied into a free buffer
 /// and sent. Fixed-size, so producing one never allocates.
@@ -52,6 +54,18 @@ pub struct Punt {
     pub port: PortId,
     /// The whole Ethernet frame.
     pub frame: Vec<u8>,
+}
+
+/// An SD-WAN handshake message for the control plane: the UDP payload (our
+/// header, the Noise message, mac1) and where it came from. Rare, so it may
+/// allocate.
+#[derive(Debug, Clone)]
+pub struct HandshakeIn {
+    /// The tether it arrived on.
+    pub tether: TetherId,
+    pub src: Ipv4Addr,
+    pub sport: u16,
+    pub payload: Vec<u8>,
 }
 
 /// A learned IP → MAC binding on a port.
@@ -88,6 +102,12 @@ const ETH: usize = eth::HDR_LEN;
 /// Control-plane packets queued per batch at most (a DHCP flood can't eat
 /// memory; the worker drains them every loop).
 const PUNT_MAX: usize = 256;
+/// SD-WAN handshake messages handed to the control plane, per worker: each
+/// costs it a key exchange, so a flood can't keep it busy.
+const HANDSHAKE_RATE_PER_SEC: u64 = 20;
+const HANDSHAKE_TOKEN_NS: u64 = 1_000_000_000 / HANDSHAKE_RATE_PER_SEC;
+/// The largest handshake message accepted (an initiation is 129 bytes).
+const HANDSHAKE_MAX: usize = 192;
 
 #[derive(Debug, Clone, Copy)]
 struct NeighborEntry {
@@ -130,6 +150,14 @@ pub struct Pipeline {
     tx_counter: u64,
     /// Received counters, shared by all workers.
     replay: Arc<ReplayGuard>,
+    /// Session keys of sites that use the handshake (from the control plane),
+    /// and per site the session this worker last sealed with and its next
+    /// packet number.
+    keys: Arc<KeyTable>,
+    session_tx: Vec<(u64, u64)>,
+    /// Handshake messages may reach the control plane at this rate.
+    handshake_tokens: u64,
+    handshake_last_refill: u64,
     /// Learned addresses of peers without a fixed one, shared by all workers.
     endpoints: Arc<Endpoints>,
     next_probe_ns: u64,
@@ -153,6 +181,8 @@ pub struct Pipeline {
     pub learned: Vec<Neighbor>,
     /// Packets for the control plane (DHCP); the worker forwards these.
     pub punts: Vec<Punt>,
+    /// SD-WAN handshake messages for the control plane.
+    pub handshakes: Vec<HandshakeIn>,
     /// Packet tracing (debug logging), off unless asked for; the worker
     /// drains `tracer.events`.
     pub tracer: Tracer,
@@ -169,7 +199,8 @@ impl Pipeline {
         overlay: Arc<Overlay>,
     ) -> Self {
         let nports = ports.len();
-        let replay = Arc::new(ReplayGuard::new(overlay.sites.len()));
+        let nsites = overlay.sites.len();
+        let replay = Arc::new(ReplayGuard::new(nsites));
         let endpoints = Arc::new(Endpoints::new(overlay.tethers.len()));
         Pipeline {
             min_mtu: min_mtu(&ports),
@@ -187,6 +218,10 @@ impl Pipeline {
             overlay_run: 0,
             tx_counter: 0,
             replay,
+            keys: Arc::new(KeyTable::default()),
+            session_tx: vec![(0, 0); nsites],
+            handshake_tokens: HANDSHAKE_RATE_PER_SEC,
+            handshake_last_refill: 0,
             endpoints,
             next_probe_ns: 0,
             probe_seq: 0,
@@ -207,6 +242,7 @@ impl Pipeline {
             emits: Vec::with_capacity(64),
             learned: Vec::with_capacity(16),
             punts: Vec::new(),
+            handshakes: Vec::new(),
             tracer: Tracer::default(),
             host_out: Vec::new(),
         }
@@ -325,6 +361,11 @@ impl Pipeline {
         self.overlay_run = run;
         self.tx_counter = 0;
         self.replay = replay;
+    }
+
+    /// New session keys for the sites that use the handshake.
+    pub fn set_keys(&mut self, keys: Arc<KeyTable>) {
+        self.keys = keys;
     }
 
     /// Share one learned-endpoints table between all workers.
@@ -1786,21 +1827,69 @@ impl Pipeline {
         } else {
             (t.remote, self.overlay.udp_port)
         };
+        Some((
+            t.port,
+            remote,
+            dport,
+            self.underlay_next_hop(tether, remote),
+        ))
+    }
+
+    /// Who to send to for `remote` over a tether's WAN: its explicit
+    /// gateway; else the peer itself if it's on the link; else the link's
+    /// gateway (configured, or from DHCP).
+    fn underlay_next_hop(&self, tether: TetherId, remote: Ipv4Addr) -> Ipv4Addr {
+        let t = &self.overlay.tethers[tether as usize];
         let p = &self.ports[t.port as usize];
-        // Explicit gateway; else the peer itself if it's on this link; else
-        // the link's gateway (configured, or from DHCP).
-        let next_hop = t
-            .gateway
+        t.gateway
             .or_else(|| (!p.reaches(remote)).then_some(p.gateway).flatten())
-            .unwrap_or(remote);
-        Some((t.port, remote, dport, next_hop))
+            .unwrap_or(remote)
+    }
+
+    /// Can packets on this tether be sealed now? (A pre-shared key, or a
+    /// confirmed session with its site.)
+    fn can_seal(&self, tether: TetherId) -> bool {
+        let t = &self.overlay.tethers[tether as usize];
+        match self.overlay.crypto(t.site_idx) {
+            PeerCrypto::PreShared => t.key.is_some(),
+            PeerCrypto::Handshake { .. } => self.keys.sending(t.site_idx, self.now_ns).is_some(),
+        }
+    }
+
+    /// The key, header version, key id and packet number to seal the next
+    /// packet on a tether with. `None`: nothing to seal with, or this key's
+    /// packet numbers are used up (a nonce must never repeat).
+    fn next_seal(&mut self, tether: TetherId) -> Option<(TetherKey, u8, u8, u64)> {
+        let t = &self.overlay.tethers[tether as usize];
+        match self.overlay.crypto(t.site_idx) {
+            PeerCrypto::PreShared => {
+                let key = t.key?;
+                if self.tx_counter >= overlay::COUNTER_LIMIT {
+                    return None;
+                }
+                let counter = (self.overlay_run as u64) << 48 | self.tx_counter;
+                self.tx_counter += 1;
+                Some((key, overlay::VERSION, 0, counter))
+            }
+            PeerCrypto::Handshake { .. } => {
+                let s = self.keys.sending(t.site_idx, self.now_ns)?;
+                let next = self.session_tx.get_mut(t.site_idx)?;
+                if next.0 != s.serial {
+                    *next = (s.serial, 0);
+                }
+                if next.1 >= overlay::COUNTER_LIMIT {
+                    return None;
+                }
+                next.1 += 1;
+                Some((s.tx, overlay::VERSION_HANDSHAKE, s.peer_id, next.1 - 1))
+            }
+        }
     }
 
     /// Write Ethernet + IPv4 + UDP + Ephemeris headers at the start of `buf`,
     /// in front of `payload_len` bytes that are already in place, then
     /// encrypt the payload and append the tag. Returns the frame length, or
-    /// `None` if the tether has no key or this run's packet numbers are used
-    /// up (a nonce must never repeat).
+    /// `None` if there's nothing to seal with (see [`Self::next_seal`]).
     #[allow(clippy::too_many_arguments)]
     fn write_outer(
         &mut self,
@@ -1814,12 +1903,7 @@ impl Pipeline {
         tether: TetherId,
         payload_len: usize,
     ) -> Option<usize> {
-        let key = self.overlay.tethers[tether as usize].key?;
-        if self.tx_counter >= overlay::COUNTER_LIMIT {
-            return None;
-        }
-        let counter = (self.overlay_run as u64) << 48 | self.tx_counter;
-        self.tx_counter += 1;
+        let (key, version, key_id, counter) = self.next_seal(tether)?;
         let p = &self.ports[port as usize];
         eth::write(buf, mac, p.mac, eth::TYPE_IPV4);
         self.ip_ident = self.ip_ident.wrapping_add(1);
@@ -1839,11 +1923,12 @@ impl Pipeline {
         buf[u + 4..u + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
         buf[u + 6..u + 8].fill(0); // UDP checksum is optional over IPv4 (the AEAD covers us)
         let mut hdr = [0u8; overlay::HDR_LEN];
-        hdr[0] = (overlay::VERSION << 4) | typ;
+        hdr[0] = (version << 4) | typ;
         hdr[1] = class;
         hdr[2..4].copy_from_slice(&self.overlay.site_id.to_be_bytes());
         hdr[4..6].copy_from_slice(&tether.to_be_bytes());
         hdr[6] = self.worker_id as u8;
+        hdr[7] = key_id;
         hdr[8..16].copy_from_slice(&counter.to_be_bytes());
         let r = u + l4::UDP_HDR_LEN;
         buf[r..r + overlay::HDR_LEN].copy_from_slice(&hdr);
@@ -1887,28 +1972,55 @@ impl Pipeline {
         };
         let dynamic = tethers[tether].remote.is_unspecified();
         let t = &self.overlay.tethers[tether];
-        let (peer_site, site_idx) = (t.peer_site, t.site_idx);
-        let Some(key) = t.key else {
-            return Verdict::Drop(DropReason::OverlayAuth);
-        };
+        let (peer_site, site_idx, psk) = (t.peer_site, t.site_idx, t.key);
+        let tid = tether as TetherId;
         let r = off + OUTER_LEN - overlay::HDR_LEN;
         let hdr: [u8; overlay::HDR_LEN] = frame[r..r + overlay::HDR_LEN].try_into().unwrap();
         let (version, typ) = (hdr[0] >> 4, hdr[0] & 0x0f);
         let site = u16::from_be_bytes([hdr[2], hdr[3]]);
-        if version != overlay::VERSION || site != peer_site {
+        let handshake = matches!(self.overlay.crypto(site_idx), PeerCrypto::Handshake { .. });
+        let want = if handshake {
+            overlay::VERSION_HANDSHAKE
+        } else {
+            overlay::VERSION
+        };
+        if version != want || site != peer_site {
             return Verdict::Drop(DropReason::BadOverlay);
+        }
+        if handshake
+            && matches!(
+                typ,
+                overlay::TYPE_HANDSHAKE_INIT | overlay::TYPE_HANDSHAKE_RESPONSE
+            )
+        {
+            return self.handshake_in(tid, frame, off, len, h);
         }
         // Authenticate (and decrypt) before believing anything else in it.
         let body = off + OUTER_LEN..off + len - TAG_LEN;
         let (payload, tag) = frame[..off + len].split_at_mut(body.end);
-        if !key.open(&hdr, &mut payload[body.clone()], tag) {
-            return Verdict::Drop(DropReason::OverlayAuth);
-        }
         let counter = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
-        if !self.replay.accept(site_idx, hdr[6], counter) {
-            return Verdict::Drop(DropReason::OverlayReplay);
+        if handshake {
+            // The session the sender says it used (byte 7: our id for it).
+            let Some(s) = self.keys.receiving(site_idx, hdr[7], self.now_ns) else {
+                return Verdict::Drop(DropReason::OverlayNoKey);
+            };
+            if !s.rx.open(&hdr, &mut payload[body.clone()], tag) {
+                return Verdict::Drop(DropReason::OverlayAuth);
+            }
+            if !s.accept(hdr[6], counter, self.now_ns) {
+                return Verdict::Drop(DropReason::OverlayReplay);
+            }
+        } else {
+            let Some(key) = psk else {
+                return Verdict::Drop(DropReason::OverlayAuth);
+            };
+            if !key.open(&hdr, &mut payload[body.clone()], tag) {
+                return Verdict::Drop(DropReason::OverlayAuth);
+            }
+            if !self.replay.accept(site_idx, hdr[6], counter) {
+                return Verdict::Drop(DropReason::OverlayReplay);
+            }
         }
-        let tid = tether as TetherId;
         if dynamic {
             // Authentic and fresh: the peer is (now) at this address/port.
             let u = off + ETH + ipv4::MIN_HDR_LEN;
@@ -1963,15 +2075,110 @@ impl Pipeline {
         }
     }
 
+    /// A handshake message from a site: for the control plane, which checks
+    /// it. At most [`HANDSHAKE_RATE_PER_SEC`] per worker get there.
+    fn handshake_in(
+        &mut self,
+        tether: TetherId,
+        frame: &[u8],
+        off: usize,
+        len: usize,
+        h: &ipv4::Header,
+    ) -> Verdict {
+        let u = off + ETH + ipv4::MIN_HDR_LEN;
+        let payload = &frame[u + l4::UDP_HDR_LEN..off + len];
+        if payload.len() > HANDSHAKE_MAX {
+            return Verdict::Drop(DropReason::BadOverlay);
+        }
+        let elapsed = self.now_ns.saturating_sub(self.handshake_last_refill);
+        let new = elapsed / HANDSHAKE_TOKEN_NS;
+        if new > 0 {
+            self.handshake_tokens = (self.handshake_tokens + new).min(HANDSHAKE_RATE_PER_SEC);
+            self.handshake_last_refill += new * HANDSHAKE_TOKEN_NS;
+        }
+        if self.handshake_tokens == 0 || self.handshakes.len() >= PUNT_MAX {
+            return Verdict::Drop(DropReason::ControlQueueFull);
+        }
+        self.handshake_tokens -= 1;
+        self.handshakes.push(HandshakeIn {
+            tether,
+            src: h.src,
+            sport: u16::from_be_bytes([frame[u], frame[u + 1]]),
+            payload: payload.to_vec(),
+        });
+        Verdict::Drop(DropReason::OverlayHandshake)
+    }
+
+    /// Send a handshake message (`payload`: our header, the Noise message,
+    /// mac1) on a tether: to `to` (a reply goes back where the message came
+    /// from), or else to the tether's peer. From our overlay port, so a peer
+    /// behind NAT gets it. `false` if the next hop isn't known yet (it's
+    /// being resolved; the control plane tries again).
+    pub fn send_handshake(
+        &mut self,
+        tether: TetherId,
+        to: Option<(Ipv4Addr, u16)>,
+        payload: &[u8],
+    ) -> bool {
+        if tether as usize >= self.overlay.tethers.len() {
+            return false;
+        }
+        let (port, remote, dport, next_hop) = match to {
+            Some((ip, p)) => (
+                self.overlay.tethers[tether as usize].port,
+                ip,
+                p,
+                self.underlay_next_hop(tether, ip),
+            ),
+            None => match self.tether_dest(tether) {
+                Some(d) => d,
+                None => return false,
+            },
+        };
+        let Some(mac) = self.neighbor(port, next_hop) else {
+            self.resolve(port, next_hop);
+            return false;
+        };
+        let udp_len = l4::UDP_HDR_LEN + payload.len();
+        let total = ETH + ipv4::MIN_HDR_LEN + udp_len;
+        if total > EMIT_MAX {
+            return false;
+        }
+        let mut e = Emit {
+            port,
+            len: total,
+            frame: [0; EMIT_MAX],
+        };
+        let p = &self.ports[port as usize];
+        eth::write(&mut e.frame, mac, p.mac, eth::TYPE_IPV4);
+        self.ip_ident = self.ip_ident.wrapping_add(1);
+        ipv4::write_header(
+            &mut e.frame[ETH..],
+            (ipv4::MIN_HDR_LEN + udp_len) as u16,
+            self.ip_ident,
+            LOCAL_TTL,
+            ipv4::PROTO_UDP,
+            p.addr,
+            remote,
+        );
+        let u = ETH + ipv4::MIN_HDR_LEN;
+        e.frame[u..u + 2].copy_from_slice(&self.overlay.udp_port.to_be_bytes());
+        e.frame[u + 2..u + 4].copy_from_slice(&dport.to_be_bytes());
+        e.frame[u + 4..u + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        e.frame[u + l4::UDP_HDR_LEN..total].copy_from_slice(payload);
+        self.push_emit(e);
+        self.stats.originated += 1;
+        true
+    }
+
     /// One probe per tether: sequence number + our clock. Every worker shares
     /// the same clock origin, so whichever worker receives the reply can
     /// compute the round-trip time.
     fn send_probes(&mut self) {
         self.probe_seq = self.probe_seq.wrapping_add(1);
         for i in 0..self.overlay.tethers.len() {
-            let t = &self.overlay.tethers[i];
-            if t.key.is_none() {
-                continue; // no key: the tether stays down
+            if !self.can_seal(i as TetherId) {
+                continue; // nothing to seal with (yet): the tether stays down
             }
             let Some((port, remote, dport, neighbor_ip)) = self.tether_dest(i as TetherId) else {
                 continue; // peer not heard from yet: it will probe us

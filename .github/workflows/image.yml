@@ -63,6 +63,32 @@ jobs:
           path: fuzz/artifacts
           if-no-files-found: ignore
 
+  # SD-WAN between two real routers on this machine (lab/netns/sdwan-test.sh):
+  # a handshake, "fibre" and "LTE" paths with emulated delay, per-class
+  # paths, and a fibre cut. AF_XDP on veth pairs: needs root, not a VM.
+  sdwan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Build
+        run: cargo build --locked -p ephemerisd -p ephctl
+      - name: Test tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends iperf3
+      - name: Two routers, two WANs
+        run: |
+          mkdir -p sdwan-logs
+          sudo LOGS=$PWD/sdwan-logs lab/netns/sdwan-test.sh target/debug/ephemerisd
+      - name: Keep the routers' logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sdwan-logs
+          path: sdwan-logs
+          if-no-files-found: ignore
+
   image:
     needs: test
     runs-on: ubuntu-24.04

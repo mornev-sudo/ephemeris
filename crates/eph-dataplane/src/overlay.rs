@@ -29,17 +29,30 @@
 //! The receiver accepts each counter once ([`ReplayGuard`]): a captured
 //! packet replayed later, or one from an earlier run, is dropped.
 //!
+//! ## Session keys from a handshake (version 3)
+//!
+//! A site configured with its public key instead uses short-lived session
+//! keys that the control plane agrees with it in a Noise handshake (the
+//! pattern WireGuard uses; see ephemerisd's `sdwan` module). The header is
+//! the same, but version 3, and byte 7 is the receiver's id for the session
+//! key that sealed the packet. Each session has one key per direction and
+//! counts from 0, so the nonce rules above hold without runs, and keys are
+//! replaced every two minutes: a key stolen later decrypts nothing recorded
+//! earlier (forward secrecy). The handshake messages themselves (types 4
+//! and 5) go to the control plane.
+//!
 //! Probes carry a sequence number and the sender's timestamp; the far side
 //! echoes them, so the sender measures round-trip time, jitter and loss per
 //! tether, i.e. per WAN path. They are sealed like data, so path health
 //! can't be faked either.
 
 use crate::config::PortId;
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub type TetherId = u16;
 
@@ -48,6 +61,14 @@ pub const VERSION: u8 = 2;
 pub const TYPE_DATA: u8 = 1;
 pub const TYPE_PROBE: u8 = 2;
 pub const TYPE_PROBE_REPLY: u8 = 3;
+/// The header version on tethers to sites that use the handshake.
+pub const VERSION_HANDSHAKE: u8 = 3;
+/// Handshake messages, handled by the control plane.
+pub const TYPE_HANDSHAKE_INIT: u8 = 4;
+pub const TYPE_HANDSHAKE_RESPONSE: u8 = 5;
+/// A session key is replaced after two minutes, and never used after three.
+pub const REKEY_AFTER_NS: u64 = 120_000_000_000;
+pub const REJECT_AFTER_NS: u64 = 180_000_000_000;
 /// Probe payload: sequence number (4) + sender timestamp in ns (8).
 pub const PROBE_LEN: usize = 12;
 /// Everything in front of the inner IP packet: Ethernet + IPv4 + UDP + ours.
@@ -159,6 +180,9 @@ pub struct Overlay {
     pub allow_new_sessions: bool,
     /// Peer site ids (index = site_idx).
     pub sites: Vec<u16>,
+    /// How each peer site's packets are protected (index = site_idx; a
+    /// site missing here uses its pre-shared key).
+    pub peers: Vec<PeerCrypto>,
     pub tethers: Vec<Tether>,
     /// classes[0] is the default class.
     pub classes: Vec<Class>,
@@ -172,6 +196,7 @@ impl Overlay {
             mtu: DEFAULT_MTU,
             allow_new_sessions: true,
             sites: vec![],
+            peers: vec![],
             tethers: vec![],
             classes: vec![Class {
                 name: "default".into(),
@@ -182,6 +207,14 @@ impl Overlay {
 
     pub fn enabled(&self) -> bool {
         !self.tethers.is_empty()
+    }
+
+    /// How packets to and from the site at `site_idx` are protected.
+    pub fn crypto(&self, site_idx: usize) -> PeerCrypto {
+        self.peers
+            .get(site_idx)
+            .copied()
+            .unwrap_or(PeerCrypto::PreShared)
     }
 
     /// Which application class a packet (or a session's first packet) is in.
@@ -219,10 +252,10 @@ impl TetherKey {
     /// `hdr` holds the sender's site, worker and counter (see the module docs).
     pub fn seal(&self, hdr: &[u8; HDR_LEN], payload: &mut [u8]) -> [u8; TAG_LEN] {
         let (site, worker, counter) = header_nonce_parts(hdr);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
-        let nonce = Self::nonce(site, worker, counter);
+        let cipher = ChaCha20Poly1305::new(&Key::from(self.0));
+        let nonce = Nonce::from(Self::nonce(site, worker, counter));
         let tag = cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), hdr, payload)
+            .encrypt_inout_detached(&nonce, hdr, payload.into())
             .expect("payload within the AEAD's size limit");
         tag.into()
     }
@@ -230,19 +263,14 @@ impl TetherKey {
     /// Check `tag` and decrypt `payload` in place. On failure the payload is
     /// left untouched and must be dropped.
     pub fn open(&self, hdr: &[u8; HDR_LEN], payload: &mut [u8], tag: &[u8]) -> bool {
-        if tag.len() != TAG_LEN {
+        let Ok(tag) = Tag::try_from(tag) else {
             return false;
-        }
+        };
         let (site, worker, counter) = header_nonce_parts(hdr);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
-        let nonce = Self::nonce(site, worker, counter);
+        let cipher = ChaCha20Poly1305::new(&Key::from(self.0));
+        let nonce = Nonce::from(Self::nonce(site, worker, counter));
         cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                hdr,
-                payload,
-                Tag::from_slice(tag),
-            )
+            .decrypt_inout_detached(&nonce, hdr, payload.into(), &tag)
             .is_ok()
     }
 }
@@ -251,6 +279,134 @@ fn header_nonce_parts(hdr: &[u8; HDR_LEN]) -> (u16, u8, u64) {
     let site = u16::from_be_bytes([hdr[2], hdr[3]]);
     let counter = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
     (site, hdr[6], counter)
+}
+
+/// How a peer site's packets are protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerCrypto {
+    /// Sealed directly with the tethers' pre-shared key (version 2).
+    PreShared,
+    /// Session keys from a handshake with the site's key pair (version 3);
+    /// the tethers' pre-shared key, if any, is mixed into the handshake.
+    Handshake { public: [u8; 32] },
+}
+
+/// Keys agreed in one handshake with a peer site: one per direction.
+pub struct Session {
+    /// Unique among this router's sessions: workers restart their packet
+    /// numbers when the session they seal with changes.
+    pub serial: u64,
+    /// Our id for this session: the peer puts it in byte 7 of what it seals.
+    pub local_id: u8,
+    /// The peer's id for it: we put it in byte 7.
+    pub peer_id: u8,
+    pub tx: TetherKey,
+    pub rx: TetherKey,
+    /// When it was agreed (the workers' clock).
+    pub created_ns: u64,
+    /// Did this router start the handshake?
+    pub initiator: bool,
+    /// The initiator may send at once. The responder waits for the first
+    /// packet sealed with it: proof the initiator has the keys too.
+    confirmed: AtomicBool,
+    /// When a packet sealed with it last arrived.
+    last_rx_ns: AtomicU64,
+    /// Counters received under this session (one window per sending worker).
+    replay: ReplayGuard,
+}
+
+impl Session {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        serial: u64,
+        local_id: u8,
+        peer_id: u8,
+        tx: TetherKey,
+        rx: TetherKey,
+        created_ns: u64,
+        initiator: bool,
+    ) -> Self {
+        Session {
+            serial,
+            local_id,
+            peer_id,
+            tx,
+            rx,
+            created_ns,
+            initiator,
+            confirmed: AtomicBool::new(initiator),
+            last_rx_ns: AtomicU64::new(0),
+            replay: ReplayGuard::new(1),
+        }
+    }
+
+    pub fn confirmed(&self) -> bool {
+        self.confirmed.load(Ordering::Relaxed)
+    }
+
+    pub fn last_rx_ns(&self) -> u64 {
+        self.last_rx_ns.load(Ordering::Relaxed)
+    }
+
+    /// Still within its lifetime?
+    pub fn usable(&self, now_ns: u64) -> bool {
+        now_ns.saturating_sub(self.created_ns) < REJECT_AFTER_NS
+    }
+
+    /// A packet sealed with it arrived and authenticated: accept `counter`
+    /// from `worker` once. Confirms the session and notes the time.
+    pub fn accept(&self, worker: u8, counter: u64, now_ns: u64) -> bool {
+        if counter >= COUNTER_LIMIT || !self.replay.accept(0, worker, counter) {
+            return false;
+        }
+        if !self.confirmed() {
+            self.confirmed.store(true, Ordering::Relaxed);
+        }
+        // Only write when it moved noticeably: every worker shares this.
+        if now_ns.saturating_sub(self.last_rx_ns()) > 50_000_000 {
+            self.last_rx_ns.store(now_ns, Ordering::Relaxed);
+        }
+        true
+    }
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("serial", &self.serial)
+            .field("local_id", &self.local_id)
+            .field("peer_id", &self.peer_id)
+            .field("created_ns", &self.created_ns)
+            .field("initiator", &self.initiator)
+            .field("confirmed", &self.confirmed())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The session keys of every peer site, built by the control plane and
+/// swapped into the workers like a path table.
+#[derive(Debug, Default)]
+pub struct KeyTable {
+    /// Per site_idx, newest first (at most a few).
+    pub peers: Vec<Vec<Arc<Session>>>,
+}
+
+impl KeyTable {
+    /// What to seal with towards a site: its newest confirmed session.
+    pub fn sending(&self, site_idx: usize, now_ns: u64) -> Option<&Arc<Session>> {
+        self.peers
+            .get(site_idx)?
+            .iter()
+            .find(|s| s.confirmed() && s.usable(now_ns))
+    }
+
+    /// The session a packet from a site says it was sealed with.
+    pub fn receiving(&self, site_idx: usize, key_id: u8, now_ns: u64) -> Option<&Arc<Session>> {
+        self.peers
+            .get(site_idx)?
+            .iter()
+            .find(|s| s.local_id == key_id && s.usable(now_ns))
+    }
 }
 
 /// Replay protection for received overlay packets, shared by all workers

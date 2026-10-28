@@ -224,7 +224,7 @@ async function refreshSdwan() {
 
 async function refreshSites() {
   const v = await api("GET", "/overlay/sites");
-  table($("sitetab"), ["Site", "Id", "Role", "Connection", "Key", "Tethers", ""], v.sites.map(x => {
+  table($("sitetab"), ["Site", "Id", "Role", "Connection", "Encryption", "Tethers", ""], v.sites.map(x => {
     const b = el("button", "Copy entry for its router", "btn");
     b.onclick = async () => {
       try {
@@ -235,10 +235,31 @@ async function refreshSites() {
       } catch (err) { alert(err.message); }
     };
     return [x.name, String(x.id), x.role, td(x.connected ? "direct" : "through a hub", x.connected ? "ok" : ""),
-      x.connected ? td(x.has_key ? "set" : "missing", x.has_key ? "ok" : "bad") : td("not needed", "s"),
+      encryption(x),
       td(x.tethers.join(", ") || "—", "mono"), b];
   }));
-  $("sitemeta").textContent = v.this ? `This router: ${v.this.name} (site ${v.this.id}, ${v.this.role})` : "";
+  const meta = $("sitemeta");
+  meta.replaceChildren();
+  if (v.this) meta.append(`This router: ${v.this.name} (site ${v.this.id}, ${v.this.role}). `);
+  if (v.public_key) {
+    const copy = el("button", "Copy", "btn");
+    copy.onclick = async () => {
+      try { await navigator.clipboard.writeText(v.public_key); copy.textContent = "Copied"; } catch { prompt("This router's public key:", v.public_key); }
+      setTimeout(() => copy.textContent = "Copy", 2000);
+    };
+    meta.append("Its public key, for other routers' entries for it: ", el("span", v.public_key, "mono"), " ", copy);
+  }
+}
+
+/// How tethers to a site are encrypted: a table cell.
+function encryption(x) {
+  if (!x.connected) return td("not needed", "s");
+  if (x.public_key) {
+    const h = x.handshake || {};
+    if (h.key_age_s != null) return td(`handshake · keys ${dur(h.key_age_s)} old`, "ok");
+    return td(h.pending ? "handshake · waiting for it" : "handshake · no keys yet", "warn");
+  }
+  return x.has_key ? td("pre-shared key", "ok") : td("missing", "bad");
 }
 
 async function refreshDhcp() {
@@ -621,8 +642,10 @@ function renderSdwanCfg() {
     "Every other router in the network. Tethers are built to the sites this router's role connects to " +
     "(one per outside interface and address); the rest are reached through a hub. " +
     "Leave Addresses empty for a site without a fixed address: it's learned when that site gets in touch. " +
-    "The key must be the same on both routers: generate it here, then copy it into the other router's entry for this one " +
-    "(SD-WAN tab → Copy entry, after committing).", "s"));
+    "Public key: the other router's (its SD-WAN tab shows it). With one, tethers get fresh session keys from a handshake every " +
+    "two minutes, so a key stolen later can't decrypt anything recorded before; set it on both routers. " +
+    "The key, if set, must be the same on both routers: generate it here, then copy it into the other router's entry for this one " +
+    "(SD-WAN tab → Copy entry, after committing). With a public key it's optional extra protection; without one it encrypts the tethers itself.", "s"));
   const t = el("div", undefined, "tablewrap");
   formTable(t, cfg.site, [
     { key: "name", label: "Name", placeholder: "cpt" },
@@ -630,8 +653,9 @@ function renderSdwanCfg() {
     { key: "role", label: "Role", type: "select", options: [["hub", "hub"], ["spoke", "spoke"], ["mesh", "mesh"]], empty: "mesh" },
     { key: "addresses", label: "WAN addresses", type: "list", placeholder: "learned" },
     { key: "prefixes", label: "Networks", type: "list", placeholder: "10.2.0.0/16" },
+    { key: "public_key", label: "Public key", placeholder: "its public key", optional: true },
     { key: "key", label: "Key", type: "key" },
-  ], () => ({ name: "", id: nextSiteId(), role: "spoke", addresses: [], prefixes: [], key: null }), "Add site");
+  ], () => ({ name: "", id: nextSiteId(), role: "spoke", addresses: [], prefixes: [], public_key: null, key: null }), "Add site");
   box.append(t);
 }
 

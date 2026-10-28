@@ -10,7 +10,7 @@
 use crate::report::{
     unix_ms, Control, DetailWanted, KernelStats, Report, SessionView, SESSION_DETAIL,
 };
-use eph_dataplane::{DropReason, Pipeline, PortId, Punt, Verdict};
+use eph_dataplane::{DropReason, HandshakeIn, Pipeline, PortId, Punt, Verdict};
 use eph_packet::eth;
 use eph_xdp::{Umem, XdpDesc, Xsk};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +49,8 @@ pub struct Worker {
     /// Where DHCP / PPPoE packets for the control plane go (bounded: a
     /// flood is dropped here, not queued without end).
     pub punt: SyncSender<Punt>,
+    /// Where SD-WAN handshake messages go (bounded, like `punt`).
+    pub handshake: SyncSender<HandshakeIn>,
     /// Until when (Unix ms) someone wants the session and neighbour lists.
     pub detail: DetailWanted,
     /// Where packets for the router's own SSH and portal go (the host
@@ -114,6 +116,16 @@ impl Worker {
                     Control::SetTrace(t) => self.pipeline.set_trace(t),
                     Control::Transmit { port, frame } => outbox.push((port, frame)),
                     Control::InjectHost(p) => host_in.push(p),
+                    Control::SetKeys(keys) => self.pipeline.set_keys(keys),
+                    Control::Handshake {
+                        tether,
+                        to,
+                        payload,
+                    } => {
+                        // No next hop yet: it's being resolved, and the
+                        // control plane tries again in a moment.
+                        self.pipeline.send_handshake(tether, to, &payload);
+                    }
                 }
             }
             let mut work = 0usize;
@@ -288,6 +300,11 @@ impl Worker {
                 // Full (the control plane is behind, e.g. a DHCP flood):
                 // drop it here rather than queue without end.
                 if self.punt.try_send(p).is_err() {
+                    self.pipeline.stats.drop(DropReason::ControlQueueFull);
+                }
+            }
+            for h in self.pipeline.handshakes.drain(..) {
+                if self.handshake.try_send(h).is_err() {
                     self.pipeline.stats.drop(DropReason::ControlQueueFull);
                 }
             }

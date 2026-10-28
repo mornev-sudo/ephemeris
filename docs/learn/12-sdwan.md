@@ -62,6 +62,64 @@ And a packet that comes out of a tether must have a source address that
 belongs to the site the tether leads to (its overlay routes). Otherwise it's
 dropped as `spoofed-source`.
 
+### Session keys from a handshake
+
+A static key has two weaknesses. Whoever steals it later can decrypt
+everything recorded with it (no **forward secrecy**), and replacing it means
+editing both routers. So a site can instead be given the other router's
+**public key**. The two routers then agree fresh session keys in a
+handshake, and replace them every two minutes.
+
+Each router has one X25519 key pair, its **identity**, made on first start
+and kept in `/var/lib/ephemeris/overlay-identity`. Only the public half
+ever leaves the router. The handshake is
+[Noise](https://noiseprotocol.org/) `IKpsk2`, the pattern WireGuard uses,
+from the [`snow`](https://docs.rs/snow) library:
+
+```
+ initiator                                      responder
+    │ ── initiation: ephemeral key, its identity (encrypted), its key id ──▶
+    │ ◀─ response: ephemeral key, its key id ─────────────────────────────
+ both: one key per direction, from four Diffie-Hellman results and the
+       pre-shared key (if set); the ephemeral private keys are forgotten
+```
+
+- **Forward secrecy.** The session keys come from *ephemeral* keys that
+  are thrown away. Stealing a router's identity or the pre-shared key later
+  doesn't recover them, so recorded traffic stays secret.
+- **Authentication.** The initiation proves the sender holds the private
+  key of the public key configured for it; the response proves the same
+  for the responder. With a pre-shared key, both must also know it.
+- **On the wire** the header gets version 3, and its spare byte becomes
+  the **key id**: which session key sealed the packet (each side numbers
+  its own). The handshake messages are types 4 and 5. The data plane hands
+  them to the control plane ([`sdwan.rs`](../../crates/ephemerisd/src/sdwan.rs)),
+  at most 20 a second per worker, and that thread does the key exchange.
+- **Rekeying without loss.** A router keeps up to three sessions per site:
+  the current one, the previous one (for packets still on their way), and
+  a new one. The responder only switches to new keys once a packet sealed
+  with them arrives from the initiator: proof the initiator has them. A
+  replayed initiation therefore never makes it switch to keys nobody else
+  holds.
+- **Who starts.** Whichever side needs keys and knows where the other is.
+  A hub can't reach a branch without a fixed address, so the branch starts.
+  If both start at once, the higher site id answers the other's initiation
+  and drops its own. The side that answered the last handshake waits 15
+  seconds longer before rekeying, so both rarely start together. And if
+  nothing at all arrives from a site for 3 seconds (it restarted and lost
+  its keys), a new handshake starts straight away.
+- **Junk costs nothing.** Every handshake message ends in `mac1`, a keyed
+  BLAKE2s keyed with the *receiver's* public key. It's not a secret, but
+  random packets fail it before any expensive key exchange.
+- **Each packet number used once.** New keys come with every session and
+  count from 0, so the run numbers above aren't needed. Packets captured
+  before a restart can't be replayed either: their keys are gone.
+
+With no session (yet), a site's tethers are down: no probes, no data.
+`overlay-no-key` counts packets sealed with a key the router doesn't have
+(expired, or from before a restart); `overlay-handshake` counts handshake
+messages handed to the control plane.
+
 ### Encapsulation without copying
 
 The obvious way to add 44 bytes of headers is to allocate a bigger buffer
@@ -198,19 +256,39 @@ prefixes = ["10.3.0.0/16"]
 
 ### Keys
 
-Each pair of routers that builds tethers shares **its own** key (32 random
-bytes, 64 hex characters). A leaked key exposes one pair, not the network.
-Sites reached through a hub need no key: the hub's tethers carry them.
+**Public keys (recommended).** `ephctl sdwan identity` (or the SD-WAN tab)
+shows this router's public key. Put it in the other router's `[[site]]`
+entry for this one, and the other router's in this one's:
+
+```toml
+[[site]]
+name = "jhb"
+id = 2
+public_key = "<jhb's: ephctl sdwan identity on jhb>"
+```
+
+or `ephctl sdwan public-key jhb --set <key>`. Both routers must agree: a
+site with a public key on one side and without on the other gets no
+tethers. Routers on 0.11 and earlier don't have public keys, so a pair
+moves over once both run 0.12. Until then, it keeps its pre-shared key.
+
+**Pre-shared keys.** Each pair of routers that builds tethers shares **its
+own** key (32 random bytes, 64 hex characters). A leaked key exposes one
+pair, not the network. With a public key, the pre-shared key is optional
+and only mixed into the handshake, as a second secret. Without one, it
+seals the packets directly (no forward secrecy). Sites reached through a
+hub need no keys at all: the hub's tethers carry them.
 
 - **Portal:** Configuration → SD-WAN. The key field has *Generate* (made in
   your browser from the system's secure random source), *Show* and *Copy*.
 - **CLI:** `ephctl sdwan key jhb` shows it. `--generate` or `--set <hex>`
   replaces it and commits.
 
-The other router needs the same key in its entry for *this* router. The
+The other router needs the same keys in its entry for *this* router. The
 SD-WAN tab's **Copy entry for its router** button, or
 `ephctl sdwan entry jhb`, prints a ready-made `[[site]]` block describing
-this router, with the shared key filled in. Paste it on the other side.
+this router, with the shared key and (if this router uses a public key for
+jhb) this router's public key filled in. Paste it on the other side.
 Like any change to sites, it applies after a data-plane restart.
 
 ### Peers without a fixed address
@@ -270,8 +348,15 @@ peers, where they were last heard from), and the path each class uses.
   wires two routers back to back in memory and checks encapsulation,
   per-class paths, failover, probe RTT, path MTU, MSS clamping, and that
   spoofed tether packets are rejected.
+  [`tests_session_keys.rs`](../../crates/eph-dataplane/src/tests_session_keys.rs)
+  does the same with session keys (confirmation, rekeys without loss,
+  expiry, unknown keys), and the tests in
+  [`sdwan.rs`](../../crates/ephemerisd/src/sdwan.rs) run handshakes between
+  two routers: wrong keys, tampering, replays, both starting at once,
+  retries on the other WAN, and a peer learned from its initiation.
 - **End to end:** [`sdwan-test.sh`](../../lab/netns/sdwan-test.sh) runs in
-  every CI boot. It starts two real routers with a 5 ms "fibre" and a 40 ms
+  CI on every change (the `sdwan` job). It starts two real routers, each with the other's public
+  key, checks that they agree keys in a handshake, with a 5 ms "fibre" and a 40 ms
   "LTE" link (Linux `netem`) and checks pings, RTT, Frag Needed, a TCP
   transfer on the bulk class over LTE, and then **cuts the fibre** mid-ping.
   The test requires that the loss is detected, that traffic moves to LTE
@@ -280,13 +365,14 @@ peers, where they were last heard from), and the path each class uses.
 
 ## Limits of Phase 4a, and what comes next
 
-- **Pre-shared keys, no handshake yet.** Tethers are encrypted and
-  authenticated, but with a static key: there is no forward secrecy (a key
-  stolen later decrypts recorded traffic), and changing a key means editing
-  both routers. Next: a WireGuard-style handshake with ephemeral keys and
-  rotation. Also, right after a router restarts, a packet captured during
-  the peer's *current* run can be replayed once if it's within the window
-  of the first fresh packet. Older runs are always refused.
+- **Sites on a pre-shared key** have no forward secrecy, and right after a
+  router restarts, a packet captured during the peer's *current* run can
+  be replayed once if it's within the window of the first fresh packet.
+  Give them a public key.
+- **No cookie reply yet.** WireGuard answers a flood of initiations with a
+  cookie the sender must echo, which proves its address. Here a flood that
+  passes mac1 (from someone who knows the public key) is only rate-limited,
+  which can delay a site's next rekey.
 - **Each router holds its own site list.** Roles and keys keep it short,
   but every router is still configured on its own (with "Copy entry" to
   help). Next (4c): a central controller that hands out the site topology

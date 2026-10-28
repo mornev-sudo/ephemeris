@@ -13,16 +13,16 @@ use eph_packet::{checksum, eth, icmp, ipv4, l4, Mac};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-const HOST_A: Mac = [0x52, 0, 0, 0, 0, 0x0a];
-const HOST_B: Mac = [0x52, 0, 0, 0, 0, 0x0b];
-const OFF: usize = 128; // headroom, like a real UMEM frame
+pub(crate) const HOST_A: Mac = [0x52, 0, 0, 0, 0, 0x0a];
+pub(crate) const HOST_B: Mac = [0x52, 0, 0, 0, 0, 0x0b];
+pub(crate) const OFF: usize = 128; // headroom, like a real UMEM frame
 /// The pre-shared key both routers' tethers use.
 const KEY: TetherKey = TetherKey([7; 32]);
 
-fn ip(s: &str) -> Ipv4Addr {
+pub(crate) fn ip(s: &str) -> Ipv4Addr {
     s.parse().unwrap()
 }
-fn mac(site: u8, port: u8) -> Mac {
+pub(crate) fn mac(site: u8, port: u8) -> Mac {
     [0x02, 0, 0, 0, site, port]
 }
 
@@ -39,6 +39,18 @@ fn router_with_key(site: u8, key: Option<TetherKey>) -> Pipeline {
 /// `dynamic`: this router doesn't know the other's WAN addresses; it learns
 /// them from the other's packets.
 fn router_opts(site: u8, key: Option<TetherKey>, dynamic: bool) -> Pipeline {
+    router_full(site, key, dynamic, false)
+}
+
+/// `handshake`: the other site uses session keys from a handshake (its
+/// "public key" is 32 bytes of its site number); `key`, if any, is then
+/// only the handshake's extra pre-shared key.
+pub(crate) fn router_full(
+    site: u8,
+    key: Option<TetherKey>,
+    dynamic: bool,
+    handshake: bool,
+) -> Pipeline {
     let other = 3 - site;
     let lan = format!("10.{site}.0.1/24");
     let ports: Arc<[Port]> = Arc::new([
@@ -49,6 +61,11 @@ fn router_opts(site: u8, key: Option<TetherKey>, dynamic: bool) -> Pipeline {
     let mut o = Overlay::disabled();
     o.site_id = site as u16;
     o.sites = vec![other as u16];
+    if handshake {
+        o.peers = vec![overlay::PeerCrypto::Handshake {
+            public: [other; 32],
+        }];
+    }
     o.tethers = vec![
         Tether {
             id: 0,
@@ -152,7 +169,7 @@ fn health(up: bool, rtt_ms: u64) -> TetherHealth {
 }
 
 /// A frame buffer with an IPv4 packet at OFF: ICMP echo, or TCP SYN to `dport`.
-fn packet(
+pub(crate) fn packet(
     dst_mac: Mac,
     src_mac: Mac,
     src: &str,
@@ -211,7 +228,7 @@ fn set_tcp_checksum(ip_pkt: &mut [u8]) {
     ip_pkt[36..38].copy_from_slice(&c.to_be_bytes());
 }
 
-fn tx(v: Verdict) -> (PortId, usize, usize) {
+pub(crate) fn tx(v: Verdict) -> (PortId, usize, usize) {
     match v {
         Verdict::Tx { port, off, len } => (port, off, len),
         Verdict::Drop(r) => panic!("expected Tx, got drop {r:?}"),
@@ -464,7 +481,7 @@ fn seal_by_hand(inner: &[u8], counter: u64) -> (Vec<u8>, usize) {
     (f, end + overlay::TAG_LEN)
 }
 
-fn drop_reason(v: Verdict) -> DropReason {
+pub(crate) fn drop_reason(v: Verdict) -> DropReason {
     match v {
         Verdict::Drop(r) => r,
         v => panic!("expected a drop, got {v:?}"),

@@ -20,6 +20,7 @@ mod pppoe;
 mod report;
 #[cfg(target_os = "linux")]
 mod run;
+mod sdwan;
 mod startup;
 #[cfg(target_os = "linux")]
 mod worker;
@@ -40,6 +41,11 @@ struct Args {
     /// password is stored (yescrypt); first boot uses it.
     #[arg(long)]
     hash_password: bool,
+    /// Print this router's SD-WAN public key (what other routers put in
+    /// their `[[site]]` entry for it), making its key pair first if there
+    /// isn't one. The key pair lives next to the config file.
+    #[arg(long)]
+    sdwan_identity: bool,
     /// Development only (not in Linux builds): serve the web portal on
     /// 127.0.0.1:8080 against the config file, without a data plane.
     /// Sign in as admin / dev.
@@ -55,6 +61,14 @@ fn main() -> anyhow::Result<()> {
         std::io::stdin().read_line(&mut pw)?;
         let pw = pw.strip_suffix('\n').unwrap_or(&pw);
         println!("{}", mgmt::auth::hash_password(pw)?);
+        return Ok(());
+    }
+    if args.sdwan_identity {
+        let dir = args.config.parent().unwrap_or(std::path::Path::new("."));
+        println!(
+            "{}",
+            sdwan::hex(&sdwan::Identity::load_or_create(dir)?.public)
+        );
         return Ok(());
     }
     logging::sink::init();

@@ -137,3 +137,32 @@ fn fuzz_inputs_never_break_the_pipeline() {
         fuzzing::fuzz_input(&input);
     }
 }
+
+#[test]
+fn the_session_key_templates_are_accepted() {
+    // The tether packets from site 3 must authenticate, or mutating them
+    // would only ever test the authentication check.
+    let mut r = fuzzing::router();
+    let mut seen = vec![];
+    for (card, f) in templates() {
+        if f.len() > 34 && f[26..30] == [192, 0, 2, 5] {
+            let mut frame = vec![0u8; fuzzing::FRAME];
+            frame[256..256 + f.len()].copy_from_slice(&f);
+            seen.push(r.process(card as u16, &mut frame, 256, f.len()));
+        }
+    }
+    assert!(
+        matches!(seen[0], crate::Verdict::Tx { port: 0, .. }),
+        "data: {:?}",
+        seen[0]
+    );
+    assert!(
+        matches!(seen[1], crate::Verdict::Tx { port: 2, .. }),
+        "probe echoed: {:?}",
+        seen[1]
+    );
+    assert_eq!(
+        seen[2],
+        crate::Verdict::Drop(crate::DropReason::OverlayHandshake)
+    );
+}

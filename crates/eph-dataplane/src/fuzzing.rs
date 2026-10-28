@@ -10,12 +10,17 @@
 //! ```text
 //!  card 0 ─┬─ lan    inside, untagged   10.10.1.1/24   DHCP server, SSH + portal
 //!          └─ guest  inside, VLAN 10    10.10.10.1/24
-//!  card 1 ─── wan    outside            192.0.2.1/29   NAT, SD-WAN tether to 192.0.2.6
+//!  card 1 ─── wan    outside            192.0.2.1/29   NAT, SD-WAN tethers to 192.0.2.6
+//!                                                       (pre-shared key) and 192.0.2.5
+//!                                                       (session keys from a handshake)
 //!  card 2 ─── isp    outside, VLAN 7    PPPoE up, 203.0.113.50/32, MSS 1452
 //! ```
 
 use crate::host::HostAccess;
-use crate::overlay::{select_paths, Overlay, PathTable, Tether, TetherHealth, TetherKey};
+use crate::overlay::{
+    self, select_paths, KeyTable, Overlay, PathTable, PeerCrypto, Session, Tether, TetherHealth,
+    TetherKey,
+};
 use crate::trace::{TraceCat, TraceConfig};
 use crate::{
     build_fib, Dhcp, Neighbor, OverlayRoute, Pipeline, Port, Pppoe, Role, SessionConfig,
@@ -87,13 +92,18 @@ pub fn router() -> Pipeline {
     };
     r.set_paths(Arc::new(select_paths(
         &p.overlay,
-        &[up],
+        &[up, up],
         &PathTable::empty(&p.overlay),
     )));
+    // Agreed with site 3 (as the control plane would after a handshake).
+    r.set_keys(Arc::new(KeyTable {
+        peers: vec![vec![], vec![Arc::new(session())]],
+    }));
     for (port, mac, addr) in [
         (0, 0x0a, "10.10.1.10"),
         (1, 0x10, "10.10.10.10"),
         (2, 0x66, "192.0.2.6"),
+        (2, 0x65, "192.0.2.5"),
     ] {
         r.learn(Neighbor {
             port,
@@ -107,6 +117,22 @@ pub fn router() -> Pipeline {
         per_sec: 1_000_000,
     });
     r
+}
+
+/// The session keys with site 3: our id for them, and its.
+const LOCAL_ID: u8 = 1;
+const TO_US: TetherKey = TetherKey([0x32; 32]);
+
+fn session() -> Session {
+    Session::new(
+        1,
+        LOCAL_ID,
+        2,
+        TetherKey([0x31; 32]),
+        TO_US,
+        1_000_000_000,
+        true,
+    )
 }
 
 fn parts() -> Parts {
@@ -137,26 +163,48 @@ fn parts() -> Parts {
 
     let mut o = Overlay::disabled();
     o.site_id = 1;
-    o.sites = vec![2];
-    o.tethers = vec![Tether {
-        id: 0,
-        name: "t".into(),
-        port: 2,
-        remote: ip("192.0.2.6"),
-        gateway: None,
-        peer_site: 2,
-        site_idx: 0,
-        key: Some(TetherKey([7; 32])),
-    }];
+    o.sites = vec![2, 3];
+    o.peers = vec![
+        PeerCrypto::PreShared,
+        PeerCrypto::Handshake { public: [3; 32] },
+    ];
+    o.tethers = vec![
+        Tether {
+            id: 0,
+            name: "t".into(),
+            port: 2,
+            remote: ip("192.0.2.6"),
+            gateway: None,
+            peer_site: 2,
+            site_idx: 0,
+            key: Some(TetherKey([7; 32])),
+        },
+        Tether {
+            id: 1,
+            name: "h".into(),
+            port: 2,
+            remote: ip("192.0.2.5"),
+            gateway: None,
+            peer_site: 3,
+            site_idx: 1,
+            key: None,
+        },
+    ];
     let o = Arc::new(o);
     let statics = [StaticRoute {
         prefix: "0.0.0.0/0".parse().expect("a valid prefix"),
         via: ip("203.0.113.1"),
     }];
-    let overlay_routes = [OverlayRoute {
-        prefix: "10.2.0.0/16".parse().expect("a valid prefix"),
-        site_idx: 0,
-    }];
+    let overlay_routes = [
+        OverlayRoute {
+            prefix: "10.2.0.0/16".parse().expect("a valid prefix"),
+            site_idx: 0,
+        },
+        OverlayRoute {
+            prefix: "10.3.0.0/16".parse().expect("a valid prefix"),
+            site_idx: 1,
+        },
+    ];
     let fib = build_fib(&ports, &statics, &overlay_routes).expect("a valid table");
     Parts {
         ports,
@@ -203,6 +251,7 @@ pub fn run(r: &mut Pipeline, input: &[u8]) {
         assert!(e.len <= e.frame.len());
     }
     r.punts.clear();
+    r.handshakes.clear();
     r.host_out.clear();
     r.learned.clear();
     r.tracer.events.clear();
@@ -277,6 +326,26 @@ fn vlan(mut f: Vec<u8>, vid: u16) -> Vec<u8> {
     out
 }
 
+/// A tether packet from site 3 (session keys): `typ` with `body`, sealed
+/// with the session's key unless it's a handshake message.
+fn from_site_3(typ: u8, body: &[u8]) -> Vec<u8> {
+    let mut hdr = [0u8; overlay::HDR_LEN];
+    hdr[0] = (overlay::VERSION_HANDSHAKE << 4) | typ;
+    hdr[2..4].copy_from_slice(&3u16.to_be_bytes());
+    let mut payload = hdr.to_vec();
+    payload.extend_from_slice(body);
+    if typ < overlay::TYPE_HANDSHAKE_INIT {
+        hdr[7] = LOCAL_ID;
+        // A packet number of its own per type: on one router, two
+        // templates with the same number would be a replay.
+        hdr[8..16].copy_from_slice(&(typ as u64).to_be_bytes());
+        payload[..overlay::HDR_LEN].copy_from_slice(&hdr);
+        let tag = TO_US.seal(&hdr, &mut payload[overlay::HDR_LEN..]);
+        payload.extend_from_slice(&tag);
+    }
+    udp(R_WAN, ("192.0.2.5", 4800), ("192.0.2.1", 4800), &payload)
+}
+
 /// Valid frames of every kind the router deals with, each with the card
 /// it arrives on: starting points for mutation.
 pub fn templates() -> Vec<(u8, Vec<u8>)> {
@@ -335,6 +404,18 @@ pub fn templates() -> Vec<(u8, Vec<u8>)> {
             1,
             udp(R_WAN, ("192.0.2.6", 4800), ("192.0.2.1", 4800), &[0u8; 80]),
         ),
+        (
+            1,
+            from_site_3(
+                overlay::TYPE_DATA,
+                &tcp(R_LAN, ("10.3.0.9", 40005), ("10.10.1.10", 22), 0x02, &mss)[14..],
+            ),
+        ),
+        (
+            1,
+            from_site_3(overlay::TYPE_PROBE, &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9]),
+        ),
+        (1, from_site_3(overlay::TYPE_HANDSHAKE_INIT, &[0x5a; 113])),
         (1, icmp(R_WAN, "8.8.4.4", "192.0.2.1", 3, &quoted[14..42])),
         (1, icmp(R_WAN, "8.8.4.4", "192.0.2.1", 11, &quoted[14..])),
         (

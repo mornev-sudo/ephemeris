@@ -76,6 +76,8 @@ pub struct Shared {
     pub dhcp: Arc<Mutex<crate::dhcp::DhcpState>>,
     /// Where SD-WAN peers without a fixed address were last heard from.
     pub endpoints: Arc<eph_dataplane::overlay::Endpoints>,
+    /// SD-WAN: this router's public key, and the handshakes with each site.
+    pub sdwan: crate::sdwan::SdwanState,
     /// Rates sampled every few seconds, for the Reporting graphs.
     pub history: Mutex<history::History>,
     /// What the software-update buttons know: the version being installed

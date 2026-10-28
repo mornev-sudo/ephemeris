@@ -13,7 +13,7 @@ current: a feature that adds a boundary, or moves one, updates this file.
 | Traffic between networks | Confidentiality and integrity of what passes through; the router must forward only what its policy allows |
 | The filtering and NAT policy | An outside host must not reach inside hosts unless invited |
 | Router control | Whoever controls the router controls the network: config, routes, SSH, updates |
-| Credentials | Admin password hash, API token, SD-WAN pre-shared keys, PPPoE password |
+| Credentials | Admin password hash, API token, the router's SD-WAN key pair and pre-shared keys, PPPoE password |
 | The software itself | Secure Boot keys and the release-signing key decide what a router will run |
 | Availability | A router that falls over takes every network behind it down |
 
@@ -80,13 +80,20 @@ router); per-person accounts and roles are future work.
 
 | Threat | Mitigation |
 |---|---|
-| **S/T** Forged or altered tether packets | ChaCha20-Poly1305 with per-pair pre-shared keys; packets that don't authenticate are dropped |
-| **T** Replay | Per-sender counters, persisted across restarts; nonces never reused (run numbers) |
+| **S/T** Forged or altered tether packets | ChaCha20-Poly1305 on every packet, probes included; packets that don't authenticate are dropped |
+| **S** Posing as another site | Sites with a public key: a Noise `IKpsk2` handshake (WireGuard's pattern) proves the peer holds that key pair's private key, plus the pre-shared key if set. Sites without one: per-pair pre-shared keys |
+| **I** A key stolen later decrypting recorded traffic | Sites with a public key: fresh session keys every two minutes from ephemeral X25519 keys that are then forgotten (forward secrecy) |
+| **T** Replay | Per-sender counters within each session key; nonces never reused (new keys per session; run numbers for pre-shared keys). A replayed initiation gets an answer, but its keys are never used: the responder only switches to keys a packet has proven |
+| **D** Handshake floods (each costs key exchanges) | mac1 (keyed with the receiver's public key) drops junk before any key exchange; at most 20 handshake messages a second per worker reach the control plane, and at most 5 initiations a second per site are answered |
 | **E** A tether used to reach the router's SSH or portal | The host path refuses anything that came through a tether |
 
-**Residual:** pre-shared keys don't give forward secrecy (a stolen key
-decrypts recorded traffic); the WireGuard-style handshake on the roadmap
-addresses this.
+**Residual:** sites still on a pre-shared key have no forward secrecy (a
+stolen key decrypts recorded traffic): give them a public key. A stolen
+router identity (`/var/lib/ephemeris/overlay-identity`) lets someone pose
+as that router until its public key is replaced on the others. A flood of
+initiations that pass mac1 (from someone who knows the public key) can
+delay a site's rekey by up to the rate limit; WireGuard's cookie reply
+isn't implemented yet.
 
 ## B5: the host path (data plane to sshd and nginx)
 

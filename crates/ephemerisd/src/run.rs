@@ -8,6 +8,7 @@ use crate::mgmt::paths::{PathSelector, TICK_MS};
 use crate::mgmt::{api, load_or_create_token, PortRuntime, Shared, Summary};
 use crate::overlay_state;
 use crate::report::{Control, Report};
+use crate::sdwan::{Action, Handshakes, Identity};
 use crate::startup::{self, StartupState};
 use crate::worker::Worker;
 use anyhow::{bail, Context, Result};
@@ -19,7 +20,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -71,6 +72,16 @@ pub fn run(config_path: &Path) -> Result<()> {
     crate::logging::control().apply_config(&cfg.logging);
     crate::mgmt::ssh::apply(&cfg.ssh);
     let state_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // This router's SD-WAN key pair: made on first start, so its public key
+    // can be given to other routers before any site uses it.
+    let identity = match Identity::load_or_create(&state_dir) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            error!(target: crate::logging::cat::SDWAN,
+                "SD-WAN key pair unavailable ({e:#}): tethers to sites with a public_key stay down");
+            None
+        }
+    };
     let dp = match start_dataplane(&cfg, &state_dir) {
         Ok(dp) => {
             if let Err(e) = startup::mark_good(config_path, &text) {
@@ -102,6 +113,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         epoch,
         replay,
         punts,
+        handshakes,
         endpoints,
         umem_bytes,
         detail,
@@ -141,6 +153,10 @@ pub fn run(config_path: &Path) -> Result<()> {
         startup,
         dhcp: dhcp_state,
         endpoints,
+        sdwan: crate::sdwan::SdwanState {
+            public_key: identity.as_ref().map(|i| i.public),
+            ..Default::default()
+        },
         history: Default::default(),
         update: Default::default(),
         system: Default::default(),
@@ -206,6 +222,22 @@ pub fn run(config_path: &Path) -> Result<()> {
             .spawn(move || path_loop(&shared, epoch, &replay, &state_dir))
             .expect("spawning path selector")
     });
+
+    // ---- SD-WAN handshakes, for sites configured with a public key
+    let names: Vec<(u16, String)> = cfg.sites.iter().map(|s| (s.id, s.name.clone())).collect();
+    let handshaker = match (identity, handshakes) {
+        (Some(me), Some(rx)) if workers > 0 => {
+            let hs = Handshakes::new(me, overlay.clone(), &names);
+            hs.active().then(|| {
+                let shared = shared.clone();
+                std::thread::Builder::new()
+                    .name("eph-sdwan".into())
+                    .spawn(move || handshake_loop(&shared, epoch, hs, rx))
+                    .expect("spawning SD-WAN handshakes")
+            })
+        }
+        _ => None,
+    };
 
     let log_stats = d.stats_interval_secs > 0;
     let interval = Duration::from_secs(d.stats_interval_secs.max(1));
@@ -273,6 +305,9 @@ pub fn run(config_path: &Path) -> Result<()> {
     if let Some(h) = dhcp {
         let _ = h.join();
     }
+    if let Some(h) = handshaker {
+        let _ = h.join();
+    }
     print_stats(&shared, d.show_sessions);
     drop(links); // detaches XDP; the kernel would also do this when we exit
     drop(promisc);
@@ -337,6 +372,8 @@ struct Dataplane {
     replay: Arc<ReplayGuard>,
     /// DHCP packets the workers hand to the control plane.
     punts: Option<mpsc::Receiver<eph_dataplane::Punt>>,
+    /// SD-WAN handshake messages, likewise.
+    handshakes: Option<mpsc::Receiver<eph_dataplane::HandshakeIn>>,
     /// Learned addresses of SD-WAN peers without a fixed one.
     endpoints: Arc<eph_dataplane::overlay::Endpoints>,
     /// Packet buffer memory reserved, all workers.
@@ -374,6 +411,7 @@ impl Dataplane {
             txs: vec![],
             handles: vec![],
             punts: None,
+            handshakes: None,
             links: vec![],
             promisc: vec![],
             epoch: Instant::now(),
@@ -466,14 +504,19 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     let fib = Arc::new(cfg.fib(&ports)?);
     let mut overlay = cfg.overlay()?;
     // Overlay crypto: claim this start's run number before anything is
-    // sealed. Without one the tethers stay down rather than risk reusing a
-    // nonce; the rest of the router runs normally.
+    // sealed with a pre-shared key. Without one those tethers stay down
+    // rather than risk reusing a nonce; the rest of the router (and tethers
+    // with session keys, which don't use runs) runs normally.
+    let pre_shared = |o: &eph_dataplane::overlay::Overlay, t: &eph_dataplane::overlay::Tether| {
+        o.crypto(t.site_idx) == eph_dataplane::overlay::PeerCrypto::PreShared
+    };
     let run = if overlay.enabled() {
         match overlay_state::claim_run(state_dir) {
             Ok(run) => run,
             Err(e) => {
-                error!(target: crate::logging::cat::SDWAN, "SD-WAN tethers disabled: {e:#}");
-                for t in &mut overlay.tethers {
+                error!(target: crate::logging::cat::SDWAN, "SD-WAN tethers with a pre-shared key disabled: {e:#}");
+                let o = overlay.clone();
+                for t in overlay.tethers.iter_mut().filter(|t| pre_shared(&o, t)) {
                     t.key = None;
                 }
                 0
@@ -482,8 +525,12 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     } else {
         0
     };
-    for t in overlay.tethers.iter().filter(|t| t.key.is_none()) {
-        warn!(target: crate::logging::cat::SDWAN, "tether {} has no key: it stays down", t.name);
+    for t in overlay
+        .tethers
+        .iter()
+        .filter(|t| t.key.is_none() && pre_shared(&overlay, t))
+    {
+        warn!(target: crate::logging::cat::SDWAN, "tether {} has no key or public_key: it stays down", t.name);
     }
     if overlay.enabled() && overlay.mtu > DEFAULT_MTU {
         warn!(target: crate::logging::cat::SDWAN,
@@ -556,6 +603,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     // Bounded: if the control plane falls behind (a DHCP flood), packets
     // for it are dropped and counted, never queued without end.
     let (punt_tx, punt_rx) = mpsc::sync_channel(1024);
+    let (handshake_tx, handshake_rx) = mpsc::sync_channel(256);
     let detail: crate::report::DetailWanted = Default::default();
     // The host path: SSH and the portal on inside interfaces that offer
     // them. Replies go to worker 0, which sends them like its own packets.
@@ -627,6 +675,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             siblings,
             report: reports[w].clone(),
             punt: punt_tx.clone(),
+            handshake: handshake_tx.clone(),
             detail: detail.clone(),
             host: host_tx.clone(),
             busy_poll: d.busy_poll,
@@ -679,6 +728,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         epoch,
         replay,
         punts: Some(punt_rx),
+        handshakes: Some(handshake_rx),
         endpoints,
         umem_bytes: frames as u64 * FRAME_SIZE as u64 * workers as u64,
         detail,
@@ -729,6 +779,87 @@ fn path_loop(shared: &Shared, epoch: Instant, replay: &ReplayGuard, state_dir: &
                 let _ = tx.send(Control::SetPaths(table.clone()));
             }
             *shared.paths.write().unwrap() = table;
+        }
+    }
+}
+
+/// SD-WAN handshakes: answer the ones the workers hand over, and every
+/// 100 ms start the ones that are due. New keys go to every worker; the
+/// messages to send go to worker 0, which sends them like its probes.
+fn handshake_loop(
+    shared: &Shared,
+    epoch: Instant,
+    mut hs: Handshakes,
+    rx: mpsc::Receiver<eph_dataplane::HandshakeIn>,
+) {
+    const TICK: Duration = Duration::from_millis(100);
+    let overlay = shared.overlay.clone();
+    // An initiation can go on a tether whose peer we know where to find,
+    // working ones first, fastest first.
+    let candidates = |idx: usize| {
+        let health = shared.health.read().unwrap();
+        let mut c: Vec<_> = overlay
+            .tethers
+            .iter()
+            .filter(|t| {
+                t.site_idx == idx
+                    && (!t.remote.is_unspecified() || shared.endpoints.get(t.id).is_some())
+            })
+            .map(|t| {
+                let h = health.get(t.id as usize).copied().unwrap_or_default();
+                (!h.up, h.rtt_ns, t.id)
+            })
+            .collect();
+        c.sort_unstable();
+        c.into_iter().map(|(_, _, id)| id).collect()
+    };
+    let mut next_tick = Instant::now();
+    while !STOP.load(Ordering::Relaxed) {
+        let out = match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+            Ok(m) => hs.receive(&m, epoch.elapsed().as_nanos() as u64),
+            Err(mpsc::RecvTimeoutError::Timeout) => Default::default(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        apply_handshakes(shared, out);
+        if Instant::now() >= next_tick {
+            next_tick += TICK;
+            let now = epoch.elapsed().as_nanos() as u64;
+            apply_handshakes(shared, hs.tick(now, &candidates));
+            *shared.sdwan.peers.lock().unwrap() = hs.status(now);
+        }
+    }
+}
+
+fn apply_handshakes(shared: &Shared, out: crate::sdwan::Output) {
+    for (routine, e) in out.events {
+        if routine {
+            debug!(target: crate::logging::cat::SDWAN, "{e}");
+        } else {
+            info!(target: crate::logging::cat::SDWAN, "{e}");
+        }
+    }
+    let control = shared.control.lock().unwrap();
+    for a in out.actions {
+        match a {
+            Action::Learn { tether, ip, port } => shared.endpoints.learn(tether, ip, port),
+            Action::Send {
+                tether,
+                to,
+                payload,
+            } => {
+                if let Some(tx) = control.first() {
+                    let _ = tx.send(Control::Handshake {
+                        tether,
+                        to,
+                        payload,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(keys) = out.keys {
+        for tx in control.iter() {
+            let _ = tx.send(Control::SetKeys(keys.clone()));
         }
     }
 }
