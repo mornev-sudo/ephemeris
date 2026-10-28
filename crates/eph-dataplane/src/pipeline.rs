@@ -2243,6 +2243,7 @@ impl Pipeline {
         let body = off + OUTER_LEN..off + len - TAG_LEN;
         let (payload, tag) = frame[..off + len].split_at_mut(body.end);
         let counter = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+        let sender_tether = u16::from_be_bytes([hdr[4], hdr[5]]);
         if handshake {
             // The session the sender says it used (byte 7: our id for it).
             let Some(s) = self.keys.receiving(site_idx, hdr[7], self.now_ns) else {
@@ -2251,7 +2252,7 @@ impl Pipeline {
             if !s.rx.open(&hdr, &mut payload[body.clone()], tag) {
                 return Verdict::Drop(DropReason::OverlayAuth);
             }
-            if !s.accept(hdr[6], counter, self.now_ns) {
+            if !s.accept(hdr[6], sender_tether, counter, self.now_ns) {
                 return Verdict::Drop(DropReason::OverlayReplay);
             }
         } else {
@@ -2261,7 +2262,7 @@ impl Pipeline {
             if !key.open(&hdr, &mut payload[body.clone()], tag) {
                 return Verdict::Drop(DropReason::OverlayAuth);
             }
-            if !self.replay.accept(site_idx, hdr[6], counter) {
+            if !self.replay.accept(site_idx, hdr[6], sender_tether, counter) {
                 return Verdict::Drop(DropReason::OverlayReplay);
             }
         }

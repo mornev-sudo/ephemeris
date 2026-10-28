@@ -911,11 +911,11 @@ mod tests {
         // Nothing due yet.
         assert!(sends(&p.a.tick(2 * S, &all)).is_empty());
         // ...but after two minutes A (which started the first) starts again.
-        sessions(&p.b)[0].accept(0, 0, 2 * S); // A's packets arrived
-        sessions(&p.a)[0].accept(0, 0, 2 * S);
+        sessions(&p.b)[0].accept(0, 0, 0, 2 * S); // A's packets arrived
+        sessions(&p.a)[0].accept(0, 0, 0, 2 * S);
         let later = S + REKEY_AFTER_NS;
         for s in sessions(&p.a).iter().chain(sessions(&p.b).iter()) {
-            s.accept(0, 1, later); // and keep arriving
+            s.accept(0, 1, 0, later); // and keep arriving
         }
         assert!(
             sends(&p.b.tick(later, &all)).is_empty(),
@@ -1014,10 +1014,10 @@ mod tests {
         let resp = sends(&p.b.receive(&arrive(1, &init[0].2), S));
         p.a.receive(&arrive(2, &resp[0].2), S);
         let current = sessions(&p.b)[0].clone();
-        current.accept(0, 0, S); // A's first packet: confirmed
-                                 // Someone replays A's initiation a second later. B answers it (it
-                                 // can't tell), but nobody else has those keys, so B keeps sending
-                                 // with the confirmed ones.
+        current.accept(0, 0, 0, S); // A's first packet: confirmed
+                                    // Someone replays A's initiation a second later. B answers it (it
+                                    // can't tell), but nobody else has those keys, so B keeps sending
+                                    // with the confirmed ones.
         p.b.receive(&arrive(1, &init[0].2), 2 * S);
         let b = sessions(&p.b);
         assert_eq!(b.len(), 2);
@@ -1052,7 +1052,7 @@ mod tests {
     fn a_silent_peer_gets_a_new_handshake() {
         let mut p = pair(None, None);
         shake(&mut p, S);
-        sessions(&p.a)[0].accept(0, 0, S);
+        sessions(&p.a)[0].accept(0, 0, 0, S);
         // B restarted: nothing comes back for a few seconds.
         assert!(sends(&p.a.tick(3 * S, &all)).is_empty());
         assert_eq!(
