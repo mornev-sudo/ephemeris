@@ -399,8 +399,9 @@ peers, where they were last heard from), and the path each class uses.
 - **End to end:** [`sdwan-test.sh`](../../lab/netns/sdwan-test.sh) runs in
   CI on every change (the `sdwan` job). It starts two real routers, each with the other's public
   key, checks that they agree keys in a handshake, with a 5 ms "fibre" and a 40 ms
-  "LTE" link (Linux `netem`) and checks pings, RTT, Frag Needed, a TCP
-  transfer on the bulk class over LTE, and then **cuts the fibre** mid-ping.
+  "LTE" link (Linux `netem`) and checks pings, RTT, Frag Needed, TCP
+  throughput over each tether (default traffic over fibre, the bulk class
+  over LTE), and then **cuts the fibre** mid-ping.
   The test requires that the loss is detected, that traffic moves to LTE
   with most pings surviving, and that traffic moves back when the fibre
   returns.
