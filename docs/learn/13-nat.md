@@ -133,11 +133,10 @@ All of this is also in the portal: Configuration → NAT.
   by DHCP. For now the outside address and default route are static.
 - **NAT hairpinning:** an inside host reaching an inside server via its
   public address.
-- **Real NICs with several workers:** replies must arrive at the worker that
-  made the translation. On virtio (Proxmox) this happens naturally. On
-  hardware NICs it needs RSS steering by port range or a worker handoff,
-  which is a future step. Use one worker for now. If replies land on the
-  wrong worker, the `nat-wrong-worker` drop counter says so.
+- **PPPoE with several workers:** cards can't hash inside PPPoE, so a
+  PPPoE WAN's packets all arrive on one queue; the replies are handed to
+  their workers from there (chapter 7). It works with any number of
+  workers, but that one queue's worker does the PPPoE work for all of them.
 
 ## Replies that don't come back
 
@@ -145,9 +144,9 @@ A session that shows packets going out and **none coming back** (`2 / 0`
 in the portal's Sessions tab) means one of three things:
 
 1. **The reply reached the router but found no session.** It's dropped and
-   counted: `nat-wrong-worker` if it arrived at a worker other than the one
-   that owns its NAT port (the network card chose the queue; see above),
-   `nat-no-session` if the session had already expired or never existed.
+   counted as `nat-no-session`: the session had already expired or never
+   existed. (A reply that lands on another worker than its session's is
+   handed over, counted as `handed-off`, not lost; see chapter 7.)
 2. **The reply never reached the router.** The drop counters stay still.
    Something upstream dropped the request or the answer: the ISP, an
    upstream router or firewall (a modem in router mode, double NAT), or the
@@ -167,7 +166,7 @@ ephctl log show -c nat -c session -f
 
 ```
 DEBUG nat      udp 10.0.0.2:59135 -> 8.8.8.8:53 in lan: translated to 192.168.3.56:51086
-DEBUG nat      drop nat-wrong-worker: udp 8.8.8.8:53 -> 192.168.3.56:51086 in wan (a reply that arrived at a worker other than ...)
+DEBUG nat      drop nat-no-session: udp 8.8.8.8:53 -> 192.168.3.56:51086 in wan (a reply to a NAT port with no session: expired, or never made)
 DEBUG session  no answer: udp 10.0.0.2:59135 -> 8.8.8.8:53 in lan, 3 packet(s) out and none back in 30 s, sent as 192.168.3.56:51086
 ```
 

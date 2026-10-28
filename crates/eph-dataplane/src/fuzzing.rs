@@ -254,6 +254,7 @@ pub fn run(r: &mut Pipeline, input: &[u8]) {
     }
     r.punts.clear();
     r.handshakes.clear();
+    r.handoffs.clear();
     r.host_out.clear();
     r.learned.clear();
     r.tracer.events.clear();

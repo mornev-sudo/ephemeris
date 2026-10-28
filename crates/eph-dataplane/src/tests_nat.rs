@@ -12,18 +12,18 @@ use eph_packet::{checksum, eth, icmp, ipv4, l4, Mac};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-const R_LAN: Mac = [2, 0, 0, 0, 0, 1];
-const R_WAN: Mac = [2, 0, 0, 0, 0, 2];
-const HOST_A: Mac = [0x52, 0, 0, 0, 0, 0x0a];
-const HOST_B: Mac = [0x52, 0, 0, 0, 0, 0x0b];
-const ISP: Mac = [0x52, 0, 0, 0, 0, 0xfe];
-const OFF: usize = 128;
+pub(crate) const R_LAN: Mac = [2, 0, 0, 0, 0, 1];
+pub(crate) const R_WAN: Mac = [2, 0, 0, 0, 0, 2];
+pub(crate) const HOST_A: Mac = [0x52, 0, 0, 0, 0, 0x0a];
+pub(crate) const HOST_B: Mac = [0x52, 0, 0, 0, 0, 0x0b];
+pub(crate) const ISP: Mac = [0x52, 0, 0, 0, 0, 0xfe];
+pub(crate) const OFF: usize = 128;
 
-fn ip(s: &str) -> Ipv4Addr {
+pub(crate) fn ip(s: &str) -> Ipv4Addr {
     s.parse().unwrap()
 }
 
-fn router(nat: NatConfig) -> Pipeline {
+pub(crate) fn router(nat: NatConfig) -> Pipeline {
     let ports: Arc<[Port]> = Arc::new([
         Port {
             id: 0,
@@ -93,14 +93,14 @@ fn router(nat: NatConfig) -> Pipeline {
     r
 }
 
-enum L4 {
+pub(crate) enum L4 {
     Echo(u8, u16), // type, identifier
     Tcp(u16, u16, u8),
     Udp(u16, u16),
 }
 
 /// A frame with an IPv4 packet at OFF.
-fn packet(dst_mac: Mac, src_mac: Mac, src: &str, dst: &str, l4: L4) -> (Vec<u8>, usize) {
+pub(crate) fn packet(dst_mac: Mac, src_mac: Mac, src: &str, dst: &str, l4: L4) -> (Vec<u8>, usize) {
     let mut f = vec![0u8; 4096];
     let p = &mut f[OFF..];
     eth::write(p, dst_mac, src_mac, eth::TYPE_IPV4);
@@ -155,7 +155,7 @@ fn l4_sum(ip_pkt: &[u8]) -> u16 {
     checksum::checksum(&[pseudo.as_slice(), seg].concat())
 }
 
-fn tx(v: Verdict) -> (PortId, usize, usize) {
+pub(crate) fn tx(v: Verdict) -> (PortId, usize, usize) {
     match v {
         Verdict::Tx { port, off, len } => (port, off, len),
         Verdict::Drop(r) => panic!("expected Tx, got {r:?}"),
@@ -165,7 +165,7 @@ fn tx(v: Verdict) -> (PortId, usize, usize) {
 fn hdr(f: &[u8], off: usize, len: usize) -> ipv4::Header {
     ipv4::parse(&f[off + 14..off + len]).expect("valid IP header")
 }
-fn ports_of(f: &[u8], off: usize) -> (u16, u16) {
+pub(crate) fn ports_of(f: &[u8], off: usize) -> (u16, u16) {
     (
         u16::from_be_bytes([f[off + 34], f[off + 35]]),
         u16::from_be_bytes([f[off + 36], f[off + 37]]),
@@ -390,19 +390,38 @@ fn ports_are_split_between_workers_and_freed_on_expiry() {
     let p = ports_of(&f, off).0;
     assert_eq!(p % 2, 1, "worker 1 of 2 uses odd ports");
     // A reply to it that worker 0 gets instead (the card picked the wrong
-    // queue) is named for what it is.
+    // queue) is handed to worker 1, which delivers it.
     let mut other = router(NatConfig::default());
     other.set_worker(0, 2);
     let (mut f, n) = packet(R_WAN, ISP, "8.8.8.8", "203.0.113.1", L4::Udp(53, p));
     assert_eq!(
         other.process(1, &mut f, OFF, n),
+        Verdict::Drop(DropReason::HandedOff)
+    );
+    let h = other.handoffs.pop().unwrap();
+    assert_eq!((h.worker, h.ingress, h.via), (1, 1, None));
+    let mut g = vec![0u8; 4096];
+    g[OFF..OFF + h.frame.len()].copy_from_slice(&h.frame);
+    let (port, off2, _) = tx(r.process_handed(h.ingress, h.via, &mut g, OFF, h.frame.len()));
+    assert_eq!((port, eth::dst(&g[off2..])), (0, HOST_A));
+    assert_eq!(r.stats.handed_in, 1);
+    // Handed over once, never again: if the owner doesn't have it either,
+    // it's dropped there.
+    let mut stray = router(NatConfig::default());
+    stray.set_worker(0, 2);
+    let mut g = vec![0u8; 4096];
+    g[OFF..OFF + h.frame.len()].copy_from_slice(&h.frame);
+    assert_eq!(
+        stray.process_handed(h.ingress, h.via, &mut g, OFF, h.frame.len()),
         Verdict::Drop(DropReason::NatWrongWorker)
     );
-    // 31 s later the UDP session (and its port) is gone; replies are refused,
-    // and the session is counted as never answered.
-    r.set_time(32_000_000_000);
+    assert!(stray.handoffs.is_empty());
+    // Later the UDP session (and its port) is gone; replies are refused. (It
+    // was answered: the handed-over reply reached it.)
+    r.set_time(200_000_000_000);
     r.housekeeping();
-    assert_eq!(r.stats.sessions_unanswered, 1);
+    assert_eq!(r.stats.sessions_unanswered, 0);
+    assert_eq!(r.stats.sessions_expired, 1);
     let (mut f, n) = packet(R_WAN, ISP, "8.8.8.8", "203.0.113.1", L4::Udp(53, p));
     assert_eq!(
         r.process(1, &mut f, OFF, n),

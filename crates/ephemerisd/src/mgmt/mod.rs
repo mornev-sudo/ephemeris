@@ -170,6 +170,8 @@ pub struct Summary {
     pub sessions_expired: u64,
     pub sessions_unanswered: u64,
     pub sessions_early_dropped: u64,
+    /// Packets workers handed to the one owning their session.
+    pub handed_in: u64,
     pub tcp_blind: u64,
     pub arp_conflicts: u64,
     pub sessions: Vec<SessionView>,
@@ -217,6 +219,7 @@ impl Summary {
             s.sessions_expired += r.stats.sessions_expired;
             s.sessions_unanswered += r.stats.sessions_unanswered;
             s.sessions_early_dropped += r.stats.sessions_early_dropped;
+            s.handed_in += r.stats.handed_in;
             s.tcp_blind += r.stats.tcp_blind;
             s.arp_conflicts += r.stats.arp_conflicts;
             if s.ports.len() < r.stats.ports.len() {
