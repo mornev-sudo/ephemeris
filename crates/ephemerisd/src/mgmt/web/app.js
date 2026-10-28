@@ -641,7 +641,8 @@ function renderSdwanCfg() {
   box.append(el("h2", "Other sites"), el("p",
     "Every other router in the network. Tethers are built to the sites this router's role connects to " +
     "(one per outside interface and address); the rest are reached through a hub. " +
-    "Leave Addresses empty for a site without a fixed address: it's learned when that site gets in touch. " +
+    "Leave Addresses empty for a site without a fixed address: it's learned when that site gets in touch; Links is how many WAN links it has " +
+    "(fibre and LTE: 2), each followed on its own. A site whose fixed address changes (a PPPoE redial) is followed too. " +
     "Public key: the other router's (its SD-WAN tab shows it). With one, tethers get fresh session keys from a handshake every " +
     "two minutes, so a key stolen later can't decrypt anything recorded before; set it on both routers. " +
     "The key, if set, must be the same on both routers: generate it here, then copy it into the other router's entry for this one " +
@@ -652,10 +653,11 @@ function renderSdwanCfg() {
     { key: "id", label: "Site id", type: "number", min: 1 },
     { key: "role", label: "Role", type: "select", options: [["hub", "hub"], ["spoke", "spoke"], ["mesh", "mesh"]], empty: "mesh" },
     { key: "addresses", label: "WAN addresses", type: "list", placeholder: "learned" },
+    { key: "links", label: "Links (if learned)", type: "number", min: 1, max: 8 },
     { key: "prefixes", label: "Networks", type: "list", placeholder: "10.2.0.0/16" },
     { key: "public_key", label: "Public key", placeholder: "its public key", optional: true },
     { key: "key", label: "Key", type: "key" },
-  ], () => ({ name: "", id: nextSiteId(), role: "spoke", addresses: [], prefixes: [], public_key: null, key: null }), "Add site");
+  ], () => ({ name: "", id: nextSiteId(), role: "spoke", addresses: [], prefixes: [], links: 1, public_key: null, key: null }), "Add site");
   box.append(t);
 }
 

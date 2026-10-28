@@ -1009,11 +1009,14 @@ async fn overlay(State(s): St) -> Json<Value> {
                 "name": t.name, "interface": ports[t.port as usize].name,
                 // A peer without a fixed address: where it was last heard
                 // from, if it has been.
-                "remote": if t.remote.is_unspecified() {
-                    s.endpoints.get(t.id).map(|(ip, port)| format!("{ip}:{port} (learned)"))
-                        .unwrap_or_else(|| "waiting to hear from it".into())
-                } else {
-                    t.remote.to_string()
+                "remote": match (t.remote.is_unspecified(), s.endpoints.get(t.id)) {
+                    (true, Some((ip, port))) => format!("{ip}:{port} (learned)"),
+                    (true, None) => "waiting to hear from it".into(),
+                    // Its address changed (a PPPoE redial): followed.
+                    (false, Some((ip, _))) if ip != t.remote => {
+                        format!("{ip} (moved from {})", t.remote)
+                    }
+                    (false, _) => t.remote.to_string(),
                 },
                 "site": t.peer_site,
                 "crypto": crypto_name(o, t),
@@ -1135,12 +1138,24 @@ fn this_site(s: &Shared, cfg: &crate::config::Config) -> Option<crate::config::S
             .filter(|h| !h.is_empty())
             .unwrap_or_else(|| format!("site{}", o.site_id))
     });
+    // Without a fixed address, the other router learns each of our WAN
+    // links: tell it how many there are.
+    let links = if addresses.is_empty() {
+        cfg.interfaces
+            .iter()
+            .filter(|i| i.role == crate::config::RoleCfg::Outside)
+            .count()
+            .clamp(1, 8) as u8
+    } else {
+        1
+    };
     Some(crate::config::SiteCfg {
         name,
         id: o.site_id,
         role: o.role,
         addresses,
         prefixes,
+        links,
         key: None,
         public_key: None,
     })

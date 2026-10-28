@@ -548,6 +548,19 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             replay.restore(idx, worker, seen);
         }
     }
+    // Peers found elsewhere before the restart: start there (unless the
+    // config was changed since: then the configured address wins).
+    for (name, configured, ip, port) in overlay_state::load_moved(state_dir) {
+        if let Some(t) = overlay
+            .tethers
+            .iter()
+            .find(|t| t.name == name && t.remote == configured)
+        {
+            endpoints.learn(t.id, ip, port);
+            info!(target: crate::logging::cat::SDWAN,
+                "tether {name}: its peer was last at {ip}, not the configured {configured}: starting there");
+        }
+    }
     let overlay = Arc::new(overlay);
     let nat = Arc::new(cfg.nat()?);
     for p in ports.iter() {
@@ -735,16 +748,97 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     })
 }
 
+/// How long an outside address change keeps being announced.
+const ANNOUNCE_FOR: Duration = Duration::from_secs(3600);
+
+/// Our outside addresses, to notice when one changes (a PPPoE redial, a new
+/// DHCP lease) and announce it to the other sites: (old, new, when).
+struct AddressWatch {
+    last: Vec<Option<std::net::Ipv4Addr>>,
+    changes: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr, Instant)>,
+}
+
+impl AddressWatch {
+    /// Whether the list to announce changed.
+    fn check(&mut self, ports: &[eph_dataplane::Port]) -> bool {
+        let mut changed = false;
+        self.last.resize(ports.len(), None);
+        for (p, last) in ports.iter().zip(self.last.iter_mut()) {
+            if p.role != eph_dataplane::Role::Outside || p.addr.is_unspecified() {
+                continue; // a PPPoE link that's down: wait for its new address
+            }
+            match *last {
+                Some(old) if old != p.addr => {
+                    info!(target: crate::logging::cat::SDWAN,
+                        "{}: address changed from {old} to {}: telling the other sites", p.name, p.addr);
+                    self.changes.push((old, p.addr, Instant::now()));
+                    changed = true;
+                }
+                _ => {}
+            }
+            *last = Some(p.addr);
+        }
+        let before = self.changes.len();
+        self.changes.retain(|c| c.2.elapsed() < ANNOUNCE_FOR);
+        let keep = eph_dataplane::overlay::ANNOUNCE_MAX;
+        if self.changes.len() > keep {
+            self.changes.drain(..self.changes.len() - keep);
+        }
+        changed || self.changes.len() != before
+    }
+
+    fn list(&self) -> Arc<[(std::net::Ipv4Addr, std::net::Ipv4Addr)]> {
+        self.changes.iter().map(|&(a, b, _)| (a, b)).collect()
+    }
+}
+
 /// Twice a second: tether health from probe results, then path decisions.
-/// Every few seconds, also the peers' newest runs (see `overlay_state`).
+/// Every few seconds, also the peers' newest runs, peers that moved (see
+/// `overlay_state`), and changes of our own outside addresses.
 fn path_loop(shared: &Shared, epoch: Instant, replay: &ReplayGuard, state_dir: &Path) {
     let mut sel = PathSelector::new(shared.overlay.clone());
     let mut saved = overlay_state::load_peers(state_dir);
+    let mut moved_saved = overlay_state::load_moved(state_dir);
+    let mut watch = AddressWatch {
+        last: vec![],
+        changes: vec![],
+    };
     let mut tick = 0u32;
     while !STOP.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(TICK_MS));
         tick = tick.wrapping_add(1);
+        if tick.is_multiple_of(4) {
+            let ports = shared.ports.read().unwrap().clone();
+            if watch.check(&ports) {
+                let list = watch.list();
+                for tx in shared.control.lock().unwrap().iter() {
+                    let _ = tx.send(Control::SetAnnounce(list.clone()));
+                }
+            }
+        }
         if tick.is_multiple_of(10) {
+            let moved: Vec<overlay_state::Moved> = shared
+                .overlay
+                .tethers
+                .iter()
+                .filter(|t| !t.remote.is_unspecified())
+                .filter_map(|t| {
+                    let (ip, port) = shared.endpoints.get(t.id)?;
+                    (ip != t.remote).then(|| (t.name.clone(), t.remote, ip, port))
+                })
+                .collect();
+            if moved != moved_saved {
+                for m in moved.iter().filter(|m| !moved_saved.contains(m)) {
+                    info!(target: crate::logging::cat::SDWAN,
+                        "tether {}: its peer is now at {} (configured: {})", m.0, m.2, m.1);
+                }
+                match overlay_state::save_moved(state_dir, &moved) {
+                    Ok(()) => moved_saved = moved,
+                    Err(e) => {
+                        warn!(target: crate::logging::cat::SDWAN, "saving where SD-WAN peers moved: {e:#}")
+                    }
+                }
+            }
             let sites = &shared.overlay.sites;
             let mut peers: Vec<(u16, u8, u16)> = replay
                 .runs()
@@ -840,21 +934,17 @@ fn apply_handshakes(shared: &Shared, out: crate::sdwan::Output) {
     }
     let control = shared.control.lock().unwrap();
     for a in out.actions {
-        match a {
-            Action::Learn { tether, ip, port } => shared.endpoints.learn(tether, ip, port),
-            Action::Send {
+        let Action::Send {
+            tether,
+            to,
+            payload,
+        } = a;
+        if let Some(tx) = control.first() {
+            let _ = tx.send(Control::Handshake {
                 tether,
                 to,
                 payload,
-            } => {
-                if let Some(tx) = control.first() {
-                    let _ = tx.send(Control::Handshake {
-                        tether,
-                        to,
-                        payload,
-                    });
-                }
-            }
+            });
         }
     }
     if let Some(keys) = out.keys {
@@ -921,5 +1011,54 @@ fn print_stats(shared: &Shared, show_sessions: usize) {
     newest.sort_by_key(|v| std::cmp::Reverse(v.session.created_ns));
     for v in newest.into_iter().take(show_sessions) {
         info!(target: crate::logging::cat::DATAPLANE, "  {v}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wan(addr: &str) -> eph_dataplane::Port {
+        let addr = addr.parse().unwrap();
+        eph_dataplane::Port {
+            id: 0,
+            name: "wan".into(),
+            mac: [2, 0, 0, 0, 0, 1],
+            addr,
+            subnet: eph_fib::Prefix::new(addr, 32).unwrap(),
+            allow_new_sessions: false,
+            role: eph_dataplane::Role::Outside,
+            mss_adjust: None,
+            dhcp: eph_dataplane::Dhcp::Off,
+            gateway: None,
+            pppoe: eph_dataplane::Pppoe::Off,
+            onlink: vec![],
+            mtu: 1492,
+            card: 0,
+            vlan: None,
+            host: Default::default(),
+        }
+    }
+
+    #[test]
+    fn outside_address_changes_are_announced_for_a_while() {
+        let mut w = AddressWatch {
+            last: vec![],
+            changes: vec![],
+        };
+        assert!(
+            !w.check(&[wan("192.0.2.1")]),
+            "the first one isn't a change"
+        );
+        assert!(!w.check(&[wan("0.0.0.0")]), "PPPoE down: wait");
+        assert!(w.check(&[wan("203.0.113.9")]));
+        assert_eq!(
+            &w.list()[..],
+            [("192.0.2.1".parse().unwrap(), "203.0.113.9".parse().unwrap())]
+        );
+        assert!(!w.check(&[wan("203.0.113.9")]));
+        w.changes[0].2 -= ANNOUNCE_FOR;
+        assert!(w.check(&[wan("203.0.113.9")]), "expired: dropped");
+        assert!(w.list().is_empty());
     }
 }

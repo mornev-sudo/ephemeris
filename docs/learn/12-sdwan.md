@@ -305,10 +305,52 @@ address *and port*, and sends there.
   hub's overlay port, so the NAT lets the replies in.
 - **Keepalives:** the branch's probes, five a second, keep the NAT's
   mapping alive.
-- **Security:** a packet that doesn't authenticate never moves the
-  endpoint, so without the key nobody can redirect a tether.
-- **The limit:** one side of each pair needs a fixed address. Two sites
-  that both learn would wait for each other forever.
+- **Several links:** a branch with fibre *and* LTE, each behind its own
+  NAT, reaches the hub from two addresses. Tell the hub how many links it
+  has (`links = 2` in its `[[site]]`; "Copy entry" fills it in), and the
+  hub keeps a tether per link, `<site>-<wan>` and `<site>-<wan>-2`, each
+  following its own link's address and NAT port. They're told apart by the
+  sender's tether id in the header, which differs per link. A link that
+  falls silent for 30 seconds frees its tether for another (say the branch's
+  tethers were renumbered). More links than tethers are counted as
+  `overlay-links-full`.
+- **Security:** only a packet that authenticates *and* isn't a replay ever
+  moves a tether, so without the key nobody can redirect one, and a
+  captured packet sent again from elsewhere doesn't either. (That's also
+  why handshake messages never move one: a captured initiation would still
+  verify. The answer to it goes back where it came from; the tether moves
+  with the first sealed packet.)
+- **The limit:** one side of each pair needs a reachable address. Two
+  sites that both learn would wait for each other forever.
+
+### Addresses that change
+
+A hub on PPPoE keeps its public address only until the line redials. Its
+`[[site]]` entries elsewhere still name the old one. Two things follow it
+there:
+
+- **Following.** Every tether, configured address or not, follows its
+  peer to wherever its authenticated packets come from. The hub keeps
+  probing from its new address five times a second, so a branch that can
+  receive them (a public address, or a NAT that lets them in) switches at
+  once.
+- **Announcing.** Many NATs drop packets from an address they haven't sent
+  to. So for an hour after one of its outside addresses changes, a router
+  tells every peer, once a second over every tether that still works,
+  "192.0.2.2 is now 203.0.113.9" (message type 6, sealed like a probe).
+  Tethers still sending to the old address move to the new one, the branch
+  sends there first, and its NAT opens.
+
+A branch remembers where a peer moved (`/var/lib/ephemeris/overlay-moved`),
+so a restart doesn't go back to the stale address; editing the address in
+the config wins over that. The SD-WAN tab shows such a tether as
+`203.0.113.9 (moved from 192.0.2.2)`.
+
+**When it can't recover by itself:** a hub with a single WAN whose address
+changes, and branches behind NATs that drop packets from unknown
+addresses. No path is left to carry the news, so those branches need the
+new address in their config. Give such a hub a second WAN (any path
+carries the announcement), or a fixed address.
 
 ### Hand-written tethers and application classes
 

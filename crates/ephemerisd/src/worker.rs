@@ -117,6 +117,7 @@ impl Worker {
                     Control::Transmit { port, frame } => outbox.push((port, frame)),
                     Control::InjectHost(p) => host_in.push(p),
                     Control::SetKeys(keys) => self.pipeline.set_keys(keys),
+                    Control::SetAnnounce(a) => self.pipeline.set_announce(a),
                     Control::Handshake {
                         tether,
                         to,

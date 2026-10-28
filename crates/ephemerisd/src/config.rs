@@ -108,6 +108,11 @@ pub struct SiteCfg {
     /// The networks behind it, e.g. ["10.2.0.0/16"].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefixes: Vec<String>,
+    /// Without fixed addresses: how many WAN links it sends from (fibre and
+    /// LTE: 2). Each gets a path of its own here, following that link's
+    /// address and NAT port.
+    #[serde(default = "default_links", skip_serializing_if = "is_one")]
+    pub links: u8,
     /// The key this router and that site share: 64 hex characters, the same
     /// on both. Without one (and without `public_key`), no tether to it
     /// comes up.
@@ -120,6 +125,13 @@ pub struct SiteCfg {
     /// directly, as before 0.12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+}
+
+fn default_links() -> u8 {
+    1
+}
+fn is_one(n: &u8) -> bool {
+    *n == 1
 }
 
 fn default_overlay_port() -> u16 {
@@ -1628,6 +1640,9 @@ impl Config {
                 parse_public_key(k)
                     .map_err(|e| anyhow::anyhow!("site {}: public_key {e:#}", s.name))?;
             }
+            if !(1..=8).contains(&s.links) {
+                bail!("site {}: links must be between 1 and 8", s.name);
+            }
             let remotes: Vec<Ipv4Addr> = s
                 .addresses
                 .iter()
@@ -1643,9 +1658,10 @@ impl Config {
             if !oc.role.peers_with(s.role) {
                 continue;
             }
-            // No fixed address: learn it (one tether per WAN interface).
+            // No fixed address: learn it, a path per link of the site's on
+            // each of our WANs.
             let remotes = if remotes.is_empty() {
-                vec![Ipv4Addr::UNSPECIFIED]
+                vec![Ipv4Addr::UNSPECIFIED; s.links as usize]
             } else {
                 remotes
             };
@@ -2504,6 +2520,24 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
             "203.0.113.4".parse::<Ipv4Addr>().unwrap()
         );
         assert_eq!(o.sites.len(), 3, "a hub connects to everyone");
+        assert!(o.tethers.iter().all(|t| !t.name.starts_with("dbn-wan-")));
+        // dbn has two WAN links (fibre and LTE, both behind NAT): a path
+        // for each, followed separately.
+        let two = hub.replace(
+            "prefixes = [\"10.3.0.0/16\"]",
+            "prefixes = [\"10.3.0.0/16\"]\nlinks = 2",
+        );
+        let o = parse(&two).unwrap().overlay().unwrap();
+        let dbn: Vec<&str> = o
+            .tethers
+            .iter()
+            .filter(|t| t.name.starts_with("dbn"))
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(dbn, ["dbn-wan", "dbn-wan-2"]);
+        assert!(parse(&two.replace("links = 2", "links = 9"))
+            .and_then(|c| c.overlay())
+            .is_err());
     }
 
     #[test]

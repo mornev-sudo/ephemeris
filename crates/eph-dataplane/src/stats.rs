@@ -94,10 +94,13 @@ pub enum DropReason {
     OverlayNoKey,
     /// SD-WAN handshake message handed to the control plane.
     OverlayHandshake,
+    /// From a site without a fixed address, over more of its WAN links than
+    /// it has slots here (`links` in its `[[site]]`).
+    OverlayLinksFull,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 40] = [
+    pub const ALL: [DropReason; 41] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -138,6 +141,7 @@ impl DropReason {
         DropReason::NatWrongWorker,
         DropReason::OverlayNoKey,
         DropReason::OverlayHandshake,
+        DropReason::OverlayLinksFull,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -183,6 +187,7 @@ impl DropReason {
             DropReason::NatWrongWorker => "nat-wrong-worker",
             DropReason::OverlayNoKey => "overlay-no-key",
             DropReason::OverlayHandshake => "overlay-handshake",
+            DropReason::OverlayLinksFull => "overlay-links-full",
         }
     }
 }
