@@ -97,10 +97,15 @@ pub enum DropReason {
     /// From a site without a fixed address, over more of its WAN links than
     /// it has slots here (`links` in its `[[site]]`).
     OverlayLinksFull,
+    /// Handed to the worker that owns its session (not a real drop; see
+    /// `steer`).
+    HandedOff,
+    /// For another worker, but its queue was full.
+    HandoffFull,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 41] = [
+    pub const ALL: [DropReason; 43] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -142,6 +147,8 @@ impl DropReason {
         DropReason::OverlayNoKey,
         DropReason::OverlayHandshake,
         DropReason::OverlayLinksFull,
+        DropReason::HandedOff,
+        DropReason::HandoffFull,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -188,6 +195,8 @@ impl DropReason {
             DropReason::OverlayNoKey => "overlay-no-key",
             DropReason::OverlayHandshake => "overlay-handshake",
             DropReason::OverlayLinksFull => "overlay-links-full",
+            DropReason::HandedOff => "handed-off",
+            DropReason::HandoffFull => "handoff-full",
         }
     }
 }
@@ -206,6 +215,8 @@ pub struct Stats {
     pub sessions_unanswered: u64,
     /// Dropped early to make room in a full table.
     pub sessions_early_dropped: u64,
+    /// Packets other workers handed to this one (their session is here).
+    pub handed_in: u64,
     /// TCP segments whose sequence number didn't fit their connection (any
     /// RST or FIN in them was ignored).
     pub tcp_blind: u64,
@@ -238,6 +249,7 @@ impl Default for Stats {
             sessions_expired: 0,
             sessions_unanswered: 0,
             sessions_early_dropped: 0,
+            handed_in: 0,
             tcp_blind: 0,
             arp_conflicts: 0,
             drops: [0; DropReason::COUNT],

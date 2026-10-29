@@ -186,7 +186,7 @@ fn encryption(x: &serde_json::Value) -> String {
     if x["public_key"].is_string() {
         let h = &x["handshake"];
         return match h["key_age_s"].as_u64() {
-            Some(age) => format!("handshake, keys {age}s old"),
+            Some(age) => format!("handshake, {}, keys {age}s old", str(&h["cipher"])),
             None if h["pending"] == true => "handshake, waiting".into(),
             None => "handshake, no keys yet".into(),
         };

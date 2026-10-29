@@ -603,6 +603,9 @@ async fn status(State(s): St) -> Json<Value> {
             "rx": sum.rx, "forwarded": sum.forwarded, "originated": sum.originated,
             "kernel_drops": sum.kernel_drops, "fill_empty": sum.fill_empty,
             "tcp_blind": sum.tcp_blind, "arp_conflicts": sum.arp_conflicts,
+            // Packets that reached a worker other than the one holding
+            // their session, and were handed to it (see `steer`).
+            "handed_between_workers": sum.handed_in,
         },
         "drops": sum.drops,
         "sessions": {

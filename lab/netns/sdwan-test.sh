@@ -55,7 +55,10 @@ wan() { # ns r1-veth r2-veth delay
     ip link add "$3" type veth peer name port2 netns "$1"
     for p in port1 port2; do
         ip -n "$1" link set dev "$p" master br0 up
-        ip netns exec "$1" tc qdisc add dev "$p" root netem delay "$4"
+        # A queue deep enough for these rates: netem's default (1000
+        # packets) overflows at 80 ms and turns a throughput test into a
+        # loss test.
+        ip netns exec "$1" tc qdisc add dev "$p" root netem delay "$4" limit 20000
     done
     ip link set dev "$2" up
     ip link set dev "$3" up
@@ -139,7 +142,7 @@ config 2 1 18082 > "$WORK/r2/ephemeris.toml"
 
 eph1() { EPHCTL_URL=http://127.0.0.1:18081 EPHCTL_TOKEN=$(cat "$WORK/r1/token") "$EPHCTL" "$@"; }
 # Read ephctl's tables: tether rows are
-#   NAME VIA REMOTE SITE STATE RTT ms JITTER ms LOSS TX RX   ($5 state, $6 rtt, $11 tx)
+#   NAME VIA REMOTE SITE STATE RTT ms JITTER ms LOSS TX RX   ($5 state, $6 rtt, $10 loss, $11 tx)
 # and path rows are  SITE CLASS USING.
 tun_field() { eph1 overlay | awk -v n="$1" -v f="$2" '$1 == n {print $f}'; }
 path_of() { eph1 overlay | awk -v c="$1" '$1 ~ /^[0-9]+$/ && $2 == c {print $3}'; }
@@ -148,6 +151,15 @@ uses() { [ "$(path_of "$1")" = "$2" ]; }
 fibre_down() { [ "$(tun_field fibre 5)" = DOWN ]; }
 fibre_rtt_ok() { local r; r=$(tun_field fibre 6 | cut -d. -f1); [ "$r" -ge 8 ] && [ "$r" -le 30 ]; }
 lte_carried() { [ $(( $(tun_field lte 11) - $1 )) -gt 500 ]; }
+loss_clear() { [ "$(tun_field fibre 10)" = "0.0%" ]; }
+# TCP for 5 s through the overlay to port $1 (the first second, TCP's slow
+# start, left out); prints what the receiver got and the sender's
+# retransmissions.
+tcp_through() {
+    ip netns exec sd-ha iperf3 -c 10.2.0.10 -p "$1" -t5 -O1 > "$WORK/iperf-$1" 2>&1 || return 1
+    awk '/receiver/ {rx = $(NF-2) " " $(NF-1)} /sender/ {re = $(NF-1)} END {
+        if (rx == "") exit 1; print rx ", " re " retransmissions"}' "$WORK/iperf-$1"
+}
 wait_for() { # seconds description command...
     local t=$1 d=$2; shift 2
     for _ in $(seq 1 $((t * 5))); do "$@" >/dev/null 2>&1 && return 0; sleep 0.2; done
@@ -171,10 +183,15 @@ check "RTT reflects fibre (< 30 ms)"      sh -c "ip netns exec sd-ha ping -c3 -i
 check "fibre probes measure ~10 ms RTT"   fibre_rtt_ok
 check "Frag Needed with overlay MTU"      sh -c "ip netns exec sd-ha ping -c1 -W1 -M do -s 1472 10.2.0.10 2>&1 | grep -qi 'mtu'"
 if command -v iperf3 >/dev/null; then
-    ip netns exec sd-hb iperf3 -s -1 -D; sleep 0.5
+    # Port 5201 is the bulk class (over LTE); 5202 is default traffic (fibre).
+    ip netns exec sd-hb iperf3 -s -p 5201 -1 -D
+    ip netns exec sd-hb iperf3 -s -p 5202 -1 -D
+    sleep 0.5
+    check "TCP over the fibre tether (5 ms each way)" tcp_through 5202
+    sed 's/^/        /' "$WORK/out"
     before=$(tun_field lte 11)
-    check "TCP through overlay (bulk class)" ip netns exec sd-ha iperf3 -c 10.2.0.10 -t3
-    grep -E "sender|receiver" "$WORK/out" | sed 's/^/        /' || true
+    check "TCP over the lte tether (40 ms each way, bulk class)" tcp_through 5201
+    sed 's/^/        /' "$WORK/out"
     check "bulk class went over lte"      lte_carried "$before"
 fi
 
@@ -192,7 +209,10 @@ check "still reachable over lte"          ip netns exec sd-ha ping -c3 -i0.2 -W1
 ip -n sd-wan1 link set dev br0 up
 check "fibre recovers, traffic moves back" wait_for 10 "fibre chosen again" uses default fibre
 
-echo; eph1 overlay | sed 's/^/  /'
+# The table's LOSS is over the last 5 seconds: wait for the cut to drop
+# out of it, so it shows the state now.
+wait_for 10 "fibre loss window clear" loss_clear >/dev/null || true
+echo; echo "  (LOSS: the last 5 seconds)"; eph1 overlay | sed 's/^/  /'
 echo; echo "R1 log (path changes):"; grep -i "path change" "$WORK/r1.log" | sed 's/^/  /' || true
 echo; echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

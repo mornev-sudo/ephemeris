@@ -256,7 +256,7 @@ function encryption(x) {
   if (!x.connected) return td("not needed", "s");
   if (x.public_key) {
     const h = x.handshake || {};
-    if (h.key_age_s != null) return td(`handshake · keys ${dur(h.key_age_s)} old`, "ok");
+    if (h.key_age_s != null) return td(`handshake · ${h.cipher} · keys ${dur(h.key_age_s)} old`, "ok");
     return td(h.pending ? "handshake · waiting for it" : "handshake · no keys yet", "warn");
   }
   return x.has_key ? td("pre-shared key", "ok") : td("missing", "bad");
@@ -635,6 +635,8 @@ function renderSdwanCfg() {
     { key: "udp_port", label: "UDP port", type: "number", min: 1 },
     { key: "mtu", label: "Overlay MTU", type: "number", min: 576 },
     { key: "allow_new_sessions", label: "Hosts at other sites may start sessions here", type: "check" },
+    { key: "cipher", label: "Cipher (sites with a public key)", type: "select", empty: "auto",
+      options: [["auto", "auto: AES-256-GCM if both have AES in hardware"], ["aes-256-gcm", "AES-256-GCM only"], ["chacha20-poly1305", "ChaCha20-Poly1305 only"]] },
   ]);
   top.append(f);
   cfg.site = cfg.site || [];

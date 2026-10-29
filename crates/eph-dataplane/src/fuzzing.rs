@@ -18,8 +18,8 @@
 
 use crate::host::HostAccess;
 use crate::overlay::{
-    self, select_paths, KeyTable, Overlay, PathTable, PeerCrypto, Session, Tether, TetherHealth,
-    TetherKey,
+    self, select_paths, Cipher, KeyTable, Overlay, PathTable, PeerCrypto, Session, Tether,
+    TetherHealth, TetherKey,
 };
 use crate::trace::{TraceCat, TraceConfig};
 use crate::{
@@ -124,10 +124,12 @@ const LOCAL_ID: u8 = 1;
 const TO_US: TetherKey = TetherKey([0x32; 32]);
 
 fn session() -> Session {
+    // AES-256-GCM: the pre-shared tether already covers ChaCha20.
     Session::new(
         1,
         LOCAL_ID,
         2,
+        Cipher::Aes256Gcm,
         TetherKey([0x31; 32]),
         TO_US,
         1_000_000_000,
@@ -252,6 +254,7 @@ pub fn run(r: &mut Pipeline, input: &[u8]) {
     }
     r.punts.clear();
     r.handshakes.clear();
+    r.handoffs.clear();
     r.host_out.clear();
     r.learned.clear();
     r.tracer.events.clear();
@@ -340,7 +343,8 @@ fn from_site_3(typ: u8, body: &[u8]) -> Vec<u8> {
         // templates with the same number would be a replay.
         hdr[8..16].copy_from_slice(&(typ as u64).to_be_bytes());
         payload[..overlay::HDR_LEN].copy_from_slice(&hdr);
-        let tag = TO_US.seal(&hdr, &mut payload[overlay::HDR_LEN..]);
+        let tag = overlay::SessionKey::new(Cipher::Aes256Gcm, TO_US)
+            .seal(&hdr, &mut payload[overlay::HDR_LEN..]);
         payload.extend_from_slice(&tag);
     }
     udp(R_WAN, ("192.0.2.5", 4800), ("192.0.2.1", 4800), &payload)

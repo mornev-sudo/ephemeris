@@ -192,6 +192,7 @@ a browser.
 - [ ] **Performance and capacity:**
   - [ ] Benchmarks: a microbenchmark of the per-packet pipeline (CPU ceiling per core, no NIC), and a lab test with a traffic generator (pktgen / TRex) for real packets per second on Proxmox and on hardware NICs
   - [x] Memory-aware sizing: `sessions.max_per_worker = "auto"` (the default) sized from the RAM available at start, and a start-up check that refuses or warns when the reserved tables (sessions, FIB, packet buffers) exceed what the machine has
+  - [x] Several workers with NAT: NAT ports chosen so the card delivers each reply to the worker holding its session (Toeplitz hash computed from the card's own key and table), and anything that lands elsewhere (ICMP, PPPoE, cards without readable RSS) handed to that worker; SD-WAN tether traffic handed to the worker its LAN replies reach
   - [ ] Scaling beyond one core per flow: spread PPPoE traffic (NICs can't hash inside PPPoE, so a PPPoE WAN lands on one queue) and SD-WAN tether traffic (one UDP flow per tether) across workers
   - [ ] Jumbo frames: interface MTUs above 1500 (bigger packet buffers, the NIC's own MTU raised)
 - [ ] **Phase 4: SD-WAN.**

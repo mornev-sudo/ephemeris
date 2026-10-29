@@ -73,14 +73,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
+      # Optimised (the lab profile: release without LTO), so the throughput
+      # it reports means something.
       - name: Build
-        run: cargo build --locked -p ephemerisd -p ephctl
+        run: cargo build --locked --profile lab -p ephemerisd -p ephctl
       - name: Test tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends iperf3
       - name: Two routers, two WANs
         run: |
           mkdir -p sdwan-logs
-          sudo LOGS=$PWD/sdwan-logs lab/netns/sdwan-test.sh target/debug/ephemerisd
+          sudo LOGS=$PWD/sdwan-logs lab/netns/sdwan-test.sh target/lab/ephemerisd
       - name: Keep the routers' logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

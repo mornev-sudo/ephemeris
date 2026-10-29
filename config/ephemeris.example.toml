@@ -168,7 +168,10 @@ masquerade = true
 # site_id = 1
 # name = "cpt"
 # role = "spoke"
-#
+# cipher = "auto"   # session keys: AES-256-GCM when both routers have AES in
+#                   # hardware, else ChaCha20-Poly1305; or force one of them.
+#                   # `ephemerisd --bench-crypto` measures both here.
+
 # [[site]]
 # name = "jhb"
 # id = 2

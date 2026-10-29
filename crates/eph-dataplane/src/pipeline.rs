@@ -10,6 +10,7 @@ use crate::session::{
     Dir, FlowKey, NatBinding, SessionConfig, SessionTable, TcpSegment, Track, OVERLAY_INGRESS,
 };
 use crate::stats::{DropReason, Stats};
+use crate::steer::Steering;
 use crate::trace::{self, TraceCat, TraceConfig, TraceFlow, TraceKind, Tracer};
 use eph_fib::Fib;
 use eph_packet::{arp, checksum, eth, icmp, ipv4, l4, pppoe, Mac};
@@ -66,6 +67,28 @@ pub struct HandshakeIn {
     pub src: Ipv4Addr,
     pub sport: u16,
     pub payload: Vec<u8>,
+}
+
+/// What a tether packet is sealed with (see `Pipeline::next_seal`).
+#[derive(Clone, Copy)]
+enum SealWith {
+    PreShared(TetherKey),
+    /// The current session with the site at this index.
+    Session(usize),
+}
+
+/// A packet for another worker: the one that owns its session (see
+/// [`crate::steer`]). Copied out of the frame: the other worker has its own
+/// packet memory.
+#[derive(Debug, Clone)]
+pub struct Handoff {
+    pub worker: u16,
+    /// Where it arrived, and the tether it came out of, if any: the owner
+    /// carries on from there (`Pipeline::process_handed`).
+    pub ingress: PortId,
+    pub via: Option<TetherId>,
+    /// Ethernet header and IP packet.
+    pub frame: Vec<u8>,
 }
 
 /// A learned IP → MAC binding on a port.
@@ -184,6 +207,12 @@ pub struct Pipeline {
     pub learned: Vec<Neighbor>,
     /// Packets for the control plane (DHCP); the worker forwards these.
     pub punts: Vec<Punt>,
+    /// Packets for the workers that own their sessions.
+    pub handoffs: Vec<Handoff>,
+    /// How the network cards spread packets over the workers.
+    steer: Arc<Steering>,
+    /// Working on a packet another worker handed over: never hand it on.
+    handed: bool,
     /// SD-WAN handshake messages for the control plane.
     pub handshakes: Vec<HandshakeIn>,
     /// Packet tracing (debug logging), off unless asked for; the worker
@@ -246,6 +275,9 @@ impl Pipeline {
             emits: Vec::with_capacity(64),
             learned: Vec::with_capacity(16),
             punts: Vec::new(),
+            handoffs: Vec::new(),
+            steer: Arc::new(Steering::default()),
+            handed: false,
             handshakes: Vec::new(),
             tracer: Tracer::default(),
             host_out: Vec::new(),
@@ -380,6 +412,129 @@ impl Pipeline {
     /// Share one learned-endpoints table between all workers.
     pub fn set_endpoints(&mut self, endpoints: Arc<Endpoints>) {
         self.endpoints = endpoints;
+    }
+
+    /// How the network cards spread packets (read from them at start).
+    pub fn set_steering(&mut self, steer: Arc<Steering>) {
+        self.steer = steer;
+    }
+
+    /// A packet another worker handed over (see [`Handoff`]): carry on from
+    /// where it left off, at the IP layer. `frame[off..off + len]` holds its
+    /// Ethernet header and IP packet.
+    pub fn process_handed(
+        &mut self,
+        ingress: PortId,
+        via: Option<TetherId>,
+        frame: &mut [u8],
+        off: usize,
+        len: usize,
+    ) -> Verdict {
+        if ingress as usize >= self.ports.len() || len < ETH || off + len > frame.len() {
+            return Verdict::Drop(DropReason::Malformed);
+        }
+        self.stats.handed_in += 1;
+        self.handed = true;
+        let v = self.ipv4(ingress, frame, off, len, via);
+        self.handed = false;
+        if let (Verdict::Drop(r), true) = (v, self.tracer.cfg.mask != 0) {
+            self.trace_drop(r, ingress, &frame[off..off + len]);
+        }
+        let v = self.wrap_for_link(frame, v);
+        if let Verdict::Drop(r) = v {
+            self.stats.drop(r);
+        }
+        v
+    }
+
+    /// Give the packet to `worker`, which owns its session.
+    fn hand_off(
+        &mut self,
+        worker: u16,
+        ingress: PortId,
+        via: Option<TetherId>,
+        frame: &[u8],
+        off: usize,
+        len: usize,
+    ) -> Verdict {
+        if self.handoffs.len() >= PUNT_MAX {
+            return Verdict::Drop(DropReason::HandoffFull);
+        }
+        self.handoffs.push(Handoff {
+            worker,
+            ingress,
+            via,
+            frame: frame[off..off + len].to_vec(),
+        });
+        Verdict::Drop(DropReason::HandedOff)
+    }
+
+    /// The worker that owns NAT `port` on `nat_addr` (out of `port_id`) for
+    /// replies of `proto` from `remote:rport`: the one the card delivers
+    /// them to, where that can be predicted (see [`crate::steer`]), else
+    /// `port % workers`. `alloc_nat` only hands out ports this worker owns.
+    fn nat_owner(
+        &self,
+        port_id: PortId,
+        proto: u8,
+        (nat_addr, port): (Ipv4Addr, u16),
+        (remote, rport): (Ipv4Addr, u16),
+    ) -> u16 {
+        let p = &self.ports[port_id as usize];
+        // Cards can't hash inside PPPoE: everything lands on one queue.
+        if p.pppoe == Pppoe::Off && self.steer.steers_ports(p.card, proto) {
+            if let Some(q) = self
+                .steer
+                .queue(p.card, proto, (remote, rport), (nat_addr, port))
+                .filter(|&q| q < self.workers)
+            {
+                return q;
+            }
+        }
+        port % self.workers
+    }
+
+    /// For a packet out of a tether with no session here: the worker that
+    /// should hold its session. Where it goes on to a LAN card whose
+    /// spreading is known, the worker that card delivers the replies to;
+    /// on to another tether (transit through a hub), one picked by a fixed
+    /// symmetric hash, so both directions meet. `None`: unknown (keep it).
+    fn tether_owner(&self, frame: &[u8], off: usize, h: &ipv4::Header) -> Option<u16> {
+        let Ok(Flow::Tracked { key, lo_to_hi, .. }) =
+            flow_of(&frame[off + ETH..off + ETH + h.total_len], h)
+        else {
+            return None;
+        };
+        if self.sessions.lookup(&key).is_some() {
+            return None; // ours already
+        }
+        let (sport, dport) = if lo_to_hi {
+            (key.lo_port, key.hi_port)
+        } else {
+            (key.hi_port, key.lo_port)
+        };
+        let owner = match self.fib.lookup(h.dst)? {
+            NextHop::Ip { port, .. } => {
+                let p = &self.ports[*port as usize];
+                if p.pppoe != Pppoe::Off {
+                    return None;
+                }
+                // The reply, as the LAN host will send it.
+                self.steer
+                    .queue(p.card, key.proto, (h.dst, dport), (h.src, sport))?
+            }
+            NextHop::Site(_) => {
+                let x = (u32::from(h.src) ^ u32::from(h.dst))
+                    ^ (sport ^ dport) as u32
+                    ^ key.proto as u32;
+                (x.wrapping_mul(0x9e37_79b1) >> 16) as u16 % self.workers
+            }
+        };
+        (owner < self.workers).then_some(owner)
+    }
+
+    pub fn worker_id(&self) -> u16 {
+        self.worker_id
     }
 
     pub fn set_worker(&mut self, id: u16, count: u16) {
@@ -931,6 +1086,15 @@ impl Pipeline {
         if !self.source_ok(ingress, via, h.src) {
             return Verdict::Drop(DropReason::SpoofedSource);
         }
+        // Out of a tether: it landed on whichever worker the outer packet
+        // hashed to. Its session belongs where the replies will land.
+        if via.is_some() && self.workers > 1 && !self.handed {
+            if let Some(w) = self.tether_owner(frame, off, &h) {
+                if w != self.worker_id {
+                    return self.hand_off(w, ingress, via, frame, off, len);
+                }
+            }
+        }
 
         // Addressed to one of the router's own interfaces?
         // ...unless it's a reply to a NATed session (those come back to the
@@ -1144,7 +1308,7 @@ impl Pipeline {
                             (key.hi_port, key.lo_port)
                         };
                         let Some((port, xkey)) =
-                            self.alloc_nat(key.proto, addr, h.dst, sport, dport)
+                            self.alloc_nat(egress, key.proto, addr, h.dst, sport, dport)
                         else {
                             return Err(Verdict::Drop(DropReason::NatExhausted));
                         };
@@ -1314,6 +1478,7 @@ impl Pipeline {
     /// serve many sessions at once.
     fn alloc_nat(
         &self,
+        egress: PortId,
         proto: u8,
         addr: Ipv4Addr,
         dst: Ipv4Addr,
@@ -1327,10 +1492,33 @@ impl Pipeline {
         if !matches!(proto, ipv4::PROTO_TCP | ipv4::PROTO_UDP) && !icmp {
             return free(0).then(|| (0, key(0)));
         }
-        let (w, id) = (self.workers as u32, self.worker_id as u32);
-        if (icmp || sport >= 1024) && sport as u32 % w == id && free(sport) {
+        // Only ports whose replies come back to this worker (see `nat_owner`).
+        let ours = |p: u16| {
+            self.nat_owner(
+                egress,
+                proto,
+                (addr, p),
+                (dst, if icmp { p } else { dport }),
+            ) == self.worker_id
+        };
+        if (icmp || sport >= 1024) && ours(sport) && free(sport) {
             return Some((sport, key(sport)));
         }
+        let card = self.ports[egress as usize].card;
+        let steered = !icmp
+            && self.ports[egress as usize].pppoe == Pppoe::Off
+            && self.steer.steers_ports(card, proto);
+        if steered {
+            // The card decides: about one port in `workers` lands here.
+            let range = 65536 - 1024;
+            let start = (u32::from(dst) ^ sport as u32).wrapping_mul(0x9e37_79b1) % range;
+            return (0..range)
+                .map(|i| (1024 + (start + i) % range) as u16)
+                .find(|&p| ours(p) && free(p))
+                .map(|p| (p, key(p)));
+        }
+        // Otherwise this worker's share: ports where port % workers == id.
+        let (w, id) = (self.workers as u32, self.worker_id as u32);
         let slots = (65536 - 1024) / w;
         let start = (u32::from(dst) ^ sport as u32).wrapping_mul(0x9e37_79b1) % slots;
         (0..slots.min(8192))
@@ -1438,7 +1626,7 @@ impl Pipeline {
             && frame[l4] == icmp::ECHO_REQUEST
             && checksum::checksum(&frame[l4..off + len]) == 0;
         if !is_echo {
-            return Verdict::Drop(self.nat_miss(ingress, frame, off, len, h));
+            return self.nat_miss(ingress, frame, off, len, h);
         }
         if !self.take_icmp_token() {
             return Verdict::Drop(DropReason::IcmpRateLimited);
@@ -1462,33 +1650,26 @@ impl Pipeline {
     /// (and ICMP echo identifiers); worker w of n owns those where
     /// `port % n == w` (see `alloc_nat`).
     fn nat_miss(
-        &self,
+        &mut self,
         ingress: PortId,
         frame: &[u8],
         off: usize,
         len: usize,
         h: &ipv4::Header,
-    ) -> DropReason {
-        let l4 = off + ETH + h.hdr_len;
-        let nat_port = match h.proto {
-            ipv4::PROTO_TCP | ipv4::PROTO_UDP if len >= l4 - off + 4 => {
-                Some(u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]])).filter(|&p| p >= 1024)
-            }
-            ipv4::PROTO_ICMP if len >= l4 - off + 8 && frame[l4] == icmp::ECHO_REPLY => {
-                Some(u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]))
-            }
-            _ => None,
-        };
+    ) -> Verdict {
         let outside = self.ports[ingress as usize].role == Role::Outside;
-        match nat_port {
-            Some(p) if outside && self.nat.active() => {
-                if self.workers > 1 && p % self.workers != self.worker_id {
-                    DropReason::NatWrongWorker
-                } else {
-                    DropReason::NatNoSession
-                }
-            }
-            _ => DropReason::LocalUnhandled,
+        let Some((proto, port, remote, rport)) = nat_reply_tuple(&frame[off + ETH..off + len], h)
+            .filter(|_| outside && self.nat.active())
+        else {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        };
+        let owner = self.nat_owner(ingress, proto, (h.dst, port), (remote, rport));
+        if owner == self.worker_id || self.workers <= 1 {
+            Verdict::Drop(DropReason::NatNoSession)
+        } else if self.handed {
+            Verdict::Drop(DropReason::NatWrongWorker)
+        } else {
+            self.hand_off(owner, ingress, None, frame, off, len)
         }
     }
 
@@ -1876,10 +2057,11 @@ impl Pipeline {
         }
     }
 
-    /// The key, header version, key id and packet number to seal the next
-    /// packet on a tether with. `None`: nothing to seal with, or this key's
-    /// packet numbers are used up (a nonce must never repeat).
-    fn next_seal(&mut self, tether: TetherId) -> Option<(TetherKey, u8, u8, u64)> {
+    /// What to seal the next packet on a tether with (the pre-shared key, or
+    /// the site's current session), and its header version, key id and
+    /// packet number. `None`: nothing to seal with, or this key's packet
+    /// numbers are used up (a nonce must never repeat).
+    fn next_seal(&mut self, tether: TetherId) -> Option<(SealWith, u8, u8, u64)> {
         let t = &self.overlay.tethers[tether as usize];
         match self.overlay.crypto(t.site_idx) {
             PeerCrypto::PreShared => {
@@ -1889,7 +2071,7 @@ impl Pipeline {
                 }
                 let counter = (self.overlay_run as u64) << 48 | self.tx_counter;
                 self.tx_counter += 1;
-                Some((key, overlay::VERSION, 0, counter))
+                Some((SealWith::PreShared(key), overlay::VERSION, 0, counter))
             }
             PeerCrypto::Handshake { .. } => {
                 let s = self.keys.sending(t.site_idx, self.now_ns)?;
@@ -1901,7 +2083,12 @@ impl Pipeline {
                     return None;
                 }
                 next.1 += 1;
-                Some((s.tx, overlay::VERSION_HANDSHAKE, s.peer_id, next.1 - 1))
+                Some((
+                    SealWith::Session(t.site_idx),
+                    overlay::VERSION_HANDSHAKE,
+                    s.peer_id,
+                    next.1 - 1,
+                ))
             }
         }
     }
@@ -1923,7 +2110,7 @@ impl Pipeline {
         tether: TetherId,
         payload_len: usize,
     ) -> Option<usize> {
-        let (key, version, key_id, counter) = self.next_seal(tether)?;
+        let (with, version, key_id, counter) = self.next_seal(tether)?;
         let p = &self.ports[port as usize];
         eth::write(buf, mac, p.mac, eth::TYPE_IPV4);
         self.ip_ident = self.ip_ident.wrapping_add(1);
@@ -1953,7 +2140,16 @@ impl Pipeline {
         let r = u + l4::UDP_HDR_LEN;
         buf[r..r + overlay::HDR_LEN].copy_from_slice(&hdr);
         let body = r + overlay::HDR_LEN;
-        let tag = key.seal(&hdr, &mut buf[body..body + payload_len]);
+        let payload = &mut buf[body..body + payload_len];
+        let tag = match with {
+            SealWith::PreShared(key) => key.seal(&hdr, payload),
+            // The session `next_seal` picked: nothing replaced it since.
+            SealWith::Session(site_idx) => self
+                .keys
+                .sending(site_idx, self.now_ns)?
+                .tx
+                .seal(&hdr, payload),
+        };
         buf[body + payload_len..body + payload_len + TAG_LEN].copy_from_slice(&tag);
         Some(body + payload_len + TAG_LEN)
     }
@@ -2047,6 +2243,7 @@ impl Pipeline {
         let body = off + OUTER_LEN..off + len - TAG_LEN;
         let (payload, tag) = frame[..off + len].split_at_mut(body.end);
         let counter = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+        let sender_tether = u16::from_be_bytes([hdr[4], hdr[5]]);
         if handshake {
             // The session the sender says it used (byte 7: our id for it).
             let Some(s) = self.keys.receiving(site_idx, hdr[7], self.now_ns) else {
@@ -2055,7 +2252,7 @@ impl Pipeline {
             if !s.rx.open(&hdr, &mut payload[body.clone()], tag) {
                 return Verdict::Drop(DropReason::OverlayAuth);
             }
-            if !s.accept(hdr[6], counter, self.now_ns) {
+            if !s.accept(hdr[6], sender_tether, counter, self.now_ns) {
                 return Verdict::Drop(DropReason::OverlayReplay);
             }
         } else {
@@ -2065,7 +2262,7 @@ impl Pipeline {
             if !key.open(&hdr, &mut payload[body.clone()], tag) {
                 return Verdict::Drop(DropReason::OverlayAuth);
             }
-            if !self.replay.accept(site_idx, hdr[6], counter) {
+            if !self.replay.accept(site_idx, hdr[6], sender_tether, counter) {
                 return Verdict::Drop(DropReason::OverlayReplay);
             }
         }
@@ -2568,4 +2765,47 @@ fn make_room(buf: &mut [u8], off: usize, len: usize, n: usize) -> Option<usize> 
     }
     buf.copy_within(off..off + len, off + n);
     Some(off + n)
+}
+
+/// A packet to a NAT address, as (protocol, NAT port, remote address,
+/// remote port): a TCP or UDP reply (to a port NAT hands out: 1024 and up),
+/// an ICMP echo reply (its identifier is the port), or an ICMP error about a
+/// packet that left translated (the quoted packet's source port).
+fn nat_reply_tuple(ip: &[u8], h: &ipv4::Header) -> Option<(u8, u16, Ipv4Addr, u16)> {
+    let l4 = ip.get(h.hdr_len..)?;
+    let port = |b: &[u8], at: usize| Some(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]));
+    match h.proto {
+        ipv4::PROTO_TCP | ipv4::PROTO_UDP => {
+            let p = port(l4, 2)?;
+            (p >= 1024).then_some((h.proto, p, h.src, port(l4, 0)?))
+        }
+        ipv4::PROTO_ICMP if l4.first() == Some(&icmp::ECHO_REPLY) => {
+            let id = port(l4, 4)?;
+            Some((ipv4::PROTO_ICMP, id, h.src, id))
+        }
+        ipv4::PROTO_ICMP
+            if matches!(
+                l4.first(),
+                Some(&icmp::DEST_UNREACHABLE) | Some(&icmp::TIME_EXCEEDED)
+            ) =>
+        {
+            // The quoted packet: our translated one, on its way out.
+            let q = l4.get(8..)?;
+            let qhl = (*q.first()? as usize & 0x0f) * 4;
+            let qproto = *q.get(9)?;
+            let qdst = Ipv4Addr::new(*q.get(16)?, *q.get(17)?, *q.get(18)?, *q.get(19)?);
+            let ql4 = q.get(qhl..)?;
+            match qproto {
+                ipv4::PROTO_TCP | ipv4::PROTO_UDP => {
+                    Some((qproto, port(ql4, 0)?, qdst, port(ql4, 2)?))
+                }
+                ipv4::PROTO_ICMP => {
+                    let id = port(ql4, 4)?;
+                    Some((ipv4::PROTO_ICMP, id, qdst, id))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }

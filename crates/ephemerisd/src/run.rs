@@ -10,7 +10,7 @@ use crate::overlay_state;
 use crate::report::{Control, Report};
 use crate::sdwan::{Action, Handshakes, Identity};
 use crate::startup::{self, StartupState};
-use crate::worker::Worker;
+use crate::worker::{Wake, Worker};
 use anyhow::{bail, Context, Result};
 use eph_dataplane::overlay::{ReplayGuard, DEFAULT_MTU};
 use eph_dataplane::{Pipeline, Port};
@@ -227,7 +227,13 @@ pub fn run(config_path: &Path) -> Result<()> {
     let names: Vec<(u16, String)> = cfg.sites.iter().map(|s| (s.id, s.name.clone())).collect();
     let handshaker = match (identity, handshakes) {
         (Some(me), Some(rx)) if workers > 0 => {
-            let hs = Handshakes::new(me, overlay.clone(), &names);
+            let pref = cfg.overlay.as_ref().map(|o| o.cipher).unwrap_or_default();
+            let aes_hw = eph_dataplane::overlay::Cipher::aes_in_hardware();
+            let hs = Handshakes::new(me, overlay.clone(), &names).with_ciphers(pref, aes_hw);
+            if hs.active() {
+                info!(target: crate::logging::cat::SDWAN,
+                    "SD-WAN ciphers: {pref:?}; AES in hardware: {}", if aes_hw { "yes" } else { "no" });
+            }
             hs.active().then(|| {
                 let shared = shared.clone();
                 std::thread::Builder::new()
@@ -495,6 +501,13 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         }
         ifindexes.push(idx);
     }
+    // How the cards spread packets over the workers, so NAT replies (and
+    // tether traffic) reach the worker that holds their session.
+    let steering = Arc::new(if workers > 1 {
+        read_steering(cfg, &cards)
+    } else {
+        eph_dataplane::steer::Steering::default()
+    });
     let ports: Arc<[Port]> = cfg
         .ports(|i| {
             let s = iface::mac(&i.device)?;
@@ -617,6 +630,16 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
     // for it are dropped and counted, never queued without end.
     let (punt_tx, punt_rx) = mpsc::sync_channel(1024);
     let (handshake_tx, handshake_rx) = mpsc::sync_channel(256);
+    // Packets for the worker that owns their session, and a wake-up for
+    // each worker sleeping in poll().
+    let (handoff_txs, handoff_rxs): (Vec<_>, Vec<_>) =
+        (0..workers).map(|_| mpsc::sync_channel(4096)).unzip();
+    let mut handoff_rxs = handoff_rxs.into_iter();
+    let wakes: Arc<[Wake]> = (0..workers)
+        .map(|_| Wake::new())
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("creating the workers' wake-ups")?
+        .into();
     let detail: crate::report::DetailWanted = Default::default();
     // The host path: SSH and the portal on inside interfaces that offer
     // them. Replies go to worker 0, which sends them like its own packets.
@@ -678,6 +701,7 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         pipeline.set_nat(nat.clone());
         pipeline.set_overlay_run(run, replay.clone());
         pipeline.set_endpoints(endpoints.clone());
+        pipeline.set_steering(steering.clone());
         pipeline.set_trace(crate::logging::control().trace_config());
         pool.push(Worker {
             id: w,
@@ -689,6 +713,9 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
             report: reports[w].clone(),
             punt: punt_tx.clone(),
             handshake: handshake_tx.clone(),
+            handoff_to: handoff_txs.clone(),
+            handoff_in: handoff_rxs.next().expect("one per worker"),
+            wakes: wakes.clone(),
             detail: detail.clone(),
             host: host_tx.clone(),
             busy_poll: d.busy_poll,
@@ -952,6 +979,52 @@ fn apply_handshakes(shared: &Shared, out: crate::sdwan::Output) {
             let _ = tx.send(Control::SetKeys(keys.clone()));
         }
     }
+}
+
+/// Each card's spreading (see `eph_dataplane::steer`). Outside cards are
+/// first told to hash TCP and UDP on ports too, so a NAT port decides where
+/// replies land. A card that can't say is left to hand-offs.
+fn read_steering(cfg: &Config, cards: &[&str]) -> eph_dataplane::steer::Steering {
+    let card_rss: Vec<_> = cards
+        .iter()
+        .map(|&dev| {
+            let outside = cfg
+                .interfaces
+                .iter()
+                .any(|i| i.device == dev && i.role == crate::config::RoleCfg::Outside);
+            if outside {
+                let (tcp, udp) = iface::hash_ports(dev);
+                if !(tcp && udp) {
+                    info!(target: crate::logging::cat::DATAPLANE,
+                        "{dev}: can't hash {} on ports: NAT replies handed between workers as needed",
+                        if tcp { "UDP" } else if udp { "TCP" } else { "TCP or UDP" });
+                }
+            }
+            match iface::rss(dev) {
+                Ok(r) => {
+                    info!(target: crate::logging::cat::DATAPLANE,
+                        "{dev}: Toeplitz RSS over {} entries{}; ports hashed: TCP {}, UDP {}",
+                        r.indir.len(),
+                        if r.symmetric { " (symmetric)" } else { "" },
+                        if r.tcp_ports { "yes" } else { "no" },
+                        if r.udp_ports { "yes" } else { "no" });
+                    Some(eph_dataplane::steer::CardRss {
+                        key: r.key,
+                        indir: r.indir.iter().map(|&q| q.min(u16::MAX as u32) as u16).collect(),
+                        symmetric: r.symmetric,
+                        tcp_ports: r.tcp_ports,
+                        udp_ports: r.udp_ports,
+                    })
+                }
+                Err(e) => {
+                    info!(target: crate::logging::cat::DATAPLANE,
+                        "{dev}: queue spreading unknown ({e}): replies handed between workers as needed");
+                    None
+                }
+            }
+        })
+        .collect();
+    eph_dataplane::steer::Steering::new(&card_rss)
 }
 
 /// Make the calling thread nicer (0 = normal, 19 = lowest), so that on a

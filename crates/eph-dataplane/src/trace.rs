@@ -90,9 +90,9 @@ impl TraceCat {
             IcmpRateLimited => TraceCat::Icmp,
             NoPath | UnknownTether | BadOverlay | OverlayAuth | OverlayReplay | OverlayNoKey
             | OverlayLinksFull => TraceCat::Sdwan,
-            TxRingFull | ControlQueueFull => TraceCat::Dataplane,
-            ArpConsumed | OverlayControl | OverlayHandshake | DhcpToControl | PppoeToControl
-            | ToHost => return None,
+            TxRingFull | ControlQueueFull | HandoffFull => TraceCat::Dataplane,
+            ArpConsumed | OverlayControl | OverlayHandshake | HandedOff | DhcpToControl
+            | PppoeToControl | ToHost => return None,
         })
     }
 }

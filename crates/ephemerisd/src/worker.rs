@@ -10,9 +10,10 @@
 use crate::report::{
     unix_ms, Control, DetailWanted, KernelStats, Report, SessionView, SESSION_DETAIL,
 };
-use eph_dataplane::{DropReason, HandshakeIn, Pipeline, PortId, Punt, Verdict};
+use eph_dataplane::{DropReason, Handoff, HandshakeIn, Pipeline, PortId, Punt, Verdict};
 use eph_packet::eth;
 use eph_xdp::{Umem, XdpDesc, Xsk};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,36 @@ const REPORT_EVERY: Duration = Duration::from_millis(250);
 const DETAIL_EVERY: Duration = Duration::from_secs(1);
 /// "N trace events not logged": at most this often.
 const SUPPRESSED_EVERY: Duration = Duration::from_secs(10);
+
+/// Wakes a worker sleeping in poll() (an eventfd it polls too): another
+/// worker handed it packets.
+pub struct Wake(OwnedFd);
+
+impl Wake {
+    pub fn new() -> std::io::Result<Self> {
+        // SAFETY: plain syscall, no pointers; the result is checked.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a new, valid descriptor nobody else owns.
+        Ok(Wake(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn ring(&self) {
+        let one = 1u64;
+        // SAFETY: writes the 8 bytes of a live u64 to our own eventfd. A full
+        // counter (EAGAIN) means it's ringing already: nothing to do.
+        unsafe { libc::write(self.0.as_raw_fd(), (&one as *const u64).cast(), 8) };
+    }
+
+    fn clear(&self) {
+        let mut n = 0u64;
+        // SAFETY: reads at most 8 bytes into a live u64; non-blocking, so an
+        // eventfd that wasn't rung just returns EAGAIN.
+        unsafe { libc::read(self.0.as_raw_fd(), (&mut n as *mut u64).cast(), 8) };
+    }
+}
 
 pub struct Worker {
     pub id: usize,
@@ -51,6 +82,11 @@ pub struct Worker {
     pub punt: SyncSender<Punt>,
     /// Where SD-WAN handshake messages go (bounded, like `punt`).
     pub handshake: SyncSender<HandshakeIn>,
+    /// Packets for the worker that owns their session (index = worker),
+    /// and those other workers hand to this one; each worker's wake-up.
+    pub handoff_to: Vec<SyncSender<Handoff>>,
+    pub handoff_in: Receiver<Handoff>,
+    pub wakes: Arc<[Wake]>,
     /// Until when (Unix ms) someone wants the session and neighbour lists.
     pub detail: DetailWanted,
     /// Where packets for the router's own SSH and portal go (the host
@@ -85,12 +121,16 @@ impl Worker {
         let mut pollfds: Vec<libc::pollfd> = self
             .socks
             .iter()
-            .map(|s| libc::pollfd {
-                fd: s.fd(),
+            .map(|s| s.fd())
+            .chain(self.wakes.get(self.id).map(|w| w.0.as_raw_fd()))
+            .map(|fd| libc::pollfd {
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
             })
             .collect();
+        // Which workers were handed packets this round (to wake them).
+        let mut handed_to = vec![false; self.handoff_to.len()];
         let mut batch = [XdpDesc::default(); BATCH];
         let mut last_suppressed = Instant::now();
         // Frames the control plane asked us to send.
@@ -206,6 +246,46 @@ impl Worker {
                 }
             }
 
+            // 3b. Packets other workers handed over: their session is here.
+            //     Copied into our own packet memory, with headroom like a
+            //     received frame, and processed from the IP layer on.
+            for _ in 0..BATCH {
+                let Ok(h) = self.handoff_in.try_recv() else {
+                    break;
+                };
+                work += 1;
+                let Some(addr) = free.pop() else { break };
+                // SAFETY: a frame from this worker's free list; `buf` ends
+                // before the frame goes onto a TX ring.
+                let buf = unsafe { self.umem.frame_mut(addr) };
+                const HEAD: usize = 256;
+                if HEAD + h.frame.len() > buf.len() {
+                    free.push(addr);
+                    continue;
+                }
+                buf[HEAD..HEAD + h.frame.len()].copy_from_slice(&h.frame);
+                match self
+                    .pipeline
+                    .process_handed(h.ingress, h.via, buf, HEAD, h.frame.len())
+                {
+                    Verdict::Tx { port, off, len } => {
+                        let card = self.pipeline.card_of(port);
+                        if self.socks[card].tx.push(XdpDesc {
+                            addr: addr + off as u64,
+                            len: len as u32,
+                            options: 0,
+                        }) {
+                            tx_pending[card] = true;
+                            self.pipeline.stats.sent(port, len);
+                        } else {
+                            self.pipeline.stats.drop(DropReason::TxRingFull);
+                            free.push(addr);
+                        }
+                    }
+                    Verdict::Drop(_) => free.push(addr),
+                }
+            }
+
             // 4. Frames the router generated itself (ARP requests, overlay probes).
             let mut emits = std::mem::take(&mut self.pipeline.emits);
             for e in emits.drain(..) {
@@ -309,6 +389,22 @@ impl Worker {
                     self.pipeline.stats.drop(DropReason::ControlQueueFull);
                 }
             }
+            // ...and packets for the worker that owns their session; then
+            // wake those workers, once each.
+            for h in self.pipeline.handoffs.drain(..) {
+                let w = h.worker as usize;
+                match self.handoff_to.get(w) {
+                    Some(tx) if tx.try_send(h).is_ok() => handed_to[w] = true,
+                    _ => self.pipeline.stats.drop(DropReason::HandoffFull),
+                }
+            }
+            for (w, rung) in handed_to.iter_mut().enumerate() {
+                if std::mem::take(rung) {
+                    if let Some(wake) = self.wakes.get(w) {
+                        wake.ring();
+                    }
+                }
+            }
 
             // ...and packet trace events become log lines (only while a
             // packet category is at debug; rate-limited by the pipeline).
@@ -376,6 +472,9 @@ impl Worker {
                             IDLE_POLL_MS,
                         )
                     };
+                    if let Some(w) = self.wakes.get(self.id) {
+                        w.clear();
+                    }
                 }
             } else {
                 idle = 0;

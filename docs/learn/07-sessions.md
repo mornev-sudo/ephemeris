@@ -214,34 +214,50 @@ fast but not cryptographically strong. A hardened build would use a keyed
 hash like SipHash, at some cost per packet. That's a classic speed vs
 security trade-off.
 
-## Many cores: why symmetric RSS matters
+## Many cores: where a packet lands
 
 Each worker has its **own** session table, with no locks and no sharing.
-That's only correct if *both directions of a conversation land on the same
+That's only correct if *both directions of a conversation reach the same
 worker*. Otherwise worker 0 creates the session on the request, worker 1
-receives the reply, finds nothing, and drops it as `no-session`.
+receives the reply, finds nothing, and drops it.
 
-Remember that the NIC picks the RX queue (and therefore the worker) by
-hashing the packet's addresses and ports (RSS). The standard Toeplitz hash
-gives `hash(A→B) ≠ hash(B→A)`, so the directions scatter. There are two
-fixes:
+The NIC picks the RX queue (and therefore the worker) by hashing the
+packet's addresses and ports (RSS, a Toeplitz hash with the card's key)
+and looking the result up in its *indirection table*. The plain hash gives
+`hash(A→B) ≠ hash(B→A)`, so the directions scatter. Three things keep them
+together:
 
-- **Symmetric RSS.** Configure the NIC so the hash ignores direction:
-  `ethtool -X dev hfunc toeplitz symmetric-xor` on Linux 6.10+, or the
-  classic trick of a Toeplitz key made of the repeating bytes `6d 5a`.
+- **Symmetric RSS** for routed traffic: configure the card so the hash
+  ignores direction (`ethtool -X dev hfunc toeplitz symmetric-xor` on
+  Linux 6.10+, or a Toeplitz key of the repeating bytes `6d 5a`).
   `bootstrap.sh` tries this on every data NIC.
-- **Hand-off.** If a packet lands on the wrong worker, pass it to the owner,
-  through a ring between workers, like VPP's "worker handoff". This is more
-  general, but costs a cross-core hop.
+- **Steering NAT replies** ([`steer.rs`](../../crates/eph-dataplane/src/steer.rs)).
+  Source NAT changes the reply's addresses, so no symmetric hash can match
+  it to the request. But the NAT port is ours to choose. At start the
+  router reads each card's key and table (`ethtool -x`), asks outside cards
+  to hash TCP and UDP on ports too, and computes the hash itself; a worker
+  then picks a NAT port whose reply lands on *its own* queue. About one
+  port in *n* qualifies for *n* workers, so the search is short. The reply
+  arrives where its session is: nothing copied, nothing shared, so NAT
+  throughput grows with the number of workers.
+- **Handing off** ([`Pipeline::process_handed`](../../crates/eph-dataplane/src/pipeline.rs)).
+  Whatever still lands on the wrong worker is copied to the one that owns
+  it, through a bounded queue per worker, and the owner is woken if it's
+  asleep. That covers what can't be steered: ICMP (hashed on addresses
+  only), a PPPoE link (cards can't hash inside PPPoE, so it all arrives on
+  one queue), a card that won't say how it hashes (virtio without RSS), and
+  any card that hashes differently from what we predicted. Correctness
+  never depends on the prediction; a wrong one only costs a copy. The
+  `handed-off` count (Drops by reason) shows how often it happens.
 
-**In our Proxmox lab (virtio) it works out anyway.** The host-side tap device
-picks the guest's RX queue using a hash that is already symmetric, and it
-also remembers which queue the guest *sent* each flow on and delivers replies
-there. Since worker *N* sends on queue *N*, replies come back to worker *N*.
-With a single worker the question never arises.
+Traffic out of an SD-WAN tether is handled the same way: the outer packet
+lands wherever its UDP header hashes to, so the inner packet is handed to
+the worker the LAN card will deliver the replies to (or, for traffic
+passing between two tethers, to one picked by a fixed symmetric hash).
 
-If you see `no-session` drops with multiple workers on real NICs, asymmetric
-RSS is the first suspect.
+**In our Proxmox lab (virtio)** the host-side tap device delivers replies to
+the queue the guest sent the flow on, so most packets arrive at the right
+worker anyway, and the hand-off catches the rest.
 
 ## What about routing changes?
 

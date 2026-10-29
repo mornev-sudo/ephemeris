@@ -102,6 +102,141 @@ pub fn disable_vlan_stripping(name: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Run one ethtool request on a card: `data` is the request struct the
+/// kernel reads and writes in place.
+fn ethtool<T: ?Sized>(name: &str, data: &mut T) -> io::Result<()> {
+    // SAFETY: plain syscall, no pointers; the result is checked.
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    // SAFETY: a new, valid descriptor nobody else owns.
+    let sock = unsafe { OwnedFd::from_raw_fd(cvt(sock)?) };
+    // SAFETY: ifreq is plain C data (integers, arrays, a union of them and
+    // a pointer); all zeros is a valid value, and a NUL-filled name.
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    // At most 15 bytes and no NUL inside, so the name stays NUL-terminated.
+    if name.len() >= req.ifr_name.len() || name.bytes().any(|b| b == 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad name"));
+    }
+    for (d, s) in req.ifr_name.iter_mut().zip(name.bytes()) {
+        *d = s as libc::c_char;
+    }
+    req.ifr_ifru.ifru_data = (data as *mut T).cast::<libc::c_char>();
+    // SAFETY: `req` names the card and points at `data`, a live request the
+    // kernel reads and writes (no further than its declared sizes) for the
+    // duration of the call.
+    cvt(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCETHTOOL, &mut req) })?;
+    Ok(())
+}
+
+/// How a card spreads arriving packets over its queues (`ethtool -x` and
+/// `ethtool -n <card> rx-flow-hash`): what the router needs to predict
+/// which queue a packet lands on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rss {
+    /// The Toeplitz key.
+    pub key: Vec<u8>,
+    /// Hash (low bits) -> queue.
+    pub indir: Vec<u32>,
+    /// "symmetric-xor": source and destination fields XORed first.
+    pub symmetric: bool,
+    /// Ports are hashed too (else only the addresses), for TCP and UDP.
+    pub tcp_ports: bool,
+    pub udp_ports: bool,
+}
+
+const ETHTOOL_GRSSH: u32 = 0x46;
+const ETHTOOL_GRXFH: u32 = 0x29;
+const ETHTOOL_SRXFH: u32 = 0x2a;
+const TCP_V4_FLOW: u32 = 0x01;
+const UDP_V4_FLOW: u32 = 0x02;
+const RXH_IP_SRC: u64 = 1 << 4;
+const RXH_IP_DST: u64 = 1 << 5;
+const RXH_L4_B_0_1: u64 = 1 << 6;
+const RXH_L4_B_2_3: u64 = 1 << 7;
+const RXH_FOUR_TUPLE: u64 = RXH_IP_SRC | RXH_IP_DST | RXH_L4_B_0_1 | RXH_L4_B_2_3;
+
+/// `struct ethtool_rxnfc`, as far as ETHTOOL_[GS]RXFH uses it.
+#[repr(C)]
+struct RxFlowHash {
+    cmd: u32,
+    flow_type: u32,
+    data: u64,
+}
+
+/// Which fields `flow_type` packets are hashed on.
+fn flow_hash(name: &str, flow_type: u32) -> io::Result<u64> {
+    let mut r = RxFlowHash {
+        cmd: ETHTOOL_GRXFH,
+        flow_type,
+        data: 0,
+    };
+    ethtool(name, &mut r)?;
+    Ok(r.data)
+}
+
+/// The card's spreading. An error if it can't say, or spreads some way
+/// other than a plain or symmetric-xor Toeplitz hash (a virtio NIC without
+/// RSS, a CRC32 hash): the router then doesn't predict, and hands off.
+pub fn rss(name: &str) -> io::Result<Rss> {
+    const HEADER: usize = 24; // struct ethtool_rxfh before rss_config[]
+    const ETH_RSS_HASH_TOP: u8 = 1;
+    const RXH_XFRM_SYM_XOR: u8 = 1;
+    // First the sizes, then everything.
+    let mut head = [0u32; HEADER / 4];
+    head[0] = ETHTOOL_GRSSH;
+    ethtool(name, &mut head)?;
+    let (indir_size, key_size) = (head[2] as usize, head[3] as usize);
+    if indir_size == 0 || !(16..=256).contains(&key_size) || indir_size > 1 << 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no usable RSS table",
+        ));
+    }
+    let mut buf = vec![0u32; HEADER / 4 + indir_size + key_size.div_ceil(4)];
+    buf[0] = ETHTOOL_GRSSH;
+    buf[2] = indir_size as u32;
+    buf[3] = key_size as u32;
+    ethtool(name, &mut buf[..])?;
+    let [hfunc, input_xfrm, ..] = buf[4].to_ne_bytes();
+    if hfunc != ETH_RSS_HASH_TOP || input_xfrm & !RXH_XFRM_SYM_XOR != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("hash function {hfunc:#x}, transform {input_xfrm:#x}: not a plain Toeplitz"),
+        ));
+    }
+    let indir = buf[HEADER / 4..HEADER / 4 + indir_size].to_vec();
+    let key: Vec<u8> = buf[HEADER / 4 + indir_size..]
+        .iter()
+        .flat_map(|w| w.to_ne_bytes())
+        .take(key_size)
+        .collect();
+    let ports = |flow| flow_hash(name, flow).is_ok_and(|d| d & RXH_FOUR_TUPLE == RXH_FOUR_TUPLE);
+    Ok(Rss {
+        key,
+        indir,
+        symmetric: input_xfrm & RXH_XFRM_SYM_XOR != 0,
+        tcp_ports: ports(TCP_V4_FLOW),
+        udp_ports: ports(UDP_V4_FLOW),
+    })
+}
+
+/// Have the card hash TCP and UDP on addresses *and ports* (many hash UDP
+/// on addresses only by default), so a NAT port choice decides the queue
+/// replies land on. Returns which of (TCP, UDP) are hashed on ports now.
+pub fn hash_ports(name: &str) -> (bool, bool) {
+    let set = |flow| {
+        if flow_hash(name, flow).is_ok_and(|d| d & RXH_FOUR_TUPLE == RXH_FOUR_TUPLE) {
+            return true;
+        }
+        let mut r = RxFlowHash {
+            cmd: ETHTOOL_SRXFH,
+            flow_type: flow,
+            data: RXH_FOUR_TUPLE,
+        };
+        ethtool(name, &mut r).is_ok()
+    };
+    (set(TCP_V4_FLOW), set(UDP_V4_FLOW))
+}
+
 /// The card in promiscuous mode for as long as this lives.
 ///
 /// A card carrying VLANs needs it: many NICs (Intel's, and virtio under

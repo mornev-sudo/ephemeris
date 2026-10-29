@@ -26,8 +26,9 @@
 //! and raises every time it starts (see ephemerisd), so a nonce is never used
 //! twice under one key, not even across restarts.
 //!
-//! The receiver accepts each counter once ([`ReplayGuard`]): a captured
-//! packet replayed later, or one from an earlier run, is dropped.
+//! The receiver accepts each counter once per sending tether
+//! ([`ReplayGuard`]): a captured packet replayed later, or one from an
+//! earlier run, is dropped.
 //!
 //! ## Session keys from a handshake (version 3)
 //!
@@ -47,12 +48,13 @@
 //! can't be faked either.
 
 use crate::config::PortId;
+use aes_gcm::Aes256Gcm;
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub type TetherId = u16;
 
@@ -378,6 +380,109 @@ impl TetherKey {
     }
 }
 
+/// The AEAD a session's keys are for, agreed in its handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cipher {
+    /// RFC 8439: fast in software everywhere.
+    ChaCha20Poly1305,
+    /// NIST SP 800-38D: several times faster where the CPU has AES and
+    /// carry-less multiply instructions (AES-NI and PCLMULQDQ on x86,
+    /// including Atom C3000; the crypto extensions on ARMv8).
+    Aes256Gcm,
+}
+
+impl Cipher {
+    pub fn name(self) -> &'static str {
+        match self {
+            Cipher::ChaCha20Poly1305 => "ChaCha20-Poly1305",
+            Cipher::Aes256Gcm => "AES-256-GCM",
+        }
+    }
+
+    /// Does this CPU do AES-GCM in hardware? (Otherwise the software AES is
+    /// constant-time but much slower than ChaCha20.)
+    pub fn aes_in_hardware() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("aes")
+                && std::arch::is_x86_feature_detected!("pclmulqdq")
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::is_aarch64_feature_detected!("aes")
+                && std::arch::is_aarch64_feature_detected!("pmull")
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+}
+
+/// One direction of a session: its key, made ready for its cipher once
+/// (AES expands its key into round keys; ChaCha20 needs nothing). The same
+/// nonce rules as [`TetherKey`].
+pub struct SessionKey {
+    key: TetherKey,
+    aes: Option<Box<Aes256Gcm>>,
+}
+
+impl SessionKey {
+    pub fn new(cipher: Cipher, key: TetherKey) -> Self {
+        let aes = (cipher == Cipher::Aes256Gcm)
+            .then(|| Box::new(Aes256Gcm::new(&aes_gcm::Key::<Aes256Gcm>::from(key.0))));
+        SessionKey { key, aes }
+    }
+
+    pub fn cipher(&self) -> Cipher {
+        if self.aes.is_some() {
+            Cipher::Aes256Gcm
+        } else {
+            Cipher::ChaCha20Poly1305
+        }
+    }
+
+    /// Encrypt `payload` in place, authenticating `hdr` too; returns the tag.
+    pub fn seal(&self, hdr: &[u8; HDR_LEN], payload: &mut [u8]) -> [u8; TAG_LEN] {
+        let Some(aes) = &self.aes else {
+            return self.key.seal(hdr, payload);
+        };
+        let (site, worker, counter) = header_nonce_parts(hdr);
+        let nonce = aes_gcm::Nonce::from(TetherKey::nonce(site, worker, counter));
+        aes.encrypt_inout_detached(&nonce, hdr, payload.into())
+            .expect("payload within the AEAD's size limit")
+            .into()
+    }
+
+    /// Check `tag` and decrypt `payload` in place. On failure the payload is
+    /// left untouched and must be dropped.
+    pub fn open(&self, hdr: &[u8; HDR_LEN], payload: &mut [u8], tag: &[u8]) -> bool {
+        let Some(aes) = &self.aes else {
+            return self.key.open(hdr, payload, tag);
+        };
+        let Ok(tag) = aes_gcm::Tag::try_from(tag) else {
+            return false;
+        };
+        let (site, worker, counter) = header_nonce_parts(hdr);
+        let nonce = aes_gcm::Nonce::from(TetherKey::nonce(site, worker, counter));
+        aes.decrypt_inout_detached(&nonce, hdr, payload.into(), &tag)
+            .is_ok()
+    }
+}
+
+/// Same cipher and key (the expanded AES key follows from the key).
+impl PartialEq for SessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cipher() == other.cipher() && self.key == other.key
+    }
+}
+
+impl fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SessionKey({}, redacted)", self.cipher().name())
+    }
+}
+
 fn header_nonce_parts(hdr: &[u8; HDR_LEN]) -> (u16, u8, u64) {
     let site = u16::from_be_bytes([hdr[2], hdr[3]]);
     let counter = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
@@ -403,8 +508,8 @@ pub struct Session {
     pub local_id: u8,
     /// The peer's id for it: we put it in byte 7.
     pub peer_id: u8,
-    pub tx: TetherKey,
-    pub rx: TetherKey,
+    pub tx: SessionKey,
+    pub rx: SessionKey,
     /// When it was agreed (the workers' clock).
     pub created_ns: u64,
     /// Did this router start the handshake?
@@ -424,6 +529,7 @@ impl Session {
         serial: u64,
         local_id: u8,
         peer_id: u8,
+        cipher: Cipher,
         tx: TetherKey,
         rx: TetherKey,
         created_ns: u64,
@@ -433,8 +539,8 @@ impl Session {
             serial,
             local_id,
             peer_id,
-            tx,
-            rx,
+            tx: SessionKey::new(cipher, tx),
+            rx: SessionKey::new(cipher, rx),
             created_ns,
             initiator,
             confirmed: AtomicBool::new(initiator),
@@ -457,9 +563,10 @@ impl Session {
     }
 
     /// A packet sealed with it arrived and authenticated: accept `counter`
-    /// from `worker` once. Confirms the session and notes the time.
-    pub fn accept(&self, worker: u8, counter: u64, now_ns: u64) -> bool {
-        if counter >= COUNTER_LIMIT || !self.replay.accept(0, worker, counter) {
+    /// from `worker`'s tether `tether` once. Confirms the session and notes
+    /// the time.
+    pub fn accept(&self, worker: u8, tether: TetherId, counter: u64, now_ns: u64) -> bool {
+        if counter >= COUNTER_LIMIT || !self.replay.accept(0, worker, tether, counter) {
             return false;
         }
         if !self.confirmed() {
@@ -479,6 +586,7 @@ impl fmt::Debug for Session {
             .field("serial", &self.serial)
             .field("local_id", &self.local_id)
             .field("peer_id", &self.peer_id)
+            .field("cipher", &self.tx.cipher())
             .field("created_ns", &self.created_ns)
             .field("initiator", &self.initiator)
             .field("confirmed", &self.confirmed())
@@ -514,12 +622,23 @@ impl KeyTable {
 
 /// Replay protection for received overlay packets, shared by all workers
 /// (a peer's packets can arrive on any of them). One sliding window per
-/// sending (site, worker): each counter is accepted once, and anything more
-/// than [`REPLAY_WINDOW`] packets behind the newest, or from an older run, is
-/// refused.
+/// sending (site, worker, tether): each counter is accepted once, and
+/// anything more than [`REPLAY_WINDOW`] packets behind the newest, or from
+/// an older run, is refused.
+///
+/// A sending worker numbers its packets once across all its tethers, so
+/// one window for all of them would refuse the slow tether's packets
+/// whenever the fast one runs more than a window's worth ahead of it (LTE
+/// probes while fibre carries a gigabit). The sender's tether id is in the
+/// authenticated header, so a packet replayed onto another path still meets
+/// its own tether's window. Tethers share [`REPLAY_LANES`] windows by id;
+/// windows are made when first used.
 pub struct ReplayGuard {
-    windows: Vec<Mutex<Window>>,
+    windows: Vec<OnceLock<Box<Mutex<Window>>>>,
 }
+
+/// Windows per sending (site, worker): sender tethers beyond this share.
+pub const REPLAY_LANES: usize = 8;
 
 /// How far behind the newest packet a late (reordered) one may be.
 pub const REPLAY_WINDOW: u64 = 1024;
@@ -590,40 +709,77 @@ impl Window {
 impl ReplayGuard {
     pub fn new(sites: usize) -> Self {
         ReplayGuard {
-            windows: (0..sites * MAX_SENDER_WORKERS)
-                .map(|_| Mutex::new(Window::default()))
+            windows: (0..sites * MAX_SENDER_WORKERS * REPLAY_LANES)
+                .map(|_| OnceLock::new())
                 .collect(),
         }
     }
 
-    fn window(&self, site_idx: usize, worker: u8) -> Option<&Mutex<Window>> {
-        self.windows
-            .get(site_idx * MAX_SENDER_WORKERS + worker as usize)
+    fn index(site_idx: usize, worker: u8, lane: usize) -> usize {
+        (site_idx * MAX_SENDER_WORKERS + worker as usize) * REPLAY_LANES + lane
     }
 
-    /// Accept `counter` from `worker` at site `site_idx`, once. Only call it
-    /// for packets that authenticated, so forged ones can't move the window.
-    pub fn accept(&self, site_idx: usize, worker: u8, counter: u64) -> bool {
-        let Some(w) = self.window(site_idx, worker) else {
+    fn window(&self, site_idx: usize, worker: u8, tether: TetherId) -> Option<&Mutex<Window>> {
+        let lane = tether as usize % REPLAY_LANES;
+        Some(
+            self.windows
+                .get(Self::index(site_idx, worker, lane))?
+                .get_or_init(Default::default),
+        )
+    }
+
+    /// The lanes of one sender that are in use.
+    fn lanes(&self, site_idx: usize, worker: u8) -> impl Iterator<Item = &Mutex<Window>> {
+        let first = Self::index(site_idx, worker, 0);
+        self.windows
+            .get(first..first + REPLAY_LANES)
+            .into_iter()
+            .flatten()
+            .filter_map(|w| w.get().map(|b| &**b))
+    }
+
+    /// Accept `counter` from `worker`'s tether `tether` at site `site_idx`,
+    /// once. Only call it for packets that authenticated, so forged ones
+    /// can't move the window.
+    pub fn accept(&self, site_idx: usize, worker: u8, tether: TetherId, counter: u64) -> bool {
+        let Some(w) = self.window(site_idx, worker, tether) else {
             return false;
         };
         let run = (counter >> 48) as u16;
         let n = counter & (COUNTER_LIMIT - 1);
-        w.lock().unwrap_or_else(|e| e.into_inner()).accept(run, n)
+        let (ok, newer) = {
+            let mut w = w.lock().unwrap_or_else(|e| e.into_inner());
+            let before = w.run;
+            (w.accept(run, n), run > before)
+        };
+        if ok && newer {
+            // A newer run on one tether means the sender restarted: its
+            // other tethers' older runs are over too.
+            for l in self.lanes(site_idx, worker) {
+                let mut l = l.lock().unwrap_or_else(|e| e.into_inner());
+                if l.run < run {
+                    l.run = run;
+                    l.started = false;
+                }
+            }
+        }
+        ok
     }
 
     /// The newest run seen from each (site index, worker) that has sent
     /// anything, so a restarted router can refuse older runs.
     pub fn runs(&self) -> Vec<(usize, u8, u16)> {
-        self.windows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, w)| {
-                let w = w.lock().unwrap_or_else(|e| e.into_inner());
-                w.started.then(|| {
-                    let site = i / MAX_SENDER_WORKERS;
-                    (site, (i % MAX_SENDER_WORKERS) as u8, w.run)
-                })
+        let senders = self.windows.len() / REPLAY_LANES;
+        (0..senders)
+            .filter_map(|i| {
+                let (site, worker) = (i / MAX_SENDER_WORKERS, (i % MAX_SENDER_WORKERS) as u8);
+                self.lanes(site, worker)
+                    .filter_map(|w| {
+                        let w = w.lock().unwrap_or_else(|e| e.into_inner());
+                        w.started.then_some(w.run)
+                    })
+                    .max()
+                    .map(|run| (site, worker, run))
             })
             .collect()
     }
@@ -631,10 +787,12 @@ impl ReplayGuard {
     /// Refuse runs older than `run` from this sender (restored after a
     /// restart). Packets of `run` itself are still accepted.
     pub fn restore(&self, site_idx: usize, worker: u8, run: u16) {
-        if let Some(w) = self.window(site_idx, worker) {
-            let mut w = w.lock().unwrap_or_else(|e| e.into_inner());
-            if !w.started && run > w.run {
-                w.run = run;
+        for lane in 0..REPLAY_LANES as TetherId {
+            if let Some(w) = self.window(site_idx, worker, lane) {
+                let mut w = w.lock().unwrap_or_else(|e| e.into_inner());
+                if !w.started && run > w.run {
+                    w.run = run;
+                }
             }
         }
     }
@@ -780,44 +938,68 @@ mod tests {
     #[test]
     fn replay_window_accepts_each_counter_once() {
         let g = ReplayGuard::new(1);
-        assert!(g.accept(0, 0, c(1, 10)));
-        assert!(!g.accept(0, 0, c(1, 10)), "duplicate");
-        assert!(g.accept(0, 0, c(1, 12)));
-        assert!(g.accept(0, 0, c(1, 11)), "late but within the window");
-        assert!(!g.accept(0, 0, c(1, 11)));
-        assert!(g.accept(0, 0, c(1, 12 + REPLAY_WINDOW)));
-        assert!(!g.accept(0, 0, c(1, 12)), "too far behind");
+        assert!(g.accept(0, 0, 0, c(1, 10)));
+        assert!(!g.accept(0, 0, 0, c(1, 10)), "duplicate");
+        assert!(g.accept(0, 0, 0, c(1, 12)));
+        assert!(g.accept(0, 0, 0, c(1, 11)), "late but within the window");
+        assert!(!g.accept(0, 0, 0, c(1, 11)));
+        assert!(g.accept(0, 0, 0, c(1, 12 + REPLAY_WINDOW)));
+        assert!(!g.accept(0, 0, 0, c(1, 12)), "too far behind");
         // 11 + WINDOW shares a slot with 11, which was seen: the slot was
         // cleared when the window moved past it.
         assert!(
-            g.accept(0, 0, c(1, 11 + REPLAY_WINDOW)),
+            g.accept(0, 0, 0, c(1, 11 + REPLAY_WINDOW)),
             "slot reused for a new number"
         );
         assert!(
-            !g.accept(0, 0, c(1, 12 + REPLAY_WINDOW)),
+            !g.accept(0, 0, 0, c(1, 12 + REPLAY_WINDOW)),
             "the top itself, again"
         );
         // Each sending worker counts on its own.
-        assert!(g.accept(0, 1, c(1, 10)));
+        assert!(g.accept(0, 1, 0, c(1, 10)));
     }
 
     #[test]
     fn replay_window_follows_runs() {
         let g = ReplayGuard::new(2);
-        assert!(g.accept(1, 0, c(3, 500)));
+        assert!(g.accept(1, 0, 0, c(3, 500)));
         assert!(
-            g.accept(1, 0, c(4, 0)),
+            g.accept(1, 0, 0, c(4, 0)),
             "a restarted sender starts again at 0"
         );
-        assert!(!g.accept(1, 0, c(3, 501)), "older run");
+        assert!(!g.accept(1, 0, 0, c(3, 501)), "older run");
         assert_eq!(g.runs(), vec![(1, 0, 4)]);
         // After our own restart: runs below what we saw are refused, even
         // before the sender's first new packet.
         let g = ReplayGuard::new(2);
         g.restore(1, 0, 4);
-        assert!(!g.accept(1, 0, c(3, 9)));
-        assert!(g.accept(1, 0, c(4, 9)));
-        assert!(!g.accept(5, 0, c(4, 9)), "no such site");
+        assert!(!g.accept(1, 0, 0, c(3, 9)));
+        assert!(g.accept(1, 0, 0, c(4, 9)));
+        assert!(!g.accept(5, 0, 0, c(4, 9)), "no such site");
+    }
+
+    #[test]
+    fn each_sending_tether_has_its_own_window() {
+        // One worker sends over fibre (tether 0) and LTE (tether 1) from
+        // one counter: fibre's packets arrive long before LTE's.
+        let g = ReplayGuard::new(1);
+        assert!(g.accept(0, 0, 0, c(1, 5000)));
+        assert!(
+            g.accept(0, 0, 1, c(1, 10)),
+            "LTE, far behind fibre, but new on its own path"
+        );
+        assert!(!g.accept(0, 0, 1, c(1, 10)), "replayed");
+        assert!(!g.accept(0, 0, 0, c(1, 10)), "fibre's window is unchanged");
+        // A restart seen on one tether ends the old run on the others.
+        assert!(g.accept(0, 0, 0, c(2, 0)));
+        assert!(!g.accept(0, 0, 1, c(1, 11)), "older run, other tether");
+        assert!(g.accept(0, 0, 1, c(2, 1)));
+        assert_eq!(g.runs(), vec![(0, 0, 2)]);
+        // Restored runs hold on every tether.
+        let g = ReplayGuard::new(1);
+        g.restore(0, 0, 2);
+        assert!(!g.accept(0, 0, 3, c(1, 0)));
+        assert!(g.accept(0, 0, 3, c(2, 0)));
     }
 
     #[test]

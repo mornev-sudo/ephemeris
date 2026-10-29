@@ -2,7 +2,9 @@
 //! The control plane agrees the keys; here they're installed by hand, as
 //! the control plane would, to check what the data plane does with them.
 
-use crate::overlay::{self, KeyTable, Session, TetherKey, REJECT_AFTER_NS, TYPE_HANDSHAKE_INIT};
+use crate::overlay::{
+    self, Cipher, KeyTable, Session, TetherKey, REJECT_AFTER_NS, TYPE_HANDSHAKE_INIT,
+};
 use crate::tests_overlay::{drop_reason, ip, mac, packet, router_full, tx, HOST_A, HOST_B, OFF};
 use crate::*;
 use eph_packet::{eth, icmp, ipv4};
@@ -17,18 +19,64 @@ fn router(site: u8) -> Pipeline {
 /// One handshake's keys, as each side holds them: R1 started it (so may
 /// send at once), R2 answered (so waits for R1's first packet).
 fn sessions(serial: u64, ids: (u8, u8), created: u64) -> (Arc<Session>, Arc<Session>) {
+    sessions_with(Cipher::ChaCha20Poly1305, serial, ids, created)
+}
+
+fn sessions_with(
+    cipher: Cipher,
+    serial: u64,
+    ids: (u8, u8),
+    created: u64,
+) -> (Arc<Session>, Arc<Session>) {
     let (to_r2, to_r1) = (
         TetherKey([serial as u8; 32]),
         TetherKey([0x80 | serial as u8; 32]),
     );
     (
         Arc::new(Session::new(
-            serial, ids.0, ids.1, to_r2, to_r1, created, true,
+            serial, ids.0, ids.1, cipher, to_r2, to_r1, created, true,
         )),
         Arc::new(Session::new(
-            serial, ids.1, ids.0, to_r1, to_r2, created, false,
+            serial, ids.1, ids.0, cipher, to_r1, to_r2, created, false,
         )),
     )
+}
+
+#[test]
+fn aes_gcm_sessions_carry_traffic_both_ways() {
+    let (mut r1, mut r2) = (router(1), router(2));
+    let (s1, s2) = sessions_with(Cipher::Aes256Gcm, 1, (5, 9), NOW);
+    install(&mut r1, vec![s1]);
+    install(&mut r2, vec![s2]);
+    let (v, mut f) = ping_from_a(&mut r1);
+    let (_, off, len) = tx(v);
+    let plain = packet(mac(1, 0), HOST_A, "10.1.0.10", "10.2.0.10", None, 8, true).0;
+    assert_ne!(
+        &f[off + overlay::OUTER_LEN..off + overlay::OUTER_LEN + 20],
+        &plain[OFF + 14..OFF + 34],
+        "encrypted"
+    );
+    let (port, off, _) = tx(r2.process(1, &mut f, off, len));
+    assert_eq!((port, eth::dst(&f[off..])), (0, HOST_B));
+    let (v, mut f) = reply_from_b(&mut r2);
+    let (_, off, len) = tx(v);
+    let (port, off, _) = tx(r1.process(1, &mut f, off, len));
+    assert_eq!((port, eth::dst(&f[off..])), (0, HOST_A));
+}
+
+#[test]
+fn the_two_ciphers_never_open_each_others_packets() {
+    let (mut r1, mut r2) = (router(1), router(2));
+    let (s1, _) = sessions_with(Cipher::Aes256Gcm, 1, (5, 9), NOW);
+    let (_, s2) = sessions_with(Cipher::ChaCha20Poly1305, 1, (5, 9), NOW);
+    install(&mut r1, vec![s1]);
+    install(&mut r2, vec![s2]);
+    let (v, mut f) = ping_from_a(&mut r1);
+    let (_, off, len) = tx(v);
+    assert_eq!(
+        drop_reason(r2.process(1, &mut f, off, len)),
+        DropReason::OverlayAuth
+    );
 }
 
 fn install(r: &mut Pipeline, newest_first: Vec<Arc<Session>>) {
