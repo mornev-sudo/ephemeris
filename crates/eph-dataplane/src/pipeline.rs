@@ -77,6 +77,9 @@ enum SealWith {
     Session(usize),
 }
 
+/// NAT ports of a worker's own looked at, at most, for one new flow.
+const NAT_TRIES: u32 = 8192;
+
 /// A packet for another worker: the one that owns its session (see
 /// [`crate::steer`]). Copied out of the frame: the other worker has its own
 /// packet memory.
@@ -1298,6 +1301,9 @@ impl Pipeline {
                 // Source NAT for this new session? Decide and reserve the
                 // translated tuple *before* creating the session, so a session
                 // never exists half-translated.
+                if self.sessions.host_full(&key, lo_to_hi) {
+                    return Err(Verdict::Drop(DropReason::HostSessionLimit));
+                }
                 let mut binding = None;
                 if let NextHop::Ip { port: egress, .. } = nh {
                     if let Some(addr) = self.nat.decide(&self.ports, ingress, egress, h.src, h.dst)
@@ -1510,9 +1516,13 @@ impl Pipeline {
             && self.steer.steers_ports(card, proto);
         if steered {
             // The card decides: about one port in `workers` lands here.
+            // Looked at no further than the plain split below would get
+            // (8192 of ours), so a destination nearly out of ports costs a
+            // bounded search per new flow, not a sweep of all 64512.
             let range = 65536 - 1024;
             let start = (u32::from(dst) ^ sport as u32).wrapping_mul(0x9e37_79b1) % range;
-            return (0..range)
+            let tries = (NAT_TRIES * self.workers as u32).min(range);
+            return (0..tries)
                 .map(|i| (1024 + (start + i) % range) as u16)
                 .find(|&p| ours(p) && free(p))
                 .map(|p| (p, key(p)));
@@ -1521,7 +1531,7 @@ impl Pipeline {
         let (w, id) = (self.workers as u32, self.worker_id as u32);
         let slots = (65536 - 1024) / w;
         let start = (u32::from(dst) ^ sport as u32).wrapping_mul(0x9e37_79b1) % slots;
-        (0..slots.min(8192))
+        (0..slots.min(NAT_TRIES))
             .map(|i| 1024 + ((start + i) % slots) * w + id)
             .filter(|&p| p <= 65535)
             .map(|p| p as u16)

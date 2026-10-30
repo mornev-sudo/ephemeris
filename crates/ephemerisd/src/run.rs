@@ -692,7 +692,8 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         let mut pipeline = Pipeline::new(
             ports.clone(),
             fib.clone(),
-            cfg.sessions.to_config(plan.sessions_per_worker),
+            cfg.sessions
+                .to_config(plan.sessions_per_worker, plan.workers),
             overlay.clone(),
         );
         // One worker sends the SD-WAN probes; replies may land on any worker.

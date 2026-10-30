@@ -767,6 +767,33 @@ fn full_table_refuses_new_flows_but_keeps_old_ones() {
     assert!(matches!(r.process(0, &mut b, 0, n), Verdict::Tx { .. }));
 }
 
+#[test]
+fn a_host_over_its_session_limit_is_refused_others_are_not() {
+    let mut r = router_with(
+        true,
+        SessionConfig {
+            max_sessions: 64,
+            max_per_host: 2,
+            ..Default::default()
+        },
+    );
+    learn(&mut r, 1, HOST_B, "10.10.2.10");
+    for port in [1000u16, 1001] {
+        let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", port), ("10.10.2.10", 53), None);
+        assert!(matches!(r.process(0, &mut b, 0, n), Verdict::Tx { .. }));
+    }
+    let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", 1002), ("10.10.2.10", 53), None);
+    assert_eq!(
+        r.process(0, &mut b, 0, n),
+        Verdict::Drop(DropReason::HostSessionLimit)
+    );
+    // Its existing flows carry on, and another host starts its own.
+    let (mut b, n) = seg(R0, HOST_A, ("10.10.1.10", 1000), ("10.10.2.10", 53), None);
+    assert!(matches!(r.process(0, &mut b, 0, n), Verdict::Tx { .. }));
+    let (mut b, n) = seg(R0, HOST_A, ("10.10.1.11", 1000), ("10.10.2.10", 53), None);
+    assert!(matches!(r.process(0, &mut b, 0, n), Verdict::Tx { .. }));
+}
+
 /// Assert the router forwarded the packet.
 fn sent(v: Verdict) {
     assert!(matches!(v, Verdict::Tx { .. }), "expected Tx, got {v:?}");

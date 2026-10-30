@@ -758,7 +758,9 @@ function renderCfg() {
 
   formFields($("f-sess"), cfg.sessions, [
     { key: "max_per_worker", label: "Sessions per worker", placeholder: "auto", optional: true,
-      help: "\"auto\" sizes the tables from the memory free at start, or a number. Reserved up front, about 300 bytes each." },
+      help: "\"auto\" sizes the tables from the memory free at start, up to 2 million sessions for the whole router; or a number. Reserved up front, about 300 bytes each." },
+    { key: "max_per_host", label: "Sessions per host", type: "number", min: 0,
+      help: "The most one address may have open at once (0: no limit), so one host can't fill the table for everyone. Refusals count as host-session-limit." },
     { key: "tcp_strict", label: "Strict TCP (only a SYN may open a session)", type: "check" },
     { key: "tcp_handshake_timeout_secs", max: 86400, label: "TCP handshake timeout (s)", type: "number", min: 1 },
     { key: "tcp_established_timeout_secs", max: 86400, label: "TCP established timeout (s)", type: "number", min: 1 },

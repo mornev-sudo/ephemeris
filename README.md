@@ -77,8 +77,10 @@ The minimum is what CI boot-tests every build on: a 2-core, 2 GB VM.
 
   By default (`sessions.max_per_worker = "auto"`) the session tables are
   sized from the memory free at start: half of what's left after the packet
-  buffers, the forwarding table and 256 MiB for the system. On a 2 GB
-  machine with one worker that's around 2 million sessions. A fixed size
+  buffers, the forwarding table and 256 MiB for the system, up to 2 million
+  sessions for the whole router (about 600 MB). On a 2 GB machine with one
+  worker that's around 2 million sessions. One host may hold at most 50,000
+  of them (`sessions.max_per_host`). A fixed size
   that doesn't fit is refused at start (the router falls back to the last
   config that worked); one that only just fits is logged as a warning.
 - **Disk:** the layout is fixed:

@@ -257,6 +257,10 @@ pub struct SessionConfig {
     /// Table full: make room by dropping a session that never got an answer
     /// (or a closing TCP one), instead of refusing the new one.
     pub early_drop: bool,
+    /// Most sessions one address may have started at once, in this table
+    /// (0: no limit). Stops one host (a scan, malware, a runaway client)
+    /// from filling the table for everyone else (RFC 6888, REQ-4).
+    pub max_per_host: u32,
 }
 
 impl Default for SessionConfig {
@@ -267,6 +271,7 @@ impl Default for SessionConfig {
             timeouts: Timeouts::default(),
             apps: Arc::from([]),
             early_drop: true,
+            max_per_host: 0,
         }
     }
 }
@@ -391,6 +396,11 @@ pub struct SessionTable {
     pub unanswered: u64,
     /// Dropped early to make room in a full table.
     pub early_dropped: u64,
+    /// Sessions started per initiating address, while `max_per_host` is
+    /// set. Room for [`HOSTS_TRACKED`] addresses is reserved up front;
+    /// beyond that, new addresses aren't counted (and so not limited)
+    /// rather than the map growing on the fast path.
+    hosts: HashMap<u32, u32, FxSeededState>,
     /// While set (a session trace is on), expiring unanswered sessions are
     /// also kept in `unanswered_log` for the pipeline to trace.
     pub log_unanswered: bool,
@@ -402,6 +412,8 @@ pub struct SessionTable {
 const KEYS_PER_SESSION: usize = 2;
 /// Timer entries looked at, at most, to find a session to drop early.
 const EARLY_DROP_SCAN: usize = 256;
+/// Initiating addresses counted for `max_per_host`, at most, per table.
+pub const HOSTS_TRACKED: usize = 65_536;
 
 /// The timer wheel holds about one (index, generation) entry per session,
 /// sometimes a stale one more; it grows as needed rather than up front.
@@ -458,6 +470,11 @@ impl SessionTable {
         // cryptographic hash; a hardened build would use SipHash or similar.)
         let seed = RandomState::new().hash_one(0x5ed5u16) as usize;
         let max = cfg.max_sessions as usize;
+        let hosts = if cfg.max_per_host > 0 {
+            HOSTS_TRACKED.min(max)
+        } else {
+            0
+        };
         SessionTable {
             cfg,
             // Room for both keys of every session (its own and, NATed, its
@@ -477,6 +494,7 @@ impl SessionTable {
             nat_active: 0,
             unanswered: 0,
             early_dropped: 0,
+            hosts: HashMap::with_capacity_and_hasher(hosts, FxSeededState::with_seed(seed)),
             log_unanswered: false,
             unanswered_log: Vec::new(),
         }
@@ -523,6 +541,43 @@ impl SessionTable {
         }
         let pure_syn = tcp_flags & (l4::TCP_SYN | l4::TCP_ACK) == l4::TCP_SYN;
         pure_syn || !self.cfg.tcp_strict
+    }
+
+    /// Has the host starting this session (`lo_to_hi`: the `lo` end) got
+    /// `max_per_host` sessions already?
+    pub fn host_full(&self, key: &FlowKey, lo_to_hi: bool) -> bool {
+        let limit = self.cfg.max_per_host;
+        limit > 0
+            && self
+                .hosts
+                .get(&initiator(key, lo_to_hi))
+                .is_some_and(|&n| n >= limit)
+    }
+
+    fn count_host(&mut self, ip: u32) {
+        if self.cfg.max_per_host == 0 {
+            return;
+        }
+        if let Some(n) = self.hosts.get_mut(&ip) {
+            *n += 1;
+        } else if self.hosts.len() < self.hosts.capacity().min(HOSTS_TRACKED) {
+            self.hosts.insert(ip, 1);
+        }
+    }
+
+    fn uncount_host(&mut self, ip: u32) {
+        if let Some(n) = self.hosts.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.hosts.remove(&ip);
+            }
+        }
+    }
+
+    /// Sessions `ip` has started that are in the table now (counted only
+    /// while `max_per_host` is set).
+    pub fn host_sessions(&self, ip: Ipv4Addr) -> u32 {
+        self.hosts.get(&u32::from(ip)).copied().unwrap_or(0)
     }
 
     /// Create a session for its first packet. `None` if the table is full.
@@ -584,6 +639,7 @@ impl SessionTable {
             return None;
         };
         self.map.insert(key, idx);
+        self.count_host(initiator(&key, lo_to_hi));
         self.created += 1;
         let at = self.expiry_ns(idx);
         self.schedule(idx, at, now_ns);
@@ -856,13 +912,23 @@ impl SessionTable {
         let s = &mut self.slab[idx as usize];
         s.alive = false;
         s.generation = s.generation.wrapping_add(1);
-        let (key, nat) = (s.key, s.nat.take());
+        let (key, nat, lo_to_hi) = (s.key, s.nat.take(), s.initiator_lo);
         self.map.remove(&key);
+        self.uncount_host(initiator(&key, lo_to_hi));
         if let Some(n) = nat {
             self.map.remove(&n.xkey);
             self.nat_active = self.nat_active.saturating_sub(1);
         }
         self.free.push(idx);
+    }
+}
+
+/// The address that started a session.
+fn initiator(key: &FlowKey, lo_to_hi: bool) -> u32 {
+    if lo_to_hi {
+        key.lo_ip
+    } else {
+        key.hi_ip
     }
 }
 
@@ -1039,6 +1105,38 @@ mod tests {
         assert_eq!(t.expire(31 * NS), 4);
         assert!(t.is_empty());
         assert!(t.create(k, d, 0, 60, 31 * NS).is_some());
+    }
+
+    #[test]
+    fn one_host_cannot_fill_the_table() {
+        let mut t = SessionTable::new(SessionConfig {
+            max_sessions: 16,
+            max_per_host: 3,
+            ..Default::default()
+        });
+        let flow = |host: &str, p: u16| FlowKey::new(ip(host), p, ip("10.0.2.10"), 53, PROTO_UDP);
+        for p in 0..3 {
+            let (k, d) = flow("10.0.1.10", 1000 + p);
+            assert!(!t.host_full(&k, d));
+            t.create(k, d, 0, 60, 0).unwrap();
+        }
+        let (k, d) = flow("10.0.1.10", 2000);
+        assert!(t.host_full(&k, d), "a fourth from the same host");
+        // Counted by who started it: replies don't count, nor do others.
+        let (k2, d2) = flow("10.0.1.11", 2000);
+        assert!(!t.host_full(&k2, d2));
+        assert!(!t.host_full(&k, !d), "the server's side of it");
+        assert_eq!(t.host_sessions(ip("10.0.1.10")), 3);
+        // Expired sessions free the host's share again.
+        assert_eq!(t.expire(31 * NS), 3);
+        assert_eq!(t.host_sessions(ip("10.0.1.10")), 0);
+        assert!(!t.host_full(&k, d));
+        // No limit: nothing counted.
+        let mut t = table();
+        let (k, d) = flow("10.0.1.10", 1000);
+        t.create(k, d, 0, 60, 0).unwrap();
+        assert!(!t.host_full(&k, d));
+        assert_eq!(t.host_sessions(ip("10.0.1.10")), 0);
     }
 
     #[test]

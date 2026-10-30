@@ -563,6 +563,10 @@ pub struct SessionsCfg {
     /// Table full: drop a session that never got an answer (or a closing
     /// TCP one) to make room, instead of refusing the new session.
     pub early_drop: bool,
+    /// Most sessions one address may have open at once, for the whole
+    /// router (0: no limit). Split evenly between the workers, as a host's
+    /// flows are.
+    pub max_per_host: u32,
     /// Per-application timeouts (`[[sessions.timeout]]`), first match wins.
     #[serde(rename = "timeout", skip_serializing_if = "Vec::is_empty")]
     pub app_timeouts: Vec<AppTimeoutCfg>,
@@ -644,6 +648,10 @@ impl<'de> Deserialize<'de> for SessionsMax {
     }
 }
 
+/// `sessions.max_per_host` unless set: far above a busy PC (a few hundred)
+/// or a torrent client (a few thousand); only a runaway host gets near it.
+pub const DEFAULT_MAX_PER_HOST: u32 = 50_000;
+
 impl Default for SessionsCfg {
     fn default() -> Self {
         let s = SessionConfig::default();
@@ -659,6 +667,7 @@ impl Default for SessionsCfg {
             tcp_closed_timeout_secs: s.timeouts.tcp_closed,
             other_timeout_secs: s.timeouts.other,
             early_drop: s.early_drop,
+            max_per_host: DEFAULT_MAX_PER_HOST,
             app_timeouts: vec![],
         }
     }
@@ -706,11 +715,12 @@ impl SessionsCfg {
             .collect()
     }
 
-    /// The data plane's settings, for tables of `max_sessions` (the
-    /// configured size, or what `memory::plan` worked out for "auto"). No
+    /// The data plane's settings, for tables of `max_sessions` in each of
+    /// `workers` workers (the configured size, or what `memory::plan`
+    /// worked out for "auto"). No
     /// session may sit idle for more than a day
     /// ([`eph_dataplane::MAX_IDLE_SECS`]): longer timeouts are capped.
-    pub fn to_config(&self, max_sessions: u32) -> SessionConfig {
+    pub fn to_config(&self, max_sessions: u32, workers: u32) -> SessionConfig {
         let cap = |name: &str, v: u64| {
             if v > eph_dataplane::MAX_IDLE_SECS {
                 tracing::warn!(target: crate::logging::cat::CONFIG,
@@ -744,6 +754,7 @@ impl SessionsCfg {
             // Checked by `validate`, so nothing is lost here.
             apps: self.app_timeouts().unwrap_or_default().into(),
             early_drop: self.early_drop,
+            max_per_host: self.max_per_host.div_ceil(workers.max(1)),
         }
     }
 }
@@ -1865,7 +1876,9 @@ pub fn print_summary(cfg: &Config) -> Result<()> {
         fib.memory_bytes() as u64,
         crate::memory::machine().as_ref(),
     )?;
-    let sc = cfg.sessions.to_config(plan.sessions_per_worker);
+    let sc = cfg
+        .sessions
+        .to_config(plan.sessions_per_worker, plan.workers);
     println!(
         "Sessions: up to {}{} per worker, tcp_strict={}, timeouts tcp={}s udp={}s/{}s icmp={}s",
         sc.max_sessions,
@@ -1947,7 +1960,7 @@ mod tests {
         c.sessions.udp_stream_timeout_secs = 2 * 86_400;
         c.validate().unwrap();
         // ...but no session stays idle for more than a day.
-        let t = c.sessions.to_config(1000).timeouts;
+        let t = c.sessions.to_config(1000, 1).timeouts;
         assert_eq!(t.tcp_established, eph_dataplane::MAX_IDLE_SECS);
         assert_eq!(t.udp_stream, eph_dataplane::MAX_IDLE_SECS);
         assert_eq!(t.udp, 30, "shorter ones are left alone");
@@ -1975,7 +1988,7 @@ idle_secs = 600
 "#,
         )
         .unwrap();
-        let apps = c.sessions.to_config(1000).apps;
+        let apps = c.sessions.to_config(1000, 1).apps;
         assert_eq!(apps.len(), 2);
         assert_eq!(
             apps[0],
