@@ -188,6 +188,25 @@ fn drops_unspecified_and_reserved_addresses() {
 }
 
 #[test]
+fn link_local_is_never_forwarded() {
+    // RFC 3927: and the router's own host path (169.254.240.0/20, with the
+    // address its own connections leave from) can't be reached from outside.
+    let mut r = router([None; 2]);
+    for (src, dst) in [
+        ("169.254.1.1", B),
+        (A, "169.254.1.1"),
+        (A, "169.254.255.254"),
+        (A, "169.254.240.1"),
+    ] {
+        assert_eq!(
+            dropped(&mut r, 0, ping(0, src, dst)),
+            DropReason::Martian,
+            "{src} -> {dst}"
+        );
+    }
+}
+
+#[test]
 fn a_31_has_no_broadcast_address() {
     let mut r = router([None; 2]);
     assert_eq!(forwarded(&mut r, 2, ping(2, "192.0.2.1", A)), 0);

@@ -39,3 +39,16 @@ ip route replace local 169.254.240.0/20 dev eph-host table local
 ip route replace default dev eph-host table 240
 ip rule del from 169.254.240.0/20 lookup 240 2>/dev/null || true
 ip rule add from 169.254.240.0/20 lookup 240 priority 100
+
+# The router's own connections ([management] outbound = "dataplane"):
+# software updates, DNS and time leave through the data plane. A default
+# route into eph-host from 169.254.255.254 (the data plane source-NATs it),
+# preferred over the management port's. While ephemerisd isn't attached to
+# eph-host (no carrier) the kernel ignores it, so the management port's
+# default route, if any, takes over.
+sysctl -qw net.ipv4.conf.eph-host.ignore_routes_with_linkdown=1 2>/dev/null || true
+if sed -n '/^\[management\]/,/^\[/p' "$CONFIG" | grep -q '^[[:space:]]*outbound[[:space:]]*=[[:space:]]*"dataplane"'; then
+    ip route replace default dev eph-host src 169.254.255.254 metric 50
+else
+    ip route del default dev eph-host metric 50 2>/dev/null || true
+fi

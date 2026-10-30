@@ -1671,3 +1671,101 @@ fn replies_go_back_with_the_port_address_and_nothing_else_gets_out() {
         Verdict::Drop(DropReason::LocalUnhandled)
     );
 }
+
+/// The router's own connections out through the data plane (see
+/// `host::SELF_ADDR`): host packets at offset 256 of a frame.
+fn from_host(src: (&str, u16), dst: (&str, u16), flags: u8) -> (Vec<u8>, usize) {
+    let (b, n) = tcp_ok([0; 6], [0; 6], src, dst, flags);
+    let mut f = vec![0u8; 2048];
+    f[256..256 + n].copy_from_slice(&b[..n]);
+    (f, n)
+}
+
+const ACK: u8 = 0x10;
+
+#[test]
+fn the_routers_own_connections_go_out_through_the_data_plane() {
+    let mut r = host_router();
+    learn(&mut r, 1, HOST_B, "10.10.2.10");
+    let me = ("169.254.255.254", 40000);
+    // Off unless asked for.
+    let (mut f, n) = from_host(me, ("10.10.2.10", 443), SYN);
+    assert_eq!(
+        r.inject_host(&mut f, 256, n),
+        Verdict::Drop(DropReason::LocalUnhandled)
+    );
+    r.set_host_outbound(true);
+
+    // Out of lan-b with lan-b's address, like a LAN host behind NAT.
+    let Verdict::Tx { port, off, len } = r.inject_host(&mut f, 256, n) else {
+        panic!("not sent")
+    };
+    assert_eq!(port, 1);
+    let o = f[off..off + len].to_vec();
+    assert_eq!((eth::dst(&o), eth::src(&o)), (HOST_B, R1));
+    let h = ipv4::parse(&o[14..]).unwrap();
+    assert_eq!((h.src, h.dst), (ip("10.10.2.1"), ip("10.10.2.10")));
+    assert_eq!(tcp_checksum(&o[14..]), 0);
+    let nat_port = u16::from_be_bytes([o[34], o[35]]);
+
+    // The reply goes into the host path, back to the router's address.
+    let (mut b, n) = tcp_ok(
+        R1,
+        HOST_B,
+        ("10.10.2.10", 443),
+        ("10.10.2.1", nat_port),
+        SYN_ACK,
+    );
+    assert_eq!(
+        r.process(1, &mut b, 0, n),
+        Verdict::Drop(DropReason::ToHost)
+    );
+    let p = r.host_out.pop().expect("handed to the host");
+    let h = ipv4::parse(&p).unwrap();
+    assert_eq!((h.src, h.dst), (ip("10.10.2.10"), ip("169.254.255.254")));
+    assert_eq!(u16::from_be_bytes([p[22], p[23]]), 40000);
+    assert_eq!(tcp_checksum(&p), 0);
+
+    // The rest of the connection follows its session.
+    let (mut f, n) = from_host(me, ("10.10.2.10", 443), ACK);
+    assert!(matches!(
+        r.inject_host(&mut f, 256, n),
+        Verdict::Tx { port: 1, .. }
+    ));
+
+    // Nobody outside can start a connection to the router this way...
+    let (mut b, n) = tcp_ok(
+        R1,
+        HOST_B,
+        ("10.10.2.10", 443),
+        ("10.10.2.1", nat_port ^ 1),
+        SYN,
+    );
+    assert_ne!(
+        r.process(1, &mut b, 0, n),
+        Verdict::Drop(DropReason::ToHost)
+    );
+    assert!(r.host_out.is_empty());
+    // ...nor reach its address directly.
+    let (mut b, n) = tcp_ok(
+        R1,
+        HOST_B,
+        ("10.10.2.10", 443),
+        ("169.254.255.254", 40000),
+        ACK,
+    );
+    assert_eq!(
+        r.process(1, &mut b, 0, n),
+        Verdict::Drop(DropReason::Martian)
+    );
+    // And the host can't send to the router's own addresses or link-local
+    // ones through it.
+    for dst in ["10.10.1.1", "169.254.1.1", "10.10.2.255", "224.0.0.1"] {
+        let (mut f, n) = from_host(me, (dst, 443), SYN);
+        assert_eq!(
+            r.inject_host(&mut f, 256, n),
+            Verdict::Drop(DropReason::LocalUnhandled),
+            "{dst}"
+        );
+    }
+}

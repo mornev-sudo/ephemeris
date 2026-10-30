@@ -506,6 +506,35 @@ check "pings through NAT (ICMP handed over as needed)" pings
 check "back to one worker (restart)"       on_router "ephctl config rollback 1 && ephctl restart"
 check "forwarding again with one worker"   wait_for 90 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
 
+# ------------------------------------------------------------ own traffic
+# The router's own connections through the data plane ([management]
+# outbound = "dataplane"): out of lan-b (the WAN), NATed to its address, with
+# DNS from lan-b's lease. Host B plays an update server; the router reaches
+# it with an HTTP request from its own shell (bash's /dev/tcp: the image has
+# no curl). Management SSH keeps working on its own subnet throughout.
+echo "Router's own traffic through the data plane:"
+mkdir -p "$WORK/www" && echo "ephemeris-update-ok" > "$WORK/www/probe.txt"
+(cd "$WORK/www" && exec ip netns exec ci-hb python3 -m http.server 8000 --bind 10.10.2.10 > "$LOGS/www-b.log" 2>&1) &
+www_pid=$!
+printf '\n[management]\noutbound = "dataplane"\n' | cat "$WORK/ephemeris.toml" - > "$WORK/outbound.toml"
+on_router "cat > /run/outbound.toml" < "$WORK/outbound.toml"
+check "own traffic through the data plane (restart)" on_router "ephctl config load /run/outbound.toml && ephctl config commit && ephctl restart"
+check "forwarding again"                   wait_for 90 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+check "default route into the data plane"  wait_for 30 "the eph-host route" on_router "ip route show default | grep -q 'dev eph-host .*src 169.254.255.254'"
+check "the router pings host B itself"     wait_for 30 "a ping from the router" on_router "ping -c2 -i0.2 -W1 10.10.2.10"
+router_fetch() { # GET /probe.txt from host B, from the router's own shell
+    "${SSH[@]}" "bash -c 'exec 3<>/dev/tcp/10.10.2.10/8000 && printf \"GET /probe.txt HTTP/1.0\r\n\r\n\" >&3 && timeout 5 cat <&3'" \
+        | grep -q ephemeris-update-ok
+}
+check "the router downloads from host B"   router_fetch
+check "host B sees the router's WAN address" grep -q '^10\.10\.2\.1 .*GET /probe.txt' "$LOGS/www-b.log"
+check "the router's DNS from lan-b's lease" wait_for 30 "resolved's servers" on_router "resolvectl dns eph-host | grep -q 10.10.2.53"
+check "management SSH still works"         on_router true
+kill "$www_pid" 2>/dev/null || true
+check "back to the management port (restart)" on_router "ephctl config rollback 1 && ephctl restart"
+check "forwarding again, own traffic as before" wait_for 90 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+check "no route into the data plane now"   on_router "! ip route show default | grep -q eph-host && ! resolvectl dns eph-host | grep -q 10.10.2.53"
+
 # ------------------------------------------------------------ updates
 if [[ -n $UPDATE_DIR ]]; then
     echo "A/B update to $UPDATE_VERSION:"

@@ -7,7 +7,8 @@ use crate::overlay::{
     TetherStats, OUTER_LEN, TAG_LEN,
 };
 use crate::session::{
-    Dir, FlowKey, NatBinding, SessionConfig, SessionTable, TcpSegment, Track, OVERLAY_INGRESS,
+    Dir, FlowKey, NatBinding, SessionConfig, SessionTable, TcpSegment, Track, HOST_INGRESS,
+    OVERLAY_INGRESS,
 };
 use crate::stats::{DropReason, Stats};
 use crate::steer::Steering;
@@ -224,6 +225,9 @@ pub struct Pipeline {
     /// IP packets for the router's own SSH and portal (see [`host`]); the
     /// worker hands them to the host path.
     pub host_out: Vec<Vec<u8>>,
+    /// The router's own connections may leave through the data plane
+    /// (`[management] outbound = "dataplane"`, see [`host`]).
+    host_outbound: bool,
 }
 
 impl Pipeline {
@@ -284,6 +288,7 @@ impl Pipeline {
             handshakes: Vec::new(),
             tracer: Tracer::default(),
             host_out: Vec::new(),
+            host_outbound: false,
         }
     }
 
@@ -415,6 +420,12 @@ impl Pipeline {
     /// Share one learned-endpoints table between all workers.
     pub fn set_endpoints(&mut self, endpoints: Arc<Endpoints>) {
         self.endpoints = endpoints;
+    }
+
+    /// Let the router's own connections out through the data plane (see
+    /// [`host`]).
+    pub fn set_host_outbound(&mut self, on: bool) {
+        self.host_outbound = on;
     }
 
     /// How the network cards spread packets (read from them at start).
@@ -1547,6 +1558,12 @@ impl Pipeline {
         off: usize,
         h: &ipv4::Header,
     ) -> Result<NextHop, Verdict> {
+        // A reply to one of the router's own connections, translated back:
+        // into the host path. (Nothing else gets here with this address:
+        // link-local never arrives from the network.)
+        if h.dst == host::SELF_ADDR {
+            return Err(self.punt_reply_to_self(ingress, frame, off, h));
+        }
         match self.fib.lookup(h.dst) {
             Some(&nh) => Ok(nh),
             None => Err(self.icmp_error(
@@ -1741,6 +1758,9 @@ impl Pipeline {
         let Ok(h) = ipv4::parse(&frame[off + ETH..off + len]) else {
             return Verdict::Drop(DropReason::BadIpHeader);
         };
+        if h.src == host::SELF_ADDR {
+            return self.host_originated(frame, off, h);
+        }
         let len = ETH + h.total_len;
         let ip = off + ETH..off + len;
         let l4 = off + ETH + h.hdr_len;
@@ -1770,6 +1790,148 @@ impl Pipeline {
             clamp_mss(&mut frame[ip], &h, max);
         }
         self.output(frame, off, len, h.dst)
+    }
+
+    /// One of the router's own packets (from [`host::SELF_ADDR`]): out like a
+    /// LAN host's, but always source-NATed to the way out's address (its
+    /// own is link-local), with a session for the replies. Only towards
+    /// local ports' networks, not into tethers.
+    fn host_originated(&mut self, frame: &mut [u8], off: usize, mut h: ipv4::Header) -> Verdict {
+        if !self.host_outbound {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        }
+        let len = ETH + h.total_len;
+        let ip = off + ETH..off + len;
+        let d = h.dst;
+        // Linux keeps its own packets whole (path MTU, MSS); a fragment has
+        // no ports to find its session by anyway.
+        if ipv4::is_fragment(&frame[ip.clone()]) {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        }
+        if filter::is_martian(d)
+            || d.is_link_local()
+            || self
+                .ports
+                .iter()
+                .any(|p| p.addr == d || (p.subnet.len() < 31 && p.broadcast() == d))
+        {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        }
+        let Some(&nh) = self.fib.lookup(d) else {
+            return Verdict::Drop(DropReason::NoRoute);
+        };
+        let NextHop::Ip { port: egress, .. } = nh else {
+            return Verdict::Drop(DropReason::NoRoute);
+        };
+        let addr = self.ports[egress as usize].addr;
+        if addr.is_unspecified() {
+            return Verdict::Drop(DropReason::NoRoute);
+        }
+        let (key, lo_to_hi, tcp) = match flow_of(&frame[ip.clone()], &h) {
+            Ok(Flow::Tracked { key, lo_to_hi, tcp }) => (key, lo_to_hi, tcp),
+            Ok(_) => return Verdict::Drop(DropReason::LocalUnhandled),
+            Err(v) => return v,
+        };
+        let tcp_flags = tcp.map_or(0, |t| t.flags);
+        let (bytes, now) = (h.total_len as u64, self.now_ns);
+        let idx = if let Some(idx) = self.sessions.lookup(&key) {
+            // Only the router's own sessions, in the direction they started.
+            let s = self.sessions.get(idx);
+            let own = s
+                .nat
+                .is_some_and(|n| n.orig_addr == host::SELF_ADDR && n.xkey != key);
+            if !own || s.dir(lo_to_hi) != Dir::Forward {
+                return Verdict::Drop(DropReason::SessionMismatch);
+            }
+            let flags = match tcp {
+                Some(seg) => self.sessions.observe_tcp(idx, Dir::Forward, &seg),
+                None => tcp_flags,
+            };
+            let Track::Ok { idx, .. } =
+                self.sessions
+                    .update_dir(idx, Dir::Forward, flags, bytes, now)
+            else {
+                return Verdict::Drop(DropReason::InvalidTcpState);
+            };
+            idx
+        } else {
+            if !self.sessions.can_create(key.proto, tcp_flags) {
+                return Verdict::Drop(DropReason::InvalidTcpState);
+            }
+            let (sport, dport) = if lo_to_hi {
+                (key.lo_port, key.hi_port)
+            } else {
+                (key.hi_port, key.lo_port)
+            };
+            let Some((port, xkey)) = self.alloc_nat(egress, key.proto, addr, d, sport, dport)
+            else {
+                return Verdict::Drop(DropReason::NatExhausted);
+            };
+            let Some(idx) = self.sessions.create(key, lo_to_hi, tcp_flags, bytes, now) else {
+                return Verdict::Drop(DropReason::SessionTableFull);
+            };
+            if let Some(seg) = tcp {
+                self.sessions.observe_tcp(idx, Dir::Forward, &seg);
+            }
+            self.sessions.bind_nat(
+                idx,
+                NatBinding {
+                    xkey,
+                    orig_addr: h.src,
+                    orig_port: sport,
+                    addr,
+                    port,
+                },
+            );
+            let s = self.sessions.get_mut(idx);
+            s.next_hop[0] = Some(nh);
+            s.fib_gen = self.fib_gen;
+            s.ingress = [Some(HOST_INGRESS), Some(egress)];
+            idx
+        };
+        let Some(n) = self.sessions.get(idx).nat else {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        };
+        nat::translate_src(&mut frame[ip.clone()], n.addr, n.port);
+        h.src = n.addr;
+        if h.proto == ipv4::PROTO_TCP {
+            if let Some(max) = self.ports[egress as usize].mss_adjust {
+                clamp_mss(&mut frame[ip], &h, max);
+            }
+        }
+        if self
+            .mtu_towards(d, h.total_len)
+            .is_some_and(|mtu| h.total_len > mtu)
+        {
+            return Verdict::Drop(DropReason::TooBig);
+        }
+        self.deliver(frame, off, len, nh, Some(idx), false)
+    }
+
+    /// A reply to one of the router's own connections, already translated
+    /// back to [`host::SELF_ADDR`] (see [`Pipeline::route`]): into the host
+    /// path, its SYN-ACKs' MSS sized for the port it came in on.
+    fn punt_reply_to_self(
+        &mut self,
+        ingress: PortId,
+        frame: &mut [u8],
+        off: usize,
+        h: &ipv4::Header,
+    ) -> Verdict {
+        if !self.host_outbound {
+            return Verdict::Drop(DropReason::LocalUnhandled);
+        }
+        let ip = off + ETH..off + ETH + h.total_len;
+        if h.proto == ipv4::PROTO_TCP {
+            if let Some(max) = self.ports.get(ingress as usize).and_then(|p| p.mss_adjust) {
+                clamp_mss(&mut frame[ip.clone()], h, max);
+            }
+        }
+        if self.host_out.len() >= PUNT_MAX {
+            return Verdict::Drop(DropReason::ControlQueueFull);
+        }
+        self.host_out.push(frame[ip].to_vec());
+        Verdict::Drop(DropReason::ToHost)
     }
 
     /// Build an ICMP error about the packet in the frame, in place, and send

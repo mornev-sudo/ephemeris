@@ -703,6 +703,9 @@ fn start_dataplane(cfg: &Config, state_dir: &Path) -> Result<Dataplane> {
         pipeline.set_overlay_run(run, replay.clone());
         pipeline.set_endpoints(endpoints.clone());
         pipeline.set_steering(steering.clone());
+        pipeline.set_host_outbound(
+            cfg.management.outbound == crate::config::Outbound::Dataplane && host_tx.is_some(),
+        );
         pipeline.set_trace(crate::logging::control().trace_config());
         pool.push(Worker {
             id: w,

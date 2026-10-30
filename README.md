@@ -178,6 +178,7 @@ a browser.
   - [x] 3a: mkosi image (read-only erofs root + dm-verity, writable /var, UKI), CI build + QEMU boot test + releases, Proxmox deploy script
   - [x] 3b: A/B root slots, systemd-sysupdate, boot counting, health-gated blessing and automatic fallback (tested in CI)
   - [x] 3c: Secure Boot signed boot chain (auto-enrolled keys) and signed, verified updates
+  - [x] Updates (and the router's own DNS and time) through the data plane, without a management network: `[management] outbound = "dataplane"`
   - [x] HTTPS for the portal and API (nginx, TLS 1.2/1.3), hardened systemd units
   - [ ] later: TPM measured boot / remote attestation
 - [x] **Edge router basics:** inside/outside interface roles, source NAT (PAT to the interface, pools, rules), form-based configuration in the portal

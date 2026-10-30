@@ -18,6 +18,7 @@ mod mgmt;
 mod overlay_state;
 mod pppoe;
 mod report;
+mod resolver;
 #[cfg(target_os = "linux")]
 mod run;
 mod sdwan;

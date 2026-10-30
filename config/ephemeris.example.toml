@@ -33,6 +33,12 @@ token_file = "/var/lib/ephemeris/api-token"
 # Host names the portal may be reached by, besides addresses, localhost and
 # the router's own name (anything else is refused: DNS rebinding).
 # hostnames = ["router.example.net"]
+# Where the router's own connections go out: software updates, DNS, time.
+# "management": over the management port (the default). "dataplane":
+# through the data plane, source-NATed out of the WAN like a LAN host, so a
+# router with no management network still updates itself; the management
+# port then only reaches its own subnet. Takes effect after a restart.
+# outbound = "dataplane"
 
 [sessions]
 # Capacity per worker. Memory is reserved up front (~300 bytes per session).
