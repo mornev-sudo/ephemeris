@@ -220,17 +220,61 @@ hash; `config.history` the list of versions (as `GET /config/history`).
 
 ## Telemetry
 
-The router sends, unasked:
+The router sends these unasked. They carry no `id` and get no answer.
 
-| Message | When | Contents |
-|---|---|---|
-| `status` | every 30 s, and on any change of state | what `GET /status` returns: interfaces, counters, drops by reason, sessions, version |
-| `stats` | every 5 min | the samples since the last one, as `GET /stats/history` |
-| `event` | as they happen | path changes, tethers up or down, a WAN lease or PPPoE session gained or lost, commits and rollbacks, update progress, a failed config at start |
+**`status`**: the router's state, exactly what `GET /status` returns.
+
+```json
+{"type": "status", "status": { ... }}
+```
+
+- Sent every 30 s, and when the state changes (an interface, WAN lease,
+  PPPoE session or tether up or down, an address changed, a commit), at
+  most once every 5 s. At most 256 KiB.
+- The body grows with releases: a controller ignores fields it doesn't
+  know. `drops` and `counters` are open-ended maps (new drop reasons
+  appear with new releases).
+
+**`stats`**: the samples since the last `stats` message, as
+`GET /stats/history` returns them.
+
+```json
+{"type": "stats", "interval_secs": 5, "interfaces": ["wan", "lan"], "samples": [ ... ]}
+```
+
+- Each sample: `t` (Unix seconds, UTC: the end of the interval its rates
+  average over), `sessions`, `rx_pps`, `tx_pps`, `rx_bps`, `tx_bps`,
+  `drops_per_sec`, `drops_total`, `ports` (one `{rx_pps, tx_pps, rx_bps,
+  tx_bps}` per interface, in the order of `interfaces`), `cpu_pct`,
+  `mem_used`, `mem_total` (bytes), `process_cpu_pct` (100 = one core) and
+  `workers_busy_pct` (one per worker, 0 to 100).
+- Sent every 5 min. The router keeps an hour of samples (720), so after a
+  reconnect it sends at most that, never an older backlog; at most 720
+  samples a message. A controller drops samples with a `t` at or before
+  the newest it has, so a resend is harmless.
+
+**`event`**: something that happened.
+
+```json
+{"type": "event", "at": "2026-11-02T02:00:00Z", "kind": "tether.down", "detail": {"tether": "lte", "site": "jhb"}}
+```
+
+- `at`: RFC 3339, UTC. `kind`: dotted lowercase. `detail`: a flat object
+  of strings and numbers, at most 4 KiB.
+- Kinds so far: `path.changed`, `tether.up`, `tether.down`,
+  `wan.lease.gained`, `wan.lease.lost`, `pppoe.up`, `pppoe.down`,
+  `config.committed`, `config.rolled_back`, `config.failed_at_start`,
+  `update.progress`. New releases add kinds; a controller keeps the ones it
+  doesn't know as text.
+- **Floods are coalesced on the router:** the same kind for the same
+  subject (one tether, one interface) within 10 s becomes one event, with
+  `"repeats": n` in its `detail`. The router sends at most 60 events a
+  minute and counts the rest; a controller may refuse more than 120 a
+  minute per router.
 
 Status and stats are best-effort: if the connection is down, the router
-keeps its own history (as now) and sends a summary when it's back, not a
-backlog.
+keeps its own history (as now) and sends what it still holds when it's
+back.
 
 The controller can ask for more when someone is looking: `sessions.get`
 (as `GET /sessions`), `routes.get`, `dhcp.get`, `wan.get`, `overlay.get`.
