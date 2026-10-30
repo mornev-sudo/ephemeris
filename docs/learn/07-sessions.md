@@ -257,7 +257,11 @@ passing between two tethers, to one picked by a fixed symmetric hash).
 
 **In our Proxmox lab (virtio)** the host-side tap device delivers replies to
 the queue the guest sent the flow on, so most packets arrive at the right
-worker anyway, and the hand-off catches the rest.
+worker anyway, and the hand-off catches the rest. Give the virtio NIC
+`rss=on` (QEMU) and the card spreads by Toeplitz RSS like real hardware:
+that's how the end-to-end test ([ci/e2e.sh](../../ci/e2e.sh), "Many
+workers") checks steering, with two workers, 64 UDP flows and 8 TCP
+streams through NAT and not one reply handed over.
 
 ## What about routing changes?
 

@@ -14,6 +14,10 @@
 # ci-hb (always 10.10.2.1, reserved for its MAC; no gateway, one DNS server,
 # and one classless static route (option 121): 10.10.98.0/24 via host B).
 #
+# lan-a's and lan-b's NICs have two queues each, spread by Toeplitz RSS as
+# on real hardware (QEMU's virtio-net RSS). The image sets one queue per
+# worker, so they run on one until the many-workers checks switch to two.
+#
 # usage: sudo ci/e2e.sh <image.qcow2> <expected-version> [<update-dir> <update-version>]
 set -euo pipefail
 
@@ -78,7 +82,7 @@ b64() { base64 -w0 < "$1"; }
 printf '%s' "$HASH" > "$WORK/hash"
 qemu-img create -q -f qcow2 -F qcow2 -b "$(realpath "$IMAGE")" "$WORK/disk.qcow2" 8G
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$WORK/vars.fd"
-for t in ephtap-a ephtap-b; do ip tuntap add dev "$t" mode tap; done
+for t in ephtap-a ephtap-b; do ip tuntap add dev "$t" mode tap multi_queue; done
 accel=tcg; [[ -w /dev/kvm ]] && accel=kvm
 
 qemu-system-x86_64 \
@@ -90,8 +94,10 @@ qemu-system-x86_64 \
     -drive id=disk,if=none,format=qcow2,file="$WORK/disk.qcow2" -device scsi-hd,drive=disk \
     -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8443-:8443 \
     -device virtio-net-pci,netdev=mgmt,addr=0x12 \
-    -netdev tap,id=lana,ifname=ephtap-a,script=no,downscript=no -device virtio-net-pci,netdev=lana,addr=0x13 \
-    -netdev tap,id=lanb,ifname=ephtap-b,script=no,downscript=no -device virtio-net-pci,netdev=lanb,addr=0x14,mac=52:54:00:12:34:58 \
+    -netdev tap,id=lana,ifname=ephtap-a,script=no,downscript=no,queues=2 \
+    -device virtio-net-pci,netdev=lana,addr=0x13,mq=on,vectors=6,rss=on \
+    -netdev tap,id=lanb,ifname=ephtap-b,script=no,downscript=no,queues=2 \
+    -device virtio-net-pci,netdev=lanb,addr=0x14,mac=52:54:00:12:34:58,mq=on,vectors=6,rss=on \
     -smbios type=11,value=io.systemd.credential:system.hostname=ci-router \
     -smbios type=11,value=io.systemd.credential.binary:ephemeris.admin_password_hash=$(b64 "$WORK/hash") \
     -smbios type=11,value=io.systemd.credential.binary:ssh.authorized_keys.root=$(b64 "$WORK/key.pub") \
@@ -399,6 +405,100 @@ ip -n ci-ha link del eth0.20
 ip -n ci-ha link del eth0.10
 check "remove it again (restart)"          on_router "ephctl config rollback 1 && ephctl restart"
 check "forwarding again without VLANs"     wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+
+# ------------------------------------------------------------ many workers
+# Two workers, one per queue of each card. Each worker picks NAT ports whose
+# replies the card's RSS brings back to it (see eph_dataplane::steer), so
+# TCP and UDP replies must arrive at the right worker without a single
+# hand-off; ICMP, which cards hash on addresses only, is handed over when
+# it lands on the other one.
+echo "Many workers (RSS steering):"
+sed 's/^workers = 1$/workers = 2/' "$WORK/ephemeris.toml" > "$WORK/workers.toml"
+on_router "cat > /run/workers.toml" < "$WORK/workers.toml"
+check "two workers (restart)"              on_router "ephctl config load /run/workers.toml && ephctl config commit && ephctl restart"
+check "forwarding with two workers"        wait_for 90 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
+check "one queue per worker on each card"  on_router '[ "$(ephctl --json status | grep -o "\"workers\": [0-9]*")" = "\"workers\": 2" ] && for d in enp0s19 enp0s20; do [ "$(ls /sys/class/net/$d/queues | grep -c "^rx-")" = 2 ] || { ethtool -l $d; exit 1; }; done'
+check "outside card's RSS read, ports hashed" \
+                                           on_router "journalctl -u ephemerisd -b --no-pager | grep 'enp0s20: Toeplitz RSS over' | tail -n1 | grep -q 'ports hashed: TCP yes, UDP yes' || { journalctl -u ephemerisd -b --no-pager | grep -E 'RSS|spreading|hash' | tail -5; false; }"
+# A counter or drop reason from the router (counters are sampled every
+# stats interval: 5 s here).
+counter() {
+    "${SSH[@]}" ephctl --json status | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+print(s["counters"].get(sys.argv[1], s["drops"].get(sys.argv[1], 0)))' "$1"
+}
+sleep 6
+handed=$(counter handed_between_workers) wrong=$(counter nat-wrong-worker) nosess=$(counter nat-no-session)
+# 64 UDP flows (one socket each, so 64 source ports) to an echo server on
+# host B, through NAT: every one must be answered.
+cat > "$WORK/udp-echo.py" <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("10.10.2.10", 7000))
+s.settimeout(60)
+while True:
+    try:
+        d, a = s.recvfrom(64)
+    except socket.timeout:
+        break
+    s.sendto(d, a)
+PY
+cat > "$WORK/udp-flows.py" <<'PY'
+import select, socket, sys, time
+n = int(sys.argv[1])
+socks = []
+for _ in range(n):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("10.10.1.10", 0))
+    socks.append(s)
+answered = set()
+for _ in range(3):
+    for i, s in enumerate(socks):
+        if i not in answered:
+            s.sendto(str(i).encode(), ("10.10.2.10", 7000))
+    end = time.time() + 2
+    while time.time() < end and len(answered) < n:
+        waiting = [s for i, s in enumerate(socks) if i not in answered]
+        for s in select.select(waiting, [], [], 0.2)[0]:
+            answered.add(int(s.recv(64)))
+    if len(answered) == n:
+        break
+print(f"{len(answered)} of {n} UDP flows answered")
+sys.exit(0 if len(answered) == n else 1)
+PY
+ip netns exec ci-hb python3 -I "$WORK/udp-echo.py" &
+echo_pid=$!
+sleep 0.5
+check "64 UDP flows through NAT, all answered" ip netns exec ci-ha python3 -I "$WORK/udp-flows.py" 64
+sed 's/^/        /' "$WORK/out"
+kill "$echo_pid" 2>/dev/null || true
+ip netns exec ci-hb iperf3 -s -D -1
+sleep 0.5
+check "TCP through NAT, 8 streams (iperf3 -P 8)" ip netns exec ci-ha iperf3 -c 10.10.2.10 -t3 -P 8
+grep -E "SUM.*receiver" "$WORK/out" | sed 's/^/        /' || true
+check "both queues of lan-b's card carried traffic" \
+                                           on_router 'ethtool -S enp0s20 > /run/q.txt; for q in 0 1; do grep -Eq "rx[_a-z]*${q}_packets: *[1-9]" /run/q.txt || { grep -E "rx.*packets" /run/q.txt; exit 1; }; done'
+sleep 6
+steered() { # since the snapshot above: nothing handed over, nothing lost
+    local h w n
+    h=$(( $(counter handed_between_workers) - handed ))
+    w=$(( $(counter nat-wrong-worker) - wrong ))
+    n=$(( $(counter nat-no-session) - nosess ))
+    echo "handed between workers: $h, nat-wrong-worker: $w, nat-no-session: $n"
+    [ "$h" -eq 0 ] && [ "$w" -eq 0 ] && [ "$n" -eq 0 ]
+}
+check "every reply reached its own worker" steered
+sed 's/^/        /' "$WORK/out"
+pings() { # eight pings at once, each its own ICMP id
+    local pids=() p ok=0
+    for _ in 1 2 3 4 5 6 7 8; do ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10 >/dev/null & pids+=($!); done
+    for p in "${pids[@]}"; do wait "$p" || ok=1; done
+    return $ok
+}
+check "pings through NAT (ICMP handed over as needed)" pings
+check "back to one worker (restart)"       on_router "ephctl config rollback 1 && ephctl restart"
+check "forwarding again with one worker"   wait_for 90 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
 
 # ------------------------------------------------------------ updates
 if [[ -n $UPDATE_DIR ]]; then
