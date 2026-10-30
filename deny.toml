@@ -22,6 +22,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "BSL-1.0",
+    # Permissive, like MIT: ring, rustls-webpki and untrusted (the TLS to
+    # a controller) use it.
+    "ISC",
     "MIT",
     "Unicode-3.0",
     "Unlicense",

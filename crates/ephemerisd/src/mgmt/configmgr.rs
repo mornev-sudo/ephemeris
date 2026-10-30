@@ -489,6 +489,16 @@ impl ConfigManager {
     // ---- convenience edits, applied to the running text (comments survive)
 
     /// The running config with a static route added (or its gateway changed).
+    /// The running config with a `[controller]` section (after enrolment).
+    pub fn with_controller(&self, c: &crate::config::ControllerCfg) -> Result<String> {
+        let mut doc: DocumentMut = self.running_text.parse()?;
+        let mut t = Table::new();
+        t["url"] = value(c.url.as_str());
+        t["pin"] = value(c.pin.as_str());
+        doc.insert("controller", Item::Table(t));
+        Ok(doc.to_string())
+    }
+
     pub fn with_route(&self, prefix: &str, via: &str) -> Result<String> {
         let mut doc: DocumentMut = self.running_text.parse()?;
         // `route = []` means no routes, like a missing key.

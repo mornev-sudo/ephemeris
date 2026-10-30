@@ -84,8 +84,8 @@ pub fn run(config_path: &Path) -> Result<()> {
     };
     // Its identity towards a controller: made on first start too, so it can
     // be read off a router before it's enrolled anywhere.
-    let controller_key = match crate::controller::Identity::load_or_create(&state_dir) {
-        Ok(i) => Some(i.public()),
+    let controller_identity = match crate::controller::Identity::load_or_create(&state_dir) {
+        Ok(i) => Some(Arc::new(i)),
         Err(e) => {
             error!(target: crate::logging::cat::MGMT, "controller key pair unavailable: {e:#}");
             None
@@ -166,7 +166,8 @@ pub fn run(config_path: &Path) -> Result<()> {
             public_key: identity.as_ref().map(|i| i.public),
             ..Default::default()
         },
-        controller_key,
+        controller_identity,
+        controller: Default::default(),
         history: Default::default(),
         update: Default::default(),
         system: Default::default(),
@@ -174,6 +175,13 @@ pub fn run(config_path: &Path) -> Result<()> {
         detail,
         stop: &STOP,
     });
+    // The controller, if this router is enrolled with one (followed even
+    // with management off: it's how a managed router is reached).
+    if let Some(id) = shared.controller_identity.clone() {
+        if let Err(e) = crate::controller::link::spawn(shared.clone(), id) {
+            error!(target: crate::logging::cat::MGMT, "can't follow the controller: {e}");
+        }
+    }
     let mgmt = m.enabled.then(|| {
         let shared = shared.clone();
         let (listen, moved) = m.bind_addr();

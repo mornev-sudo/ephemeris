@@ -60,6 +60,150 @@ pub struct Config {
     pub overlay_routes: Vec<OverlayRouteCfg>,
     #[serde(default, rename = "class")]
     pub classes: Vec<ClassCfg>,
+    /// The controller managing this router, once enrolled
+    /// (docs/controller-api.md). Written by enrolment; removing it unenrols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<ControllerCfg>,
+}
+
+/// `[controller]`: where the router's controller is, and its pinned key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerCfg {
+    /// The controller's base URL: `https://` only, with no user info, query
+    /// or fragment.
+    pub url: String,
+    /// The controller's certificate key, pinned at enrolment: `sha256:`
+    /// and the SHA-256 of its SubjectPublicKeyInfo in lowercase hex.
+    pub pin: String,
+}
+
+impl ControllerCfg {
+    pub fn validate(&self) -> Result<()> {
+        check_controller_url(&self.url)?;
+        self.pin_bytes()?;
+        Ok(())
+    }
+
+    /// The pinned SHA-256.
+    pub fn pin_bytes(&self) -> Result<[u8; 32]> {
+        let hex = self
+            .pin
+            .strip_prefix("sha256:")
+            .context("controller.pin must start with \"sha256:\"")?;
+        parse_fingerprint(hex).context("controller.pin")
+    }
+}
+
+/// A controller URL: `https://host[:port][/path]`, nothing else.
+pub fn check_controller_url(url: &str) -> Result<()> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        bail!("the controller URL must start with https://");
+    };
+    if rest.contains(['@', '?', '#']) || rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("the controller URL must have no user info, query or fragment");
+    }
+    let host = rest.split('/').next().unwrap_or("");
+    let name = host.rsplit_once(':').map_or(host, |(h, port)| {
+        if port.parse::<u16>().is_ok_and(|p| p > 0) {
+            h
+        } else {
+            ""
+        }
+    });
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-.".contains(&b))
+    {
+        bail!("the controller URL needs a host name or IPv4 address (and an optional port)");
+    }
+    Ok(())
+}
+
+/// An enrolment string, `eph-enrol:v1:<url>#<token>@<fingerprint>`
+/// (docs/controller-api.md): everything a router needs to enrol once.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Enrolment {
+    pub url: String,
+    /// 32 random bytes in base64url without padding (43 characters).
+    pub token: String,
+    /// SHA-256 of the controller certificate's SubjectPublicKeyInfo.
+    pub fingerprint: [u8; 32],
+}
+
+impl Enrolment {
+    pub const PREFIX: &'static str = "eph-enrol:v1:";
+
+    /// Parse it, refusing anything that isn't exactly the format.
+    pub fn parse(s: &str) -> Result<Self> {
+        let Some(rest) = s.trim().strip_prefix(Self::PREFIX) else {
+            bail!("an enrolment string starts with {}", Self::PREFIX);
+        };
+        let (url, rest) = rest
+            .split_once('#')
+            .context("an enrolment string has a '#' before the token")?;
+        let (token, fingerprint) = rest
+            .split_once('@')
+            .context("an enrolment string has an '@' before the fingerprint")?;
+        check_controller_url(url)?;
+        if token.len() != 43
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            bail!("the enrolment token must be 43 base64url characters");
+        }
+        let fingerprint = parse_fingerprint(fingerprint).context("the enrolment fingerprint")?;
+        Ok(Enrolment {
+            url: url.to_string(),
+            token: token.to_string(),
+            fingerprint,
+        })
+    }
+
+    /// The `[controller]` section a successful enrolment writes.
+    pub fn controller(&self) -> ControllerCfg {
+        ControllerCfg {
+            url: self.url.clone(),
+            pin: format!("sha256:{}", hex(&self.fingerprint)),
+        }
+    }
+}
+
+impl std::fmt::Display for Enrolment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (url, token) = (&self.url, &self.token);
+        write!(
+            f,
+            "{}{url}#{token}@{}",
+            Self::PREFIX,
+            hex(&self.fingerprint)
+        )
+    }
+}
+
+/// The token is a secret: never in logs or debug output.
+impl std::fmt::Debug for Enrolment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Enrolment")
+            .field("url", &self.url)
+            .field("fingerprint", &hex(&self.fingerprint))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Lowercase hex.
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// A SHA-256 fingerprint: exactly 64 lowercase hex characters.
+pub fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        bail!("must be lowercase hex");
+    }
+    parse_hex32(s)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -939,6 +1083,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(c) = &self.controller {
+            c.validate()?;
+        }
         let d = &self.dataplane;
         if d.workers == 0 {
             bail!("dataplane.workers must be at least 1");
@@ -2326,6 +2473,76 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
         assert_eq!(c.management.bind_addr(), (addr("0.0.0.0:9000"), false));
         assert!(with(r#"hostnames = ["evil name"]"#).is_err());
         assert!(with(r#"hostnames = ["router.example.net"]"#).is_ok());
+    }
+
+    #[test]
+    fn the_controller_section_is_checked() {
+        let base = "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n";
+        let pin = format!("sha256:{}", "ab".repeat(32));
+        let with = |url: &str, pin: &str| {
+            parse(&format!(
+                "{base}[controller]\nurl = \"{url}\"\npin = \"{pin}\"\n"
+            ))
+        };
+        for ok in [
+            "https://controller.example.net/",
+            "https://10.0.0.5:8443",
+            "https://orrery.example.net/acme/",
+        ] {
+            let c = with(ok, &pin).unwrap();
+            assert_eq!(c.controller.unwrap().pin_bytes().unwrap(), [0xab; 32]);
+        }
+        for bad in [
+            "http://controller.example.net/",
+            "https://user@controller.example.net/",
+            "https://controller.example.net/?x=1",
+            "https://controller.example.net/#token",
+            "https://:8443/",
+            "https://host:0/",
+            "https://bad host/",
+        ] {
+            assert!(with(bad, &pin).is_err(), "{bad}");
+        }
+        for bad in [
+            "ab".repeat(32),
+            format!("sha1:{}", "ab".repeat(32)),
+            format!("sha256:{}", "AB".repeat(32)),
+            format!("sha256:{}", "ab".repeat(31)),
+        ] {
+            assert!(with("https://c.example.net/", &bad).is_err(), "{bad}");
+        }
+        assert!(parse(base).unwrap().controller.is_none());
+    }
+
+    #[test]
+    fn enrolment_strings_are_exact() {
+        let token = "A".repeat(42) + "_";
+        let fp = "0f".repeat(32);
+        let good = format!("eph-enrol:v1:https://c.example.net/#{token}@{fp}");
+        let e = Enrolment::parse(&good).unwrap();
+        assert_eq!(
+            (e.url.as_str(), e.token.as_str()),
+            ("https://c.example.net/", token.as_str())
+        );
+        assert_eq!(e.fingerprint, [0x0f; 32]);
+        assert_eq!(e.to_string(), good, "round trip");
+        assert_eq!(e.controller().pin, format!("sha256:{fp}"));
+        assert!(!format!("{e:?}").contains(&token), "the token never prints");
+        for bad in [
+            format!("eph-enrol:v2:https://c.example.net/#{token}@{fp}"),
+            format!("eph-enrol:v1:http://c.example.net/#{token}@{fp}"),
+            format!("eph-enrol:v1:https://c.example.net/{token}@{fp}"),
+            format!("eph-enrol:v1:https://c.example.net/#{token}{fp}"),
+            format!("eph-enrol:v1:https://c.example.net/#{}@{fp}", &token[1..]),
+            format!("eph-enrol:v1:https://c.example.net/#{}+@{fp}", &token[1..]),
+            format!(
+                "eph-enrol:v1:https://c.example.net/#{token}@{}",
+                fp.to_uppercase()
+            ),
+            format!("eph-enrol:v1:https://u@c.example.net/#{token}@{fp}"),
+        ] {
+            assert!(Enrolment::parse(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
