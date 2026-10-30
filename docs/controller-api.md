@@ -60,22 +60,50 @@ Enrolment, once per router:
 
    by any of: `ephctl controller enrol <string>`, the portal, or a systemd
    credential at first boot (`ephemeris.controller`), like the update URL.
+
+   - `<url>`: the controller's base URL, `https://` only, with no user
+     info, query or fragment (so it contains no `#` or `@`).
+   - `<token>`: 32 random bytes in base64url without padding (43
+     characters from `A-Z a-z 0-9 - _`).
+   - `<sha256-fingerprint>`: the SHA-256 of the controller certificate's
+     DER-encoded SubjectPublicKeyInfo, as 64 lowercase hex characters. It's
+     the same value the router then keeps as `[controller] pin`, which
+     adds the `sha256:` prefix.
+
+   Parse it by splitting at the first `#`, then the token from the
+   fingerprint at the `@` after it; anything that doesn't match exactly is
+   refused.
 3. The router connects, checks the controller's certificate against the
    fingerprint, and sends `enrol` with the token and its management public
-   key. The controller records the key and answers with the router's id.
-4. From then on the router authenticates with its key (TLS client
-   certificate, self-signed, key pinned by the controller) and the token is
+   key:
+
+   ```json
+   {"type": "enrol", "id": 1, "token": "<43 characters>", "key": "<64 lowercase hex>"}
+   ```
+
+   `key` is the router's Ed25519 management public key (as
+   `ephctl controller identity` shows it; not the SD-WAN key), and must be
+   the key of the TLS client certificate on this connection, which proves
+   the router holds it. The controller records it and answers
+   `{"type": "result", "id": 1, "ok": {"router_id": 12}}`. The router then
+   sends `hello` on the same connection.
+4. From then on the router authenticates with that key and the token is
    spent.
+
+The router presents its client certificate (self-signed, its management
+key) on **every** connection, the enrolling one included; a controller
+refuses connections without one.
 
 The router stores the result in its config:
 
 ```toml
 [controller]
 url = "https://controller.example.net/"
-# The controller's certificate key, pinned at enrolment (SHA-256 of its
-# SubjectPublicKeyInfo). A controller moving to a new key announces it
-# over the old connection first.
-pin = "sha256:..."
+# The controller's certificate key, pinned at enrolment: "sha256:" and
+# the enrolment string's fingerprint (64 lowercase hex characters). A
+# controller moving to a new key announces it over the old connection
+# first.
+pin = "sha256:<64 hex characters>"
 ```
 
 Removing `[controller]` (locally) unenrols the router. A controller can't
@@ -91,8 +119,14 @@ to someone else.
   `{"type": "...", "id": <u64>, ...}`. Requests from either side carry an
   `id`; the answer repeats it with `"type": "result"` and either `"ok"` or
   `"error": {"code": "...", "message": "..."}`.
-- **Keep-alive:** a ping every 30 s; three missed and the connection is
-  closed and reopened.
+- **Request ids** count up from 1 on each connection, separately for each
+  side, so the router's `enrol` is 1 and its `hello` after it is 2.
+- **Keep-alive:** WebSocket ping and pong frames (not JSON messages), in
+  both directions, every 30 s. Either side closes the connection after
+  90 s without any frame from the other, and the router reconnects.
+- **Limits:** a message is at most 1 MiB (a config is at most 256 KiB);
+  the first message (`enrol` or `hello`) comes within 10 s of the TLS
+  handshake.
 - **Reconnecting:** exponential backoff from 1 s up to 5 min, with
   jitter, so a controller restart doesn't bring every router back in the
   same second.
@@ -115,7 +149,25 @@ The first message after connecting, from the router:
 
 `config.version` is the router's own history number; `sha256` is of the
 running config file's text. The controller answers with what it expects
-(the version it last pushed) and whether a push is waiting.
+(the version and hash it last pushed, `null` before its first push) and
+whether a push is waiting:
+
+```json
+{"type": "result", "id": 1, "ok": {"protocol": 1, "router_id": 12,
+  "expected_config": {"version": 42, "sha256": "..."}, "push_waiting": false}}
+```
+
+### Errors
+
+| Code | Meaning | Then |
+|---|---|---|
+| `invalid_token` | the token is wrong, used, revoked or expired (one code, so it doesn't say which) | the controller closes the connection |
+| `already_enrolled` | `enrol` from a key that's enrolled already | the router sends `hello` instead |
+| `not_enrolled` | `hello` from a key the controller doesn't know | the controller closes the connection; the router keeps reconnecting with backoff and shows "not enrolled" in its status. It never re-enrols by itself: that takes a new token from an administrator |
+| `unsupported_protocol` | the controller doesn't speak the router's `protocol` | the controller closes the connection |
+| `bad_request` | a malformed message, or a field out of range | |
+| `unknown_type` | a message type the receiver doesn't know | |
+| `conflict` | a push whose `base_sha256` isn't the running config's (see [Config](#config)) | |
 
 ## Config
 
