@@ -270,6 +270,7 @@ impl Service<'_> {
             return;
         }
         self.learned_dns = learned;
+        crate::resolver::apply(running.management.outbound, &self.learned_dns);
         let ports = self.shared.ports.read().unwrap().clone();
         let mac_of = |name: &str| ports.iter().find(|p| p.name == name).map(|p| (p.id, p.mac));
 

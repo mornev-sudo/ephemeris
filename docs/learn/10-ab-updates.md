@@ -164,6 +164,41 @@ qm set 9100 --args "$(qm config 9100 | sed -n 's/^args: //p') \
 `ephemeris-update-source.service` then writes overrides to `/run/sysupdate.d/`.
 CI uses exactly this to serve a test update from the build machine.
 
+**Which way the download goes.** By default the router's own connections
+(the update download, DNS, time) use the management port, like any Linux
+machine's. A router with no management network, only its LAN and WAN,
+can update itself through the data plane instead:
+
+```toml
+[management]
+outbound = "dataplane"
+```
+
+Then, after `ephctl restart`:
+
+- **The route.** `nic-setup` adds a default route into the host path
+  (`eph-host`) from `169.254.255.254`, preferred over the management
+  port's.
+- **The way out.** The data plane routes those packets like a LAN host's:
+  a session, source NAT to the outgoing interface's address (DHCP, PPPoE
+  or static), out of the WAN. Replies come back through the same session
+  into `eph-host`. Nothing on the outside can start a connection to the
+  router this way, and link-local addresses never arrive from the network
+  (RFC 3927).
+- **DNS.** systemd-resolved gets the DNS servers learned on the outside
+  interfaces (DHCP leases, PPPoE) for every domain, so the update server's
+  name resolves without one.
+- **The management port** then only reaches its own subnet: a client
+  behind a router on the management network can't reach the router's SSH
+  or portal through it any more. Reach them on an inside interface
+  instead (`management = ["https", "ssh"]`, chapter 19).
+- **If ephemerisd isn't running**, the kernel ignores the route
+  (`ignore_routes_with_linkdown`), and the management port's default route,
+  if there is one, takes over.
+
+Tethers aren't used for this: the router's own traffic leaves through a
+local interface. See [`eph_dataplane::host`](../../crates/eph-dataplane/src/host.rs).
+
 ## How CI proves it works
 
 On every push, [the workflow](../../.github/workflows/image.yml) builds

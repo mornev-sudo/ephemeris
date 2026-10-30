@@ -788,12 +788,16 @@ function renderCfg() {
     { key: "busy_poll", label: "Busy polling (lowest latency, 100% CPU)", type: "check" },
     { key: "stats_interval_secs", label: "Log statistics every (s, 0 = off)", type: "number", min: 0 },
   ]);
+  cfg.management.outbound = cfg.management.outbound || "management"; // left out of the file when it's the default
   formFields($("f-mgmt"), cfg.management, [
     { key: "enabled", label: "Web portal and API enabled", type: "check" },
     { key: "listen", label: "Listen address (plain HTTP)", placeholder: "127.0.0.1:8080",
       help: "Keep this on loopback: the portal reaches the network over HTTPS (nginx, port 8443)." },
     { key: "hostnames", label: "Extra host names", type: "list", placeholder: "router.example.net",
       help: "DNS names the portal may be opened by, besides addresses and the router's own name." },
+    { key: "outbound", label: "Router's own traffic (updates, DNS, time)", type: "select",
+      options: [["management", "over the management port"], ["dataplane", "through the data plane (NAT out of the WAN)"]], empty: "management",
+      help: "Through the data plane, the router updates itself without a management network; the management port then only reaches its own subnet. Takes effect after a restart." },
   ]);
 }
 

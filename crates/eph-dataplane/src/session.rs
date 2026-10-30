@@ -32,6 +32,10 @@ const NS: u64 = 1_000_000_000;
 /// failover), so they all count as one ingress.
 pub const OVERLAY_INGRESS: PortId = PortId::MAX;
 
+/// The "port" the router's own outbound packets arrive on (see
+/// `host::SELF_ADDR`).
+pub const HOST_INGRESS: PortId = PortId::MAX - 1;
+
 /// The fields of a TCP segment that sequence tracking needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TcpSegment {

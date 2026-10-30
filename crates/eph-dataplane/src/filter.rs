@@ -11,6 +11,7 @@
 //! | Source is a broadcast address (255.255.255.255 or a connected subnet's), multicast (224.0.0.0/4) or loopback (127.0.0.0/8) | `martian` |
 //! | Source or destination is unspecified (0.0.0.0/8) or reserved for future use (240.0.0.0/4) | `martian` |
 //! | *Extra:* destination is multicast or loopback (no multicast routing here) | `martian` |
+//! | Source or destination is link-local (169.254.0.0/16): routers never forward those (RFC 3927, section 7), and the router's own host path lives there | `martian` |
 //! | Source is the router's own address (any interface, or a NAT pool); *extra:* source equals destination ("LAND") | `spoofed-source` |
 //! | IP options Loose Source Route, Strict Source Route, Record Route; *extra:* Timestamp, Stream ID, or a malformed option list | `ip-option` |
 //! | Invalid fragments (see [`check_fragment`]) | `bad-fragment` |
@@ -35,7 +36,12 @@ pub(crate) fn check(
     ports: &[Port],
     nat: &NatConfig,
 ) -> Result<(), DropReason> {
-    if is_martian(h.src) || is_martian(h.dst) || is_subnet_broadcast(h.src, ports) {
+    if is_martian(h.src)
+        || is_martian(h.dst)
+        || h.src.is_link_local()
+        || h.dst.is_link_local()
+        || is_subnet_broadcast(h.src, ports)
+    {
         return Err(DropReason::Martian);
     }
     if h.src == h.dst || ports.iter().any(|p| p.addr == h.src) || nat.owns(h.src) {
@@ -56,7 +62,7 @@ pub(crate) fn check(
 /// (0.0.0.0/8), loopback (127.0.0.0/8), multicast (224.0.0.0/4) and
 /// reserved (240.0.0.0/4, which includes 255.255.255.255).
 #[inline]
-fn is_martian(ip: Ipv4Addr) -> bool {
+pub(crate) fn is_martian(ip: Ipv4Addr) -> bool {
     let a = ip.octets()[0];
     a == 0 || a == 127 || a >= 224
 }

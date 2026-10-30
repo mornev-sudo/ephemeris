@@ -18,6 +18,24 @@
 //!
 //! Only inside interfaces, never outside ones or SD-WAN tethers: checked
 //! here on every packet, whatever the config says.
+//!
+//! ## The router's own connections
+//!
+//! With `[management] outbound = "dataplane"`, the router's own traffic
+//! (software updates, DNS, time) leaves through the data plane too, so a
+//! router needs no management network to update itself. Linux sends it
+//! into `eph-host` from [`SELF_ADDR`]; the pipeline routes it like a LAN
+//! host's, always source-NATed to the way out's address, with a session,
+//! and hands the replies back into `eph-host`:
+//!
+//! ```text
+//!  sysupdate ── 169.254.255.254 ──▶ eph-host ──▶ pipeline ── NAT to wan's address ── wan ──▶ update server
+//!  sysupdate ◀───────────────────── eph-host ◀── pipeline ◀── reply to wan's address ─ wan ◀──
+//! ```
+//!
+//! Nothing can start a connection to the router this way: only replies to
+//! its sessions come back, and link-local addresses never arrive from the
+//! network (`filter`, RFC 3927).
 
 use crate::config::{PortId, Role};
 use crate::Port;
@@ -33,8 +51,11 @@ pub const SSH_PORT: u16 = 22;
 /// 169.254.169.254, the cloud metadata address.)
 pub const HOST_NET: Ipv4Addr = Ipv4Addr::new(169, 254, 240, 0);
 pub const HOST_NET_LEN: u8 = 20;
-/// Interfaces the range has room for.
-pub const HOST_PORTS_MAX: usize = (1 << (32 - HOST_NET_LEN)) - 2;
+/// Interfaces the range has room for (its last address is [`SELF_ADDR`]).
+pub const HOST_PORTS_MAX: usize = (1 << (32 - HOST_NET_LEN)) - 3;
+/// The source of the router's own outbound connections through the data
+/// plane: the range's last usable address.
+pub const SELF_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 255, 254);
 
 pub fn host_net() -> Prefix {
     Prefix::new(HOST_NET, HOST_NET_LEN).expect("a valid prefix")
@@ -96,6 +117,9 @@ mod tests {
         assert_eq!(host_addr(HOST_PORTS_MAX as u16), None);
         assert_eq!(port_of(HOST_NET), None, "the network address itself");
         assert_eq!(port_of("169.254.169.254".parse().unwrap()), None);
+        assert!(host_net().contains(SELF_ADDR));
+        assert_eq!(port_of(SELF_ADDR), None, "not an interface's");
+        assert_ne!(host_addr(HOST_PORTS_MAX as u16 - 1), Some(SELF_ADDR));
         assert_eq!(port_of("10.0.0.1".parse().unwrap()), None);
     }
 }

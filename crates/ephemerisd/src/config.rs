@@ -805,6 +805,31 @@ pub struct ManagementCfg {
     /// token) then crosses the network unencrypted. For labs only.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub insecure_remote_http: bool,
+    /// Where the router's own connections go out: software updates, DNS,
+    /// time. Takes effect at the next restart.
+    #[serde(skip_serializing_if = "Outbound::is_default")]
+    pub outbound: Outbound,
+}
+
+/// `[management] outbound`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outbound {
+    /// Over the management port, as the system's own network config
+    /// routes it (DHCP on it, by default).
+    #[default]
+    Management,
+    /// Through the data plane: routed like a LAN host's traffic and
+    /// source-NATed to the way out's address, so a router with no
+    /// management network still updates itself (see eph_dataplane::host).
+    /// The management port then only reaches its own subnet.
+    Dataplane,
+}
+
+impl Outbound {
+    fn is_default(&self) -> bool {
+        *self == Outbound::Management
+    }
 }
 
 impl ManagementCfg {
@@ -829,6 +854,7 @@ impl Default for ManagementCfg {
             token_file: "/var/lib/ephemeris/api-token".into(),
             hostnames: vec![],
             insecure_remote_http: false,
+            outbound: Outbound::Management,
         }
     }
 }
@@ -2749,6 +2775,20 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
         assert_eq!(c.management.bind_addr(), (addr("0.0.0.0:9000"), false));
         assert!(with(r#"hostnames = ["evil name"]"#).is_err());
         assert!(with(r#"hostnames = ["router.example.net"]"#).is_ok());
+    }
+
+    #[test]
+    fn the_routers_own_traffic_goes_out_where_asked() {
+        let base = "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n";
+        assert_eq!(
+            parse(base).unwrap().management.outbound,
+            Outbound::Management
+        );
+        let c = parse(&format!("[management]\noutbound = \"dataplane\"\n{base}")).unwrap();
+        assert_eq!(c.management.outbound, Outbound::Dataplane);
+        assert!(parse(&format!("[management]\noutbound = \"wan\"\n{base}")).is_err());
+        // Changing it needs a restart (nic-setup sets the route at start).
+        assert!(!parse(base).unwrap().live_applicable(&c));
     }
 
     #[test]
