@@ -477,8 +477,11 @@ ip netns exec ci-hb iperf3 -s -D -1
 sleep 0.5
 check "TCP through NAT, 8 streams (iperf3 -P 8)" ip netns exec ci-ha iperf3 -c 10.10.2.10 -t3 -P 8
 grep -E "SUM.*receiver" "$WORK/out" | sed 's/^/        /' || true
-check "both queues of lan-b's card carried traffic" \
-                                           on_router 'ethtool -S enp0s20 > /run/q.txt; for q in 0 1; do grep -Eq "rx[_a-z]*${q}_packets: *[1-9]" /run/q.txt || { grep -E "rx.*packets" /run/q.txt; exit 1; }; done'
+# Both workers did real work: each card spread the flows over both queues
+# (hundreds of packets each, not a stray one).
+check "both queues of each card carried traffic" \
+                                           on_router 'for d in enp0s19 enp0s20; do ethtool -S $d > /run/q.txt; for q in 0 1; do grep -Eq "rx(_queue_)?${q}_([a-z]+_)?packets: *[0-9]{3,}" /run/q.txt || { echo "$d queue $q:"; grep -E "rx.*packets" /run/q.txt; ethtool -x $d; exit 1; }; done; done'
+check "no worker left without a queue"     sh -c "! ${SSH[*]} journalctl -u ephemerisd -b --no-pager | grep 'sends nothing to queue'"
 sleep 6
 steered() { # since the snapshot above: nothing handed over, nothing lost
     local h w n

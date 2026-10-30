@@ -1003,6 +1003,13 @@ fn read_steering(cfg: &Config, cards: &[&str]) -> eph_dataplane::steer::Steering
             }
             match iface::rss(dev) {
                 Ok(r) => {
+                    let workers = cfg.dataplane.workers;
+                    let idle: Vec<u32> = (0..workers).filter(|q| !r.indir.contains(q)).collect();
+                    if !idle.is_empty() {
+                        warn!(target: crate::logging::cat::DATAPLANE,
+                            "{dev}: the card's RSS table sends nothing to queue(s) {idle:?}, so \
+                             those workers get no traffic from it. Fix: ethtool -X {dev} equal {workers}");
+                    }
                     info!(target: crate::logging::cat::DATAPLANE,
                         "{dev}: Toeplitz RSS over {} entries{}; ports hashed: TCP {}, UDP {}",
                         r.indir.len(),
