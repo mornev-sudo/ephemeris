@@ -32,6 +32,9 @@
 //! | POST   | /overlay/key {site, key?} | set (or, without key, generate) it; commits |
 //! | GET    | /overlay/entry?site=S     | [[site]] entry describing this router, for S|
 //! | GET    | /overlay/identity         | this router's SD-WAN public key             |
+//! | GET    | /controller/identity      | this router's public key towards a controller |
+//! | GET    | /controller               | the link to the controller: state, router id, last error |
+//! | POST   | /controller/enrol {enrolment} | enrol with a one-time enrolment string; commits `[controller]` |
 //! | POST   | /overlay/public-key {site, public_key?} | set (or clear) S's public key; commits |
 //! | GET    | /system                   | build, update job state                     |
 //! | POST   | /system/update/check      | list installed + available versions         |
@@ -128,6 +131,9 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/overlay/key", get(site_key).post(set_site_key))
         .route("/overlay/entry", get(site_entry))
         .route("/overlay/identity", get(overlay_identity))
+        .route("/controller/identity", get(controller_identity))
+        .route("/controller", get(controller_status))
+        .route("/controller/enrol", post(controller_enrol))
         .route("/overlay/public-key", post(set_site_public_key))
         .route("/system", get(system))
         .route("/system/update/check", post(update_check))
@@ -1071,6 +1077,59 @@ async fn overlay_identity(State(s): St) -> Json<Value> {
     Json(json!({ "public_key": s.sdwan.public_key.map(|k| crate::sdwan::hex(&k)) }))
 }
 
+/// This router's public key towards a controller (its management identity).
+async fn controller_identity(State(s): St) -> Json<Value> {
+    let key = s
+        .controller_identity
+        .as_ref()
+        .map(|i| crate::sdwan::hex(&i.public()));
+    Json(json!({ "public_key": key }))
+}
+
+async fn controller_status(State(s): St) -> Json<Value> {
+    Json(json!(s.controller.lock().unwrap().clone()))
+}
+
+#[derive(Deserialize)]
+struct EnrolReq {
+    /// `eph-enrol:v1:<url>#<token>@<fingerprint>`.
+    enrolment: String,
+}
+
+/// Enrol with a controller: connect with the string's pin, register this
+/// router's key with its token, and commit the `[controller]` section that
+/// the link then follows.
+async fn controller_enrol(State(s): St, Json(r): Json<EnrolReq>) -> ApiResult {
+    let e = eph_config::Enrolment::parse(&r.enrolment)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if let Some(c) = &s.config.lock().unwrap().running().controller {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("already managed by {}: remove [controller] first", c.url),
+        ));
+    }
+    let Some(id) = s.controller_identity.clone() else {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no controller key pair: see `ephctl log show -c mgmt`".into(),
+        ));
+    };
+    let hello = crate::controller::link::hello(&s);
+    let router_id = crate::controller::link::enrol(&e, &id, hello)
+        .await
+        .map_err(|err| ApiError(StatusCode::BAD_GATEWAY, format!("{err:#}")))?;
+    tracing::info!(target: "audit", "enrolled with controller {} as router {router_id}", e.url);
+    let c = {
+        let mut cfg = s.config.lock().unwrap();
+        let text = cfg.with_controller(&e.controller())?;
+        cfg.set_candidate(text)?;
+        cfg.commit(None)?
+    };
+    let mut v = finish_commit(&s, c, None)?.0;
+    v["router_id"] = router_id.into();
+    Ok(Json(v))
+}
+
 #[derive(Deserialize)]
 struct SetPublicKeyReq {
     site: String,
@@ -1719,6 +1778,8 @@ address = "10.10.2.1/24"
             dhcp: Default::default(),
             endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
             sdwan: Default::default(),
+            controller_identity: Some(Arc::new(crate::controller::Identity::from_seed([7; 32]))),
+            controller: Default::default(),
             history: Default::default(),
             update: Default::default(),
             system: Default::default(),
@@ -1782,6 +1843,67 @@ address = "10.10.2.1/24"
             Some("0.7.0.9")
         );
         assert_eq!(entry_version("auto-windows"), None);
+    }
+
+    #[tokio::test]
+    async fn the_controller_identity_is_shown_behind_login() {
+        let (s, _) = shared("ctl-identity");
+        let get = |token| {
+            call(
+                &s,
+                "GET",
+                "/api/v1/controller/identity",
+                token,
+                Body::empty(),
+                false,
+            )
+        };
+        assert_eq!(get("").await.0, StatusCode::UNAUTHORIZED);
+        let (code, v) = get("secret").await;
+        assert_eq!(code, StatusCode::OK);
+        let key = crate::controller::Identity::from_seed([7; 32]).public();
+        assert_eq!(v["public_key"], crate::sdwan::hex(&key));
+    }
+
+    #[tokio::test]
+    async fn enrolment_refuses_bad_strings_and_a_second_controller() {
+        let (s, _) = shared("ctl-enrol");
+        let enrol = |e: &str| {
+            let body = Body::from(json!({ "enrolment": e }).to_string());
+            call(&s, "POST", "/api/v1/controller/enrol", "secret", body, true)
+        };
+        let (code, v) = enrol("eph-enrol:v1:http://c.example.net/#x@y").await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+        let (_, v) = call(
+            &s,
+            "GET",
+            "/api/v1/controller",
+            "secret",
+            Body::empty(),
+            false,
+        )
+        .await;
+        assert_eq!(v["state"], "off");
+        // Already managed: refused before anything is sent anywhere.
+        {
+            let mut cfg = s.config.lock().unwrap();
+            let pin = format!("sha256:{}", "ab".repeat(32));
+            let c = crate::config::ControllerCfg {
+                url: "https://c.example.net/".into(),
+                pin,
+            };
+            let text = cfg.with_controller(&c).unwrap();
+            cfg.set_candidate(text).unwrap();
+            cfg.commit(None).unwrap();
+        }
+        let good = format!(
+            "eph-enrol:v1:https://d.example.net/#{}@{}",
+            "A".repeat(43),
+            "cd".repeat(32)
+        );
+        let (code, v) = enrol(&good).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("c.example.net"));
     }
 
     #[tokio::test]

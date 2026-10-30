@@ -51,6 +51,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SdwanCmd,
     },
+    /// Being managed by a controller (docs/controller-api.md).
+    Controller {
+        #[command(subcommand)]
+        cmd: ControllerCmd,
+    },
     /// Add or remove static routes (validated and committed immediately).
     Route {
         #[command(subcommand)]
@@ -141,6 +146,19 @@ enum LogCmd {
         #[arg(short = 'n', long, default_value_t = 50)]
         lines: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum ControllerCmd {
+    /// Where the link to the controller stands: off, connecting, connected
+    /// (with the router's id there), not enrolled, or the last error.
+    Status,
+    /// Enrol with a controller, using the one-time string its administrator
+    /// created (`eph-enrol:v1:...`). Commits the `[controller]` section.
+    Enrol { enrolment: String },
+    /// This router's public key towards a controller: its management
+    /// identity (Ed25519, not the SD-WAN key), which enrolment registers.
+    Identity,
 }
 
 #[derive(Subcommand)]
@@ -766,6 +784,57 @@ fn run(cli: Cli) -> Result<()> {
                 print!("{}", str(&v["toml"]));
                 if v["dynamic"] == true {
                     println!("# This router has no fixed WAN address: {site} learns it, so {site} needs a fixed one.");
+                }
+            }
+        },
+        Cmd::Controller { cmd } => match cmd {
+            ControllerCmd::Status => {
+                let v = c.get("/controller")?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                let state = str(&v["state"]);
+                match v["url"].as_str() {
+                    None => println!("Not managed by a controller (no [controller] section)."),
+                    Some(url) => {
+                        println!("Controller {url}: {state}");
+                        if let Some(id) = v["router_id"].as_u64() {
+                            println!("  router id: {id}");
+                        }
+                        if let Some(e) = v["error"].as_str() {
+                            println!("  last error: {e}");
+                        }
+                        if state == "not-enrolled" {
+                            println!(
+                                "  it needs a new enrolment: ephctl controller enrol <string>"
+                            );
+                        }
+                    }
+                }
+            }
+            ControllerCmd::Enrol { enrolment } => {
+                let body = serde_json::json!({ "enrolment": enrolment }).to_string();
+                let v = c.call(
+                    "POST",
+                    "/controller/enrol",
+                    Some(("application/json", &body)),
+                )?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                println!("Enrolled: this router is {} there.", v["router_id"]);
+            }
+            ControllerCmd::Identity => {
+                let v = c.get("/controller/identity")?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                match v["public_key"].as_str() {
+                    Some(k) => println!("{k}"),
+                    None => bail!("no controller key pair: see `ephctl log show -c mgmt`"),
                 }
             }
         },
