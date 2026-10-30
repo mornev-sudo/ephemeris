@@ -36,8 +36,6 @@ pub const AUTO_MIN: u32 = 16_384;
 /// ever holds; a bigger table only makes lookups slower and lets a flood
 /// of junk flows linger. Set `max_per_worker` for more.
 pub const AUTO_TOTAL_MAX: u32 = 2_000_000;
-/// The most `max_per_worker` may be set to.
-pub const SESSIONS_MAX: u32 = 16_000_000;
 /// `"auto"` without knowing the machine's memory (`--check` on a laptop).
 pub const AUTO_FALLBACK: u32 = 262_144;
 /// Huge pages, as Linux reserves them for UMEM.

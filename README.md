@@ -48,8 +48,9 @@ config ──▶ │ config.rs ──▶ FIB (DIR-24-8) ──▶ shared, read-o
 | [`eph-packet`](crates/eph-packet) | Zero-copy Ethernet/ARP/IPv4/ICMP header access and checksums | anywhere |
 | [`eph-fib`](crates/eph-fib) | DIR-24-8 longest-prefix-match routing table | anywhere |
 | [`eph-dataplane`](crates/eph-dataplane) | The forwarding logic: bytes in, verdict out. Session table, TCP state machine. No I/O | anywhere |
+| [`eph-config`](crates/eph-config) | The config: `ephemeris.toml`'s model, parsing and every check, as a library, so anything that writes configs checks them exactly as the router does | anywhere |
 | [`eph-xdp`](crates/eph-xdp) | AF_XDP sockets, UMEM, rings, and the XDP program, written directly on syscalls | Linux |
-| [`ephemerisd`](crates/ephemerisd) | The daemon: config, workers, REST API + web portal, live config changes | Linux (`--check` anywhere) |
+| [`ephemerisd`](crates/ephemerisd) | The daemon: workers, REST API + web portal, live config changes | Linux (`--check` anywhere) |
 | [`ephctl`](crates/ephctl) | CLI client of the management API | anywhere |
 | [`image/`](image) | mkosi definition of Ephemeris OS, the bootable router image | built on Linux / CI |
 

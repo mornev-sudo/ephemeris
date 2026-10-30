@@ -455,6 +455,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eph-config"
+version = "0.12.3"
+dependencies = [
+ "anyhow",
+ "eph-dataplane",
+ "eph-fib",
+ "eph-packet",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "eph-dataplane"
 version = "0.12.3"
 dependencies = [
@@ -499,6 +513,7 @@ dependencies = [
  "blake2",
  "clap",
  "curve25519-dalek",
+ "eph-config",
  "eph-dataplane",
  "eph-fib",
  "eph-packet",

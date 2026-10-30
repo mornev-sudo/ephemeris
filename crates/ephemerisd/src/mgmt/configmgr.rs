@@ -7,7 +7,7 @@
 //! change goes through the same validate → diff → commit → history path.
 
 use super::diff::diff;
-use crate::config::Config;
+use crate::config::{Config, Live};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};

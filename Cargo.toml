@@ -17,6 +17,7 @@ eph-packet = { path = "crates/eph-packet" }
 eph-fib = { path = "crates/eph-fib" }
 eph-dataplane = { path = "crates/eph-dataplane" }
 eph-xdp = { path = "crates/eph-xdp" }
+eph-config = { path = "crates/eph-config" }
 libc = "0.2"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
