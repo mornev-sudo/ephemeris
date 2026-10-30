@@ -193,9 +193,23 @@ impl Service<'_> {
                     l.lease_secs
                 );
                 let _ = save_json(&self.dir.join(format!("client-{}.json", c.interface)), l);
+                self.shared.events.emit(
+                    "wan.lease.gained",
+                    &c.interface,
+                    serde_json::json!({
+                        "interface": c.interface,
+                        "address": format!("{}/{}", l.addr, l.prefix_len),
+                        "gateway": l.router.map(|r| r.to_string()).unwrap_or_default(),
+                        "lease_secs": l.lease_secs,
+                    }),
+                );
             }
             Event::Lost => {
-                warn!(target: crate::logging::cat::DHCP_CLIENT, "DHCP: {} lost its address", c.interface)
+                warn!(target: crate::logging::cat::DHCP_CLIENT, "DHCP: {} lost its address", c.interface);
+                let detail = serde_json::json!({"interface": c.interface});
+                self.shared
+                    .events
+                    .emit("wan.lease.lost", &c.interface, detail);
             }
         }
         self.publish();
@@ -211,12 +225,26 @@ impl Service<'_> {
         };
         let d = &self.dialers[&port];
         match &event {
-            ppp::Event::Up(l) => info!(target: crate::logging::cat::PPPOE,
-                "PPPoE: {} connected to {} (session {:#06x}): {} peer {}, MTU {}",
-                d.cfg.interface, l.ac_name, l.session, l.addr, l.peer, l.mtu
-            ),
+            ppp::Event::Up(l) => {
+                info!(target: crate::logging::cat::PPPOE,
+                    "PPPoE: {} connected to {} (session {:#06x}): {} peer {}, MTU {}",
+                    d.cfg.interface, l.ac_name, l.session, l.addr, l.peer, l.mtu
+                );
+                self.shared.events.emit(
+                    "pppoe.up",
+                    &d.cfg.interface,
+                    serde_json::json!({
+                        "interface": d.cfg.interface, "concentrator": l.ac_name,
+                        "address": l.addr.to_string(), "peer": l.peer.to_string(), "mtu": l.mtu,
+                    }),
+                );
+            }
             ppp::Event::Down(why) => {
-                warn!(target: crate::logging::cat::PPPOE, "PPPoE: {} down: {why}", d.cfg.interface)
+                warn!(target: crate::logging::cat::PPPOE, "PPPoE: {} down: {why}", d.cfg.interface);
+                let detail = serde_json::json!({"interface": d.cfg.interface, "reason": why});
+                self.shared
+                    .events
+                    .emit("pppoe.down", &d.cfg.interface, detail);
             }
         }
         self.publish();

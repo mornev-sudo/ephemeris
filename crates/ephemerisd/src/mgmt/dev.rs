@@ -53,6 +53,7 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         },
         controller_identity: crate::controller::Identity::generate().ok().map(Arc::new),
         controller: Default::default(),
+        events: Default::default(),
         history: Default::default(),
         update: Default::default(),
         system: Default::default(),

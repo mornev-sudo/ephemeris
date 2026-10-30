@@ -11,6 +11,7 @@
 //! (the pinned controller key, the router's client certificate) and
 //! [`link`] (enrolment, `hello`, keep-alive, reconnecting).
 
+pub mod events;
 pub mod link;
 pub mod tls;
 
