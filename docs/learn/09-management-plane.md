@@ -68,7 +68,7 @@ No locks on the fast path, no packets lost, no restart. This is the
 
 ## What can change live, and what can't
 
-[`Config::live_applicable`](../../crates/ephemerisd/src/config.rs) draws the line:
+[`Config::live_applicable`](../../crates/eph-config/src/lib.rs) draws the line:
 
 | Live (instant) | Needs a restart |
 |---|---|

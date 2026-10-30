@@ -22,7 +22,7 @@ pub mod paths;
 pub mod ssh;
 pub mod sysinfo;
 
-use crate::config::Config;
+use crate::config::{Config, Live};
 use crate::report::{Control, Report, SessionView};
 use anyhow::{Context, Result};
 use configmgr::ConfigManager;

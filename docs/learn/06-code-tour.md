@@ -9,8 +9,9 @@ scenarios (NAT, PPPoE, VLANs, SD-WAN, the host path), open
 
 ## Startup: [`ephemerisd/src/run.rs`](../../crates/ephemerisd/src/run.rs)
 
-1. **Config → ports → FIB.** [`config.rs`](../../crates/ephemerisd/src/config.rs)
-   parses the TOML. Each `[[interface]]` becomes a `Port` (MAC read from
+1. **Config → ports → FIB.** [`eph-config`](../../crates/eph-config/src/lib.rs)
+   parses the TOML and checks it (a library of its own, so a controller
+   can check configs with the same rules). Each `[[interface]]` becomes a `Port` (MAC read from
    `/sys/class/net/<dev>/address`). `build_fib` turns connected subnets and
    static routes into a DIR-24-8 table, wrapped in an `Arc` (a shared,
    read-only pointer) that every worker gets a copy of.

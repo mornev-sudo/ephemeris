@@ -28,9 +28,10 @@ pub mod dataplane;
 pub mod sink;
 
 use anyhow::{bail, Result};
+pub use eph_config::logging::{cat, LoggingCfg, Lvl};
 use eph_dataplane::trace::{TraceCat, TraceConfig};
 use eph_fib::Prefix;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -39,27 +40,6 @@ use tracing::Level;
 
 /// The audit category's name (lines with it also go to audit.log).
 pub const AUDIT_TARGET: &str = cat::AUDIT;
-
-/// Category names, for `target:` in log calls.
-pub mod cat {
-    pub const SYSTEM: &str = "system";
-    pub const CONFIG: &str = "config";
-    pub const AUDIT: &str = "audit";
-    pub const MGMT: &str = "mgmt";
-    pub const UPDATE: &str = "update";
-    pub const INTERFACE: &str = "interface";
-    pub const ARP: &str = "arp";
-    pub const ROUTE: &str = "route";
-    pub const SESSION: &str = "session";
-    pub const NAT: &str = "nat";
-    pub const FILTER: &str = "filter";
-    pub const ICMP: &str = "icmp";
-    pub const DHCP_SERVER: &str = "dhcp-server";
-    pub const DHCP_CLIENT: &str = "dhcp-client";
-    pub const PPPOE: &str = "pppoe";
-    pub const SDWAN: &str = "sdwan";
-    pub const DATAPLANE: &str = "dataplane";
-}
 
 /// A category: what it covers and how much it logs by default.
 pub struct Category {
@@ -197,54 +177,14 @@ pub const CATEGORIES: &[Category] = &[
     ),
 ];
 
-/// A log level. Ordered from least to most detail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[repr(u8)]
-pub enum Lvl {
-    Error = 1,
-    Warn = 2,
-    Info = 3,
-    Debug = 4,
-    Trace = 5,
-}
-
-impl Lvl {
-    pub const ALL: [Lvl; 5] = [Lvl::Error, Lvl::Warn, Lvl::Info, Lvl::Debug, Lvl::Trace];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Lvl::Error => "error",
-            Lvl::Warn => "warn",
-            Lvl::Info => "info",
-            Lvl::Debug => "debug",
-            Lvl::Trace => "trace",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Lvl> {
-        Lvl::ALL
-            .into_iter()
-            .find(|l| l.name().eq_ignore_ascii_case(s.trim()))
-            .or_else(|| {
-                s.trim()
-                    .eq_ignore_ascii_case("warning")
-                    .then_some(Lvl::Warn)
-            })
-    }
-
-    pub fn of(l: &Level) -> Lvl {
-        match *l {
-            Level::ERROR => Lvl::Error,
-            Level::WARN => Lvl::Warn,
-            Level::INFO => Lvl::Info,
-            Level::DEBUG => Lvl::Debug,
-            Level::TRACE => Lvl::Trace,
-        }
-    }
-
-    fn from_u8(v: u8) -> Lvl {
-        Lvl::ALL[(v.clamp(1, 5) - 1) as usize]
+/// The level of a `tracing` line.
+pub fn lvl_of(l: &Level) -> Lvl {
+    match *l {
+        Level::ERROR => Lvl::Error,
+        Level::WARN => Lvl::Warn,
+        Level::INFO => Lvl::Info,
+        Level::DEBUG => Lvl::Debug,
+        Level::TRACE => Lvl::Trace,
     }
 }
 
@@ -258,72 +198,6 @@ pub fn category(name: &str) -> Option<usize> {
 /// count as `system`.
 fn category_of_target(target: &str) -> Option<usize> {
     category(target).or_else(|| target.starts_with("ephemerisd").then_some(0))
-}
-
-/// `[logging]` in the config.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct LoggingCfg {
-    /// Levels for categories that shouldn't use their default, e.g.
-    /// `levels = { dhcp-client = "debug" }`. Set here, they stay (no timer).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub levels: BTreeMap<String, Lvl>,
-    /// How long `ephctl log set <category> debug` lasts unless told
-    /// otherwise.
-    pub debug_minutes: u64,
-    /// Packet tracing events per second per worker, at most.
-    pub trace_per_sec: u32,
-    /// Where debug.log and audit.log go.
-    pub dir: String,
-    /// debug.log: every line kept, at any level; two files of half this.
-    pub debug_file_mb: u64,
-    /// audit.log: two files of half this.
-    pub audit_file_mb: u64,
-}
-
-pub const DEFAULT_DIR: &str = "/var/log/ephemeris";
-
-impl Default for LoggingCfg {
-    fn default() -> Self {
-        LoggingCfg {
-            levels: BTreeMap::new(),
-            debug_minutes: 10,
-            trace_per_sec: 100,
-            dir: DEFAULT_DIR.into(),
-            debug_file_mb: 64,
-            audit_file_mb: 16,
-        }
-    }
-}
-
-impl LoggingCfg {
-    pub fn validate(&self) -> Result<()> {
-        for name in self.levels.keys() {
-            if category(name).is_none() {
-                bail!(
-                    "logging.levels: no category {name:?} (there are: {})",
-                    CATEGORIES
-                        .iter()
-                        .map(|c| c.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-        }
-        if !(1..=24 * 60).contains(&self.debug_minutes) {
-            bail!("logging.debug_minutes must be between 1 and 1440");
-        }
-        if !(1..=10_000).contains(&self.trace_per_sec) {
-            bail!("logging.trace_per_sec must be between 1 and 10000");
-        }
-        if !(2..=1024).contains(&self.debug_file_mb) || !(2..=1024).contains(&self.audit_file_mb) {
-            bail!("logging.debug_file_mb and audit_file_mb must be between 2 and 1024");
-        }
-        if !self.dir.starts_with('/') {
-            bail!("logging.dir must be an absolute path");
-        }
-        Ok(())
-    }
 }
 
 /// A level raised (or lowered) at run time, possibly for a while.
@@ -389,7 +263,7 @@ impl Control {
     /// Would a line at `level` for `target` be kept?
     #[inline]
     pub fn enabled(&self, target: &str, level: &Level) -> bool {
-        let l = Lvl::of(level) as u8;
+        let l = lvl_of(level) as u8;
         match category_of_target(target) {
             Some(i) => l <= self.current[i].load(Ordering::Relaxed),
             None => l <= Lvl::Warn as u8,
@@ -702,6 +576,13 @@ mod tests {
             c.enabled(cat::DHCP_CLIENT, &Level::DEBUG),
             "config levels stay"
         );
+    }
+
+    #[test]
+    fn the_config_knows_every_category() {
+        // `[logging] levels` is checked against eph-config's list.
+        let names: Vec<&str> = CATEGORIES.iter().map(|c| c.name).collect();
+        assert_eq!(names, eph_config::logging::CATEGORY_NAMES);
     }
 
     #[test]

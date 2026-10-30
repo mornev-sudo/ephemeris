@@ -341,7 +341,7 @@ impl<S: Subscriber> Layer<S> for RecordLayer {
         self.0.push(Record {
             seq: 0,
             unix_ms: crate::report::unix_ms(),
-            level: Lvl::of(event.metadata().level()),
+            level: super::lvl_of(event.metadata().level()),
             category: category_name(event.metadata()),
             message: t.message,
         });
@@ -357,7 +357,7 @@ struct CategoryFilter {
 
 impl<S> Filter<S> for CategoryFilter {
     fn enabled(&self, meta: &Metadata<'_>, _: &Context<'_, S>) -> bool {
-        Lvl::of(meta.level()) <= self.max && control().enabled(meta.target(), meta.level())
+        super::lvl_of(meta.level()) <= self.max && control().enabled(meta.target(), meta.level())
     }
     // Levels change at run time: ask every time, don't let tracing cache
     // the answer per call site.

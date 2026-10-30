@@ -38,7 +38,7 @@
 //! Everything here is plain logic, without I/O or clocks: messages and the
 //! time go in, messages to send and new key tables come out ([`Output`]).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use blake2::digest::consts::U16;
 use blake2::digest::{Digest, KeyInit, Mac};
 use blake2::{Blake2s256, Blake2sMac};
@@ -125,16 +125,7 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 /// 64 hex characters -> 32 bytes.
-pub fn parse_hex32(s: &str) -> Result<[u8; 32]> {
-    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("must be 64 hex characters");
-    }
-    let mut k = [0u8; 32];
-    for (i, b) in k.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(k)
-}
+pub use eph_config::parse_hex32;
 
 fn params() -> snow::params::NoiseParams {
     PATTERN.parse().expect("a valid Noise pattern")
@@ -168,19 +159,7 @@ fn prologue(initiator: u16, responder: u16) -> Vec<u8> {
     p
 }
 
-/// Which cipher a router accepts for session keys (`[overlay] cipher`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CipherPref {
-    /// AES-256-GCM when both routers have AES in hardware, else ChaCha20.
-    #[default]
-    Auto,
-    /// Only this one: a router that can't use it gets no keys.
-    #[serde(rename = "aes-256-gcm")]
-    Aes256Gcm,
-    #[serde(rename = "chacha20-poly1305")]
-    ChaCha20Poly1305,
-}
+pub use eph_config::CipherPref;
 
 // In an initiation (after our key id): what we accept. In the response:
 // the cipher chosen. The payloads travel inside the Noise messages, so
