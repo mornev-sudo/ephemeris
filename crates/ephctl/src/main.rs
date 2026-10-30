@@ -51,6 +51,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SdwanCmd,
     },
+    /// Being managed by a controller (docs/controller-api.md).
+    Controller {
+        #[command(subcommand)]
+        cmd: ControllerCmd,
+    },
     /// Add or remove static routes (validated and committed immediately).
     Route {
         #[command(subcommand)]
@@ -141,6 +146,13 @@ enum LogCmd {
         #[arg(short = 'n', long, default_value_t = 50)]
         lines: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum ControllerCmd {
+    /// This router's public key towards a controller: its management
+    /// identity (Ed25519, not the SD-WAN key), which enrolment registers.
+    Identity,
 }
 
 #[derive(Subcommand)]
@@ -766,6 +778,19 @@ fn run(cli: Cli) -> Result<()> {
                 print!("{}", str(&v["toml"]));
                 if v["dynamic"] == true {
                     println!("# This router has no fixed WAN address: {site} learns it, so {site} needs a fixed one.");
+                }
+            }
+        },
+        Cmd::Controller { cmd } => match cmd {
+            ControllerCmd::Identity => {
+                let v = c.get("/controller/identity")?;
+                if json {
+                    print(&v);
+                    return Ok(());
+                }
+                match v["public_key"].as_str() {
+                    Some(k) => println!("{k}"),
+                    None => bail!("no controller key pair: see `ephctl log show -c mgmt`"),
                 }
             }
         },

@@ -82,6 +82,15 @@ pub fn run(config_path: &Path) -> Result<()> {
             None
         }
     };
+    // Its identity towards a controller: made on first start too, so it can
+    // be read off a router before it's enrolled anywhere.
+    let controller_key = match crate::controller::Identity::load_or_create(&state_dir) {
+        Ok(i) => Some(i.public()),
+        Err(e) => {
+            error!(target: crate::logging::cat::MGMT, "controller key pair unavailable: {e:#}");
+            None
+        }
+    };
     let dp = match start_dataplane(&cfg, &state_dir) {
         Ok(dp) => {
             if let Err(e) = startup::mark_good(config_path, &text) {
@@ -157,6 +166,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             public_key: identity.as_ref().map(|i| i.public),
             ..Default::default()
         },
+        controller_key,
         history: Default::default(),
         update: Default::default(),
         system: Default::default(),

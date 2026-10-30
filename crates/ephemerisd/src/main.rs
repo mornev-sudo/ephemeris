@@ -8,6 +8,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 mod config;
+mod controller;
 mod dhcp;
 mod files;
 #[cfg(target_os = "linux")]
@@ -47,6 +48,11 @@ struct Args {
     /// isn't one. The key pair lives next to the config file.
     #[arg(long)]
     sdwan_identity: bool,
+    /// Print this router's public key towards a controller (its management
+    /// identity, which enrolment registers), making its key pair first if
+    /// there isn't one. The key pair lives next to the config file.
+    #[arg(long)]
+    controller_identity: bool,
     /// Measure how fast this machine seals SD-WAN packets with each cipher
     /// (one core), and whether it has AES in hardware.
     #[arg(long)]
@@ -78,6 +84,12 @@ fn main() -> anyhow::Result<()> {
             "{}",
             sdwan::hex(&sdwan::Identity::load_or_create(dir)?.public)
         );
+        return Ok(());
+    }
+    if args.controller_identity {
+        let dir = args.config.parent().unwrap_or(std::path::Path::new("."));
+        let id = controller::Identity::load_or_create(dir)?;
+        println!("{}", sdwan::hex(&id.public()));
         return Ok(());
     }
     logging::sink::init();

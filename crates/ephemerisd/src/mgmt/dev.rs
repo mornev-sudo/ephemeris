@@ -51,6 +51,9 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
             public_key: crate::sdwan::Identity::generate().ok().map(|i| i.public),
             ..Default::default()
         },
+        controller_key: crate::controller::Identity::generate()
+            .ok()
+            .map(|i| i.public()),
         history: Default::default(),
         update: Default::default(),
         system: Default::default(),

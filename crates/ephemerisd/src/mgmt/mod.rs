@@ -78,6 +78,9 @@ pub struct Shared {
     pub endpoints: Arc<eph_dataplane::overlay::Endpoints>,
     /// SD-WAN: this router's public key, and the handshakes with each site.
     pub sdwan: crate::sdwan::SdwanState,
+    /// This router's public key towards a controller (`None`: it couldn't
+    /// be loaded, see the log).
+    pub controller_key: Option<[u8; 32]>,
     /// Rates sampled every few seconds, for the Reporting graphs.
     pub history: Mutex<history::History>,
     /// What the software-update buttons know: the version being installed

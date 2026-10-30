@@ -23,6 +23,8 @@ md-5.workspace = true
 snow.workspace = true
 blake2.workspace = true
 curve25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
 axum.workspace = true
 tokio.workspace = true
 # statvfs and sysconf for the resource report (also used on Linux below).

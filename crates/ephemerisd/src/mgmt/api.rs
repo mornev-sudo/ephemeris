@@ -32,6 +32,7 @@
 //! | POST   | /overlay/key {site, key?} | set (or, without key, generate) it; commits |
 //! | GET    | /overlay/entry?site=S     | [[site]] entry describing this router, for S|
 //! | GET    | /overlay/identity         | this router's SD-WAN public key             |
+//! | GET    | /controller/identity      | this router's public key towards a controller |
 //! | POST   | /overlay/public-key {site, public_key?} | set (or clear) S's public key; commits |
 //! | GET    | /system                   | build, update job state                     |
 //! | POST   | /system/update/check      | list installed + available versions         |
@@ -128,6 +129,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/overlay/key", get(site_key).post(set_site_key))
         .route("/overlay/entry", get(site_entry))
         .route("/overlay/identity", get(overlay_identity))
+        .route("/controller/identity", get(controller_identity))
         .route("/overlay/public-key", post(set_site_public_key))
         .route("/system", get(system))
         .route("/system/update/check", post(update_check))
@@ -1071,6 +1073,11 @@ async fn overlay_identity(State(s): St) -> Json<Value> {
     Json(json!({ "public_key": s.sdwan.public_key.map(|k| crate::sdwan::hex(&k)) }))
 }
 
+/// This router's public key towards a controller (its management identity).
+async fn controller_identity(State(s): St) -> Json<Value> {
+    Json(json!({ "public_key": s.controller_key.map(|k| crate::sdwan::hex(&k)) }))
+}
+
 #[derive(Deserialize)]
 struct SetPublicKeyReq {
     site: String,
@@ -1719,6 +1726,7 @@ address = "10.10.2.1/24"
             dhcp: Default::default(),
             endpoints: Arc::new(eph_dataplane::overlay::Endpoints::new(0)),
             sdwan: Default::default(),
+            controller_key: Some([7; 32]),
             history: Default::default(),
             update: Default::default(),
             system: Default::default(),
@@ -1782,6 +1790,25 @@ address = "10.10.2.1/24"
             Some("0.7.0.9")
         );
         assert_eq!(entry_version("auto-windows"), None);
+    }
+
+    #[tokio::test]
+    async fn the_controller_identity_is_shown_behind_login() {
+        let (s, _) = shared("ctl-identity");
+        let get = |token| {
+            call(
+                &s,
+                "GET",
+                "/api/v1/controller/identity",
+                token,
+                Body::empty(),
+                false,
+            )
+        };
+        assert_eq!(get("").await.0, StatusCode::UNAUTHORIZED);
+        let (code, v) = get("secret").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["public_key"], "07".repeat(32));
     }
 
     #[tokio::test]
