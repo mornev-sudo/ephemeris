@@ -409,9 +409,11 @@ check "forwarding again without VLANs"     wait_for 60 "forwarding" ip netns exe
 # ------------------------------------------------------------ many workers
 # Two workers, one per queue of each card. Each worker picks NAT ports whose
 # replies the card's RSS brings back to it (see eph_dataplane::steer), so
-# TCP and UDP replies must arrive at the right worker without a single
-# hand-off; ICMP, which cards hash on addresses only, is handed over when
-# it lands on the other one.
+# TCP and UDP replies arrive at the right worker: were the router's model
+# of the card's hash wrong, about half of them would be handed over. A
+# stray packet the card can't steer (ICMP, which cards hash on addresses
+# only) is handed over when it lands on the other one, and must still
+# arrive.
 echo "Many workers (RSS steering):"
 sed 's/^workers = 1$/workers = 2/' "$WORK/ephemeris.toml" > "$WORK/workers.toml"
 on_router "cat > /run/workers.toml" < "$WORK/workers.toml"
@@ -429,7 +431,7 @@ s = json.load(sys.stdin)
 print(s["counters"].get(sys.argv[1], s["drops"].get(sys.argv[1], 0)))' "$1"
 }
 sleep 6
-handed=$(counter handed_between_workers) wrong=$(counter nat-wrong-worker) nosess=$(counter nat-no-session)
+handed=$(counter handed_between_workers) wrong=$(counter nat-wrong-worker) nosess=$(counter nat-no-session) rx=$(counter rx)
 # 64 UDP flows (one socket each, so 64 source ports) to an echo server on
 # host B, through NAT: every one must be answered.
 cat > "$WORK/udp-echo.py" <<'PY'
@@ -483,15 +485,16 @@ check "both queues of each card carried traffic" \
                                            on_router 'for d in enp0s19 enp0s20; do ethtool -S $d > /run/q.txt; for q in 0 1; do grep -Eq "rx(_queue_)?${q}_([a-z]+_)?packets: *[0-9]{3,}" /run/q.txt || { echo "$d queue $q:"; grep -E "rx.*packets" /run/q.txt; ethtool -x $d; exit 1; }; done; done'
 check "no worker left without a queue"     sh -c "! ${SSH[*]} journalctl -u ephemerisd -b --no-pager | grep 'sends nothing to queue'"
 sleep 6
-steered() { # since the snapshot above: nothing handed over, nothing lost
-    local h w n
+steered() { # since the snapshot above: under 1% handed over, nothing lost
+    local h w n r
     h=$(( $(counter handed_between_workers) - handed ))
     w=$(( $(counter nat-wrong-worker) - wrong ))
     n=$(( $(counter nat-no-session) - nosess ))
-    echo "handed between workers: $h, nat-wrong-worker: $w, nat-no-session: $n"
-    [ "$h" -eq 0 ] && [ "$w" -eq 0 ] && [ "$n" -eq 0 ]
+    r=$(( $(counter rx) - rx ))
+    echo "of $r packets: handed between workers $h, nat-wrong-worker $w, nat-no-session $n"
+    [ "$r" -gt 10000 ] && [ $(( h * 100 )) -lt "$r" ] && [ "$w" -eq 0 ] && [ "$n" -eq 0 ]
 }
-check "every reply reached its own worker" steered
+check "replies reached their own worker (under 1% handed over)" steered
 sed 's/^/        /' "$WORK/out"
 pings() { # eight pings at once, each its own ICMP id
     local pids=() p ok=0
