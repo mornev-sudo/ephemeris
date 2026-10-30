@@ -37,8 +37,12 @@ token_file = "/var/lib/ephemeris/api-token"
 [sessions]
 # Capacity per worker. Memory is reserved up front (~300 bytes per session).
 # "auto": half of the memory left at start once packet buffers, the
-# forwarding table and 256 MiB for the system are set aside. Or a number.
+# forwarding table and 256 MiB for the system are set aside, and at most
+# 2 million sessions for the whole router (about 600 MB). Or a number.
 max_per_worker = "auto"
+# The most sessions one address may have open at once (0: no limit), so a
+# scan, malware or a runaway client can't fill the table for everyone.
+max_per_host = 50000
 # true: only a TCP SYN may open a session. false: also pick up connections
 # already in progress (useful right after a router restart).
 tcp_strict = false

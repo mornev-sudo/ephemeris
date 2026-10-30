@@ -181,6 +181,15 @@ Two more tools:
   (`sessions.early_drop`, on by default). Only if every session is a live,
   answered conversation is the new one refused. `ephctl status` shows how
   many were dropped early.
+- **A limit per host.** One address may have at most
+  `sessions.max_per_host` sessions open at once (50,000 by default; 0 turns
+  it off). A busy PC uses a few hundred and a torrent client a few
+  thousand, so only a scan, malware or a runaway program gets there; its
+  new flows are refused (`host-session-limit`) while everyone else's carry
+  on. Carrier-grade NATs must offer the same (RFC 6888, REQ-4). Sessions
+  count against whoever started them, and each worker enforces its share
+  (the limit divided by the workers), as a host's flows spread evenly over
+  them.
 
 `ephctl status` also counts the sessions that expired **without a single
 packet back**. A handful is normal (a DNS server that didn't answer). A
@@ -198,8 +207,12 @@ in systems code.
 Each worker reserves room for `max_per_worker` sessions at startup (about
 300 bytes each: the 200-byte session itself, and room in the hash map for
 both of its keys, its own and its NAT translation's). With `"auto"`, the
-default, the size comes from the memory the machine has free at start; a
-fixed size that won't fit is refused (see `ephemerisd/src/memory.rs`). A full table refuses *new* flows (`session-table-full`), after first
+default, the size comes from the memory the machine has free at start, up
+to **2 million sessions for the whole router** (about 600 MB), split
+between the workers. That's more than a branch or a busy office ever has
+open; a bigger table would only make lookups slower (more cache misses)
+and let a flood of junk flows linger. Set a number for more. A fixed size
+that won't fit is refused (see `ephemerisd/src/memory.rs`). A full table refuses *new* flows (`session-table-full`), after first
 trying to make room by dropping one that never got an answer (early drop,
 above); existing conversations keep working. Two reasons:
 
@@ -237,9 +250,11 @@ together:
   router reads each card's key and table (`ethtool -x`), asks outside cards
   to hash TCP and UDP on ports too, and computes the hash itself; a worker
   then picks a NAT port whose reply lands on *its own* queue. About one
-  port in *n* qualifies for *n* workers, so the search is short. The reply
-  arrives where its session is: nothing copied, nothing shared, so NAT
-  throughput grows with the number of workers.
+  port in *n* qualifies for *n* workers, so the search is short; and it
+  stops after 8,192 of the worker's own ports (`nat-exhausted`), so a
+  destination nearly out of ports can't make every new flow sweep all
+  64,512. The reply arrives where its session is: nothing copied, nothing
+  shared, so NAT throughput grows with the number of workers.
 - **Handing off** ([`Pipeline::process_handed`](../../crates/eph-dataplane/src/pipeline.rs)).
   Whatever still lands on the wrong worker is copied to the one that owns
   it, through a bounded queue per worker, and the owner is woken if it's
@@ -257,7 +272,11 @@ passing between two tethers, to one picked by a fixed symmetric hash).
 
 **In our Proxmox lab (virtio)** the host-side tap device delivers replies to
 the queue the guest sent the flow on, so most packets arrive at the right
-worker anyway, and the hand-off catches the rest.
+worker anyway, and the hand-off catches the rest. Give the virtio NIC
+`rss=on` (QEMU) and the card spreads by Toeplitz RSS like real hardware:
+that's how the end-to-end test ([ci/e2e.sh](../../ci/e2e.sh), "Many
+workers") checks steering, with two workers, 64 UDP flows and 8 TCP
+streams through NAT and not one reply handed over.
 
 ## What about routing changes?
 

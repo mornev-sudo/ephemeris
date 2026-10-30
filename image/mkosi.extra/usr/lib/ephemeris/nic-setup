@@ -11,9 +11,18 @@ for dev in $devices; do
     ip addr flush dev "$dev"                                   # the kernel must not own these links
     sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"             # ...or chatter IPv6 out of them
     ip link set dev "$dev" up
-    ethtool -L "$dev" combined "$workers" 2>/dev/null || true  # one RX queue per worker
+    # One RX queue per worker, and the card's RSS spreading flows evenly
+    # over all of them. The table goes back to the driver's default
+    # first: one set by an earlier start (perhaps with fewer workers)
+    # would otherwise stay as it was, sending nothing to the new queues,
+    # and some drivers refuse to change the queue count while it's set.
+    ethtool -X "$dev" default 2>/dev/null || true
+    ethtool -L "$dev" combined "$workers" 2>/dev/null || true
     ethtool -K "$dev" gro off lro off 2>/dev/null || true      # native XDP needs plain frames
-    ethtool -X "$dev" hfunc toeplitz symmetric-xor 2>/dev/null || true  # symmetric RSS
+    # Toeplitz over every worker's queue; symmetric where the card can.
+    ethtool -X "$dev" equal "$workers" hfunc toeplitz symmetric-xor 2>/dev/null \
+        || ethtool -X "$dev" equal "$workers" hfunc toeplitz 2>/dev/null \
+        || ethtool -X "$dev" equal "$workers" 2>/dev/null || true
 done
 
 # The host path: SSH and the portal on inside interfaces that offer them

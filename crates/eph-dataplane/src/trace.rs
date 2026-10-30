@@ -83,7 +83,9 @@ impl TraceCat {
             NotForUs | Vlan | UnsupportedEthertype => TraceCat::Interface,
             NeighborMiss => TraceCat::Arp,
             NoRoute | TtlExceeded | TooBig | LocalUnhandled => TraceCat::Route,
-            NoSession | InvalidTcpState | SessionTableFull | SessionMismatch => TraceCat::Session,
+            NoSession | InvalidTcpState | SessionTableFull | HostSessionLimit | SessionMismatch => {
+                TraceCat::Session
+            }
             NatExhausted | NatUntranslatable | NatNoSession | NatWrongWorker => TraceCat::Nat,
             Malformed | BadIpHeader | BadL4Header | Martian | SpoofedSource | IpOption
             | BadFragment | FragmentToRouter | IcmpMismatch => TraceCat::Filter,

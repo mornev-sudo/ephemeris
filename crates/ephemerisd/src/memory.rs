@@ -29,8 +29,14 @@ pub const HEADROOM: u64 = 256 << 20;
 /// Not all of it: the page cache and the management plane need some, and
 /// most routers never come near a full table.
 const AUTO_SHARE: (u64, u64) = (1, 2);
-/// `"auto"` never goes below or above these, per worker.
+/// `"auto"` never goes below this per worker...
 pub const AUTO_MIN: u32 = 16_384;
+/// ...nor above this for the whole router, split between the workers:
+/// about 600 MB of tables once full. More than a branch or a busy office
+/// ever holds; a bigger table only makes lookups slower and lets a flood
+/// of junk flows linger. Set `max_per_worker` for more.
+pub const AUTO_TOTAL_MAX: u32 = 2_000_000;
+/// The most `max_per_worker` may be set to.
 pub const SESSIONS_MAX: u32 = 16_000_000;
 /// `"auto"` without knowing the machine's memory (`--check` on a laptop).
 pub const AUTO_FALLBACK: u32 = 262_144;
@@ -100,7 +106,8 @@ pub fn plan(cfg: &Config, fib_bytes: u64, mem: Option<&Memory>) -> Result<Plan> 
             Some(avail) => {
                 let spare = avail.saturating_sub(fixed + HEADROOM);
                 let share = spare / AUTO_SHARE.1 * AUTO_SHARE.0 / workers as u64;
-                let n = SessionTable::max_for_bytes(share).min(SESSIONS_MAX);
+                let n = SessionTable::max_for_bytes(share)
+                    .min((AUTO_TOTAL_MAX / workers).max(AUTO_MIN));
                 if n < AUTO_MIN {
                     bail!(
                         "not enough memory for the session tables: {} available, {} for packet \
@@ -199,11 +206,11 @@ mod tests {
 
     #[test]
     fn auto_takes_half_of_what_is_left_per_worker() {
-        let p = plan(&cfg("\"auto\"", 1), FIB, Some(&mem(2 * GIB, 0))).unwrap();
+        let p = plan(&cfg("\"auto\"", 1), FIB, Some(&mem(GIB, 0))).unwrap();
         assert!(p.auto);
         // Two cards, ring 2048: 8192 frames, 32 MiB of packet buffers.
         assert_eq!(p.packet_buffers, 32 << 20);
-        let left = 2 * GIB - (32 << 20) - FIB - HEADROOM;
+        let left = GIB - (32 << 20) - FIB - HEADROOM;
         assert!(p.session_tables <= left / 2);
         assert!(
             p.session_tables > left / 2 - (1 << 20) * 64,
@@ -211,14 +218,25 @@ mod tests {
         );
         assert!(p.warning.is_none());
         // Twice the workers: each gets about half as many.
-        let p2 = plan(&cfg("\"auto\"", 2), FIB, Some(&mem(2 * GIB, 0))).unwrap();
+        let p2 = plan(&cfg("\"auto\"", 2), FIB, Some(&mem(GIB, 0))).unwrap();
         assert!(p2.sessions_per_worker < p.sessions_per_worker * 6 / 10);
         // Unknown machine: the old default.
         let p3 = plan(&cfg("\"auto\"", 1), FIB, None).unwrap();
         assert_eq!(p3.sessions_per_worker, AUTO_FALLBACK);
-        // Lots of memory: capped.
+        // Lots of memory: capped for the whole router, split between the
+        // workers, and about 600 MB in all.
         let p4 = plan(&cfg("\"auto\"", 1), FIB, Some(&mem(64 * GIB, 0))).unwrap();
-        assert_eq!(p4.sessions_per_worker, SESSIONS_MAX);
+        assert_eq!(p4.sessions_per_worker, AUTO_TOTAL_MAX);
+        let p5 = plan(&cfg("\"auto\"", 4), FIB, Some(&mem(64 * GIB, 0))).unwrap();
+        assert_eq!(p5.sessions_per_worker, AUTO_TOTAL_MAX / 4);
+        assert!(
+            (500 << 20..700 << 20).contains(&p5.session_tables),
+            "{}",
+            p5.session_tables
+        );
+        // Even with a great many workers, never below the minimum.
+        let p6 = plan(&cfg("\"auto\"", 200), FIB, Some(&mem(64 * GIB, 0))).unwrap();
+        assert_eq!(p6.sessions_per_worker, AUTO_MIN);
     }
 
     #[test]

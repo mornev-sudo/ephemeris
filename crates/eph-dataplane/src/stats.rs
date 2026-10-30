@@ -39,6 +39,8 @@ pub enum DropReason {
     InvalidTcpState,
     /// The session table is full; new flows are refused.
     SessionTableFull,
+    /// The host starting this flow has `sessions.max_per_host` already.
+    HostSessionLimit,
     /// Overlay route, but no tether to that site is up.
     NoPath,
     /// Too big for the overlay MTU with Don't Fragment set (an ICMP
@@ -105,7 +107,7 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 43] = [
+    pub const ALL: [DropReason; 44] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -123,6 +125,7 @@ impl DropReason {
         DropReason::NoSession,
         DropReason::InvalidTcpState,
         DropReason::SessionTableFull,
+        DropReason::HostSessionLimit,
         DropReason::NoPath,
         DropReason::TooBig,
         DropReason::UnknownTether,
@@ -171,6 +174,7 @@ impl DropReason {
             DropReason::NoSession => "no-session",
             DropReason::InvalidTcpState => "invalid-tcp-state",
             DropReason::SessionTableFull => "session-table-full",
+            DropReason::HostSessionLimit => "host-session-limit",
             DropReason::NoPath => "no-path",
             DropReason::TooBig => "too-big",
             DropReason::UnknownTether => "unknown-tether",
