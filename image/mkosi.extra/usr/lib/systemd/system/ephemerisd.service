@@ -10,6 +10,9 @@ After=systemd-udev-trigger.service systemd-tmpfiles-setup.service
 # "-": a failure there must not keep management (in ephemerisd) from starting.
 ExecStartPre=-+/usr/lib/ephemeris/nic-setup
 ExecStart=/usr/bin/ephemerisd --config /var/lib/ephemeris/ephemeris.toml
+# Zero-touch enrolment: an enrolment string for a controller, handed over
+# at deployment (docs/controller-api.md). Read at start; used once.
+ImportCredential=ephemeris.controller
 # always: `ephctl restart` makes ephemerisd exit cleanly and come back.
 Restart=always
 RestartSec=2

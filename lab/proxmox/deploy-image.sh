@@ -6,6 +6,7 @@
 #   ./deploy-image.sh 0.3.0                            # specific version
 #   IMAGE=/root/ephemeris_0.7.1-9003193_x86-64.qcow2 ./deploy-image.sh # local file
 #   SSH_KEY=/root/id_ed25519.pub ./deploy-image.sh     # also install an SSH key
+#   ENROL='eph-enrol:v1:https://...' ./deploy-image.sh # enrol with a controller at first boot
 #
 # It prints the generated admin password at the end.
 #
@@ -28,6 +29,7 @@ MEMORY=${MEMORY:-2048}
 QUEUES=${QUEUES:-2}          # virtio queues per data NIC = ephemerisd workers
 DISK=${DISK:-8G}
 SSH_KEY=${SSH_KEY:-}         # optional public key file for root@router
+ENROL=${ENROL:-}             # optional enrolment string for a controller
 CONFIG=${CONFIG:-}           # ephemeris.toml to install; default: two-port lab config
 IMAGE=${IMAGE:-}             # use this qcow2 instead of downloading
 REPLACE=${REPLACE:-0}        # 1 = destroy an existing VM with this VMID first
@@ -103,6 +105,9 @@ args="-smbios type=11,value=io.systemd.credential:system.hostname=$NAME"
 args+=" -smbios type=11,value=io.systemd.credential.binary:ephemeris.admin_password_hash=$(printf '%s' "$PWHASH" | b64)"
 [[ -z $SSH_KEY ]] || args+=" -smbios type=11,value=io.systemd.credential.binary:ssh.authorized_keys.root=$(b64 <"$SSH_KEY")"
 args+=" -smbios type=11,value=io.systemd.credential.binary:ephemeris.config=$(printf '%s\n' "$config_text" | b64)"
+# Zero-touch: the router enrols with its controller by itself (binary: the
+# string holds '#' and '@').
+[[ -z $ENROL ]] || args+=" -smbios type=11,value=io.systemd.credential.binary:ephemeris.controller=$(printf '%s' "$ENROL" | b64)"
 
 # --- 3. create the VM ----------------------------------------------------------
 if qm status "$VMID" >/dev/null 2>&1; then

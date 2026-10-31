@@ -94,6 +94,16 @@ The router presents its client certificate (self-signed, its management
 key) on **every** connection, the enrolling one included; a controller
 refuses connections without one.
 
+**Zero-touch:** given the string as the `ephemeris.controller` credential
+(e.g. `ENROL=... lab/proxmox/deploy-image.sh`), a router with no
+`[controller]` section enrols by itself when it starts. It retries with
+backoff while the controller can't be reached (the WAN may not be up
+yet), and gives up on a refused token, which then needs a new string. It
+remembers the SHA-256 of the string it enrolled with
+(`/var/lib/ephemeris/controller-enrolled`), so once unenrolled it doesn't
+try the spent token again at the next boot. `ephctl controller status`
+shows `enrolling` meanwhile.
+
 The router stores the result in its config:
 
 ```toml
@@ -303,8 +313,28 @@ Status and stats are best-effort: if the connection is down, the router
 keeps its own history (as now) and sends what it still holds when it's
 back.
 
-The controller can ask for more when someone is looking: `sessions.get`
-(as `GET /sessions`), `routes.get`, `dhcp.get`, `wan.get`, `overlay.get`.
+### Live tables
+
+For a page someone has open, the controller asks for the router's tables
+(requests, with an `id`). Routers that answer them list the `tables`
+capability in `hello`; a controller sends them to no other router.
+
+| Request | Answer `ok` |
+|---|---|
+| `sessions.get` | `{"items": [...], "total": n}`: entries as `GET /sessions` gives them, newest first |
+| `routes.get` | `{"items": [...], "total": n}`: as `GET /routes`, in the forwarding table's order |
+| `neighbors.get` | `{"items": [...], "total": n}`: as `GET /neighbors` |
+| `dhcp.get` | exactly the `GET /dhcp` body |
+| `wan.get` | exactly the `GET /wan` body |
+| `overlay.get` | exactly the `GET /overlay` body |
+
+- List requests take an optional `"limit"`: default and most 1000 (a
+  larger one is treated as 1000), so an answer always fits in 1 MiB.
+  `total` is how many there are, of which `items` holds at most `limit`.
+- The router answers within 5 s. A controller asks for each table at most
+  once every 5 s per router, gives up on an answer after 10 s, and has at
+  most 8 requests waiting per router.
+- A table the router doesn't have: `unknown_type`.
 
 ## Operations
 
