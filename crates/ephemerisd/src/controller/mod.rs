@@ -42,19 +42,15 @@ impl Identity {
         Ok(Self::from_seed(seed))
     }
 
-    /// The key pair as a PKCS#8 document (RFC 5958, with the public key),
-    /// for TLS libraries.
-    pub fn pkcs8(&self) -> Vec<u8> {
-        // SEQUENCE { version 1, AlgorithmIdentifier { id-Ed25519 },
-        // OCTET STRING { OCTET STRING seed }, [1] BIT STRING public }
-        let mut der = vec![
-            0x30, 0x53, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
-            0x04, 0x20,
-        ];
-        der.extend_from_slice(self.key.as_bytes());
-        der.extend_from_slice(&[0xa1, 0x23, 0x03, 0x21, 0x00]);
-        der.extend_from_slice(&self.public());
-        der
+    /// The key pair as a PKCS#8 document (RFC 5958 and 8410, with the
+    /// public key), for TLS libraries.
+    pub fn pkcs8(&self) -> Result<Vec<u8>> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        let doc = self
+            .key
+            .to_pkcs8_der()
+            .map_err(|e| anyhow::anyhow!("encoding the management key: {e}"))?;
+        Ok(doc.as_bytes().to_vec())
     }
 
     /// The public key: 32 bytes, shown as 64 lowercase hex characters.
@@ -118,6 +114,22 @@ mod tests {
             "never replaced silently"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_pkcs8_document_is_rfc_8410_with_the_public_key() {
+        // OneAsymmetricKey v2: version 1, id-Ed25519, the seed, and the
+        // public key as [1] IMPLICIT BIT STRING (RFC 5958; ring writes it
+        // [1] EXPLICIT, which isn't what the RFC says, but reads both).
+        let id = Identity::from_seed([9; 32]);
+        let mut want = vec![
+            0x30, 0x51, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        want.extend_from_slice(&[9; 32]);
+        want.extend_from_slice(&[0x81, 0x21, 0x00]);
+        want.extend_from_slice(&id.public());
+        assert_eq!(id.pkcs8().unwrap(), want);
     }
 
     #[test]

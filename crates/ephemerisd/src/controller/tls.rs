@@ -27,7 +27,7 @@ pub fn spki_sha256(cert: &CertificateDer<'_>) -> Result<[u8; 32]> {
 pub fn client_cert(
     identity: &Identity,
 ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.pkcs8()));
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.pkcs8()?));
     let pair = rcgen::KeyPair::try_from(&key).context("the management key")?;
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
