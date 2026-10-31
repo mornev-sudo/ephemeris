@@ -1109,32 +1109,18 @@ struct EnrolReq {
 /// router's key with its token, and commit the `[controller]` section that
 /// the link then follows.
 async fn controller_enrol(State(s): St, Json(r): Json<EnrolReq>) -> ApiResult {
+    use crate::controller::enrolment::{enrol, EnrolError};
     let e = eph_config::Enrolment::parse(&r.enrolment)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    if let Some(c) = &s.config.lock().unwrap().running().controller {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            format!("already managed by {}: remove [controller] first", c.url),
-        ));
-    }
-    let Some(id) = s.controller_identity.clone() else {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no controller key pair: see `ephctl log show -c mgmt`".into(),
-        ));
-    };
-    let hello = crate::controller::link::hello(&s);
-    let router_id = crate::controller::link::enrol(&e, &id, hello)
-        .await
-        .map_err(|err| ApiError(StatusCode::BAD_GATEWAY, format!("{err:#}")))?;
-    tracing::info!(target: "audit", "enrolled with controller {} as router {router_id}", e.url);
-    let c = {
-        let mut cfg = s.config.lock().unwrap();
-        let text = cfg.with_controller(&e.controller())?;
-        cfg.set_candidate(text)?;
-        cfg.commit(None)?
-    };
-    let mut v = finish_commit(&s, c, None)?.0;
+    let (router_id, mut v) = enrol(&s, &e).await.map_err(|err| {
+        let code = match err {
+            EnrolError::Managed(_) => StatusCode::CONFLICT,
+            EnrolError::NoIdentity => StatusCode::SERVICE_UNAVAILABLE,
+            EnrolError::Controller(_) => StatusCode::BAD_GATEWAY,
+            EnrolError::Commit(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ApiError(code, err.to_string())
+    })?;
     v["router_id"] = router_id.into();
     Ok(Json(v))
 }

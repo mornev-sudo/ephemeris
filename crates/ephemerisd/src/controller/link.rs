@@ -61,6 +61,8 @@ pub enum State {
     /// No `[controller]` section: not managed.
     #[default]
     Off,
+    /// Enrolling by itself, from the boot credential (zero-touch).
+    Enrolling,
     Connecting,
     Connected,
     /// The controller doesn't know this router's key: it needs a new
@@ -512,6 +514,54 @@ fn jittered(d: Duration) -> Duration {
     d + d.mul_f64(f64::from(r) / f64::from(u16::MAX) / 4.0)
 }
 
+/// One zero-touch enrolment attempt. The enrolment back if it's worth
+/// trying again (the controller couldn't be reached: the network may not
+/// be up yet); `None` once it worked, or can't (a refused token: spent,
+/// expired or revoked, so a new one is needed).
+async fn enrol_from_credential(
+    shared: &Arc<Shared>,
+    state_dir: &std::path::Path,
+    e: Enrolment,
+    backoff: Duration,
+) -> Option<Enrolment> {
+    use super::enrolment::{enrol, mark_used, EnrolError};
+    let set = |state: State, error: Option<String>| {
+        let mut s = shared.controller.lock().unwrap();
+        if s.state != state {
+            s.since_unix = Some(now_unix());
+        }
+        (s.state, s.url, s.error) = (state, Some(e.url.clone()), error);
+    };
+    set(State::Enrolling, None);
+    match enrol(shared, &e).await {
+        Ok((id, _)) => {
+            info!(target: crate::logging::cat::MGMT,
+                "enrolled with controller {} as router {id}, from the boot credential", e.url);
+            mark_used(state_dir, &e);
+            None
+        }
+        Err(EnrolError::Controller(err)) if err.downcast_ref::<Refused>().is_some() => {
+            tracing::error!(target: crate::logging::cat::MGMT,
+                "controller {} refused the boot credential's enrolment ({err:#}): it needs a new one", e.url);
+            set(State::Failed, Some(format!("{err:#}")));
+            None
+        }
+        Err(EnrolError::Controller(err)) => {
+            if backoff == Duration::from_secs(1) {
+                warn!(target: crate::logging::cat::MGMT,
+                    "enrolling with controller {} from the boot credential: {err:#} (retrying)", e.url);
+            }
+            set(State::Enrolling, Some(format!("{err:#}")));
+            Some(e)
+        }
+        Err(err) => {
+            tracing::error!(target: crate::logging::cat::MGMT, "enrolling from the boot credential: {err}");
+            set(State::Failed, Some(err.to_string()));
+            None
+        }
+    }
+}
+
 /// Follow the `[controller]` section for as long as the router runs, on a
 /// thread of its own.
 pub fn spawn(shared: Arc<Shared>, identity: Arc<Identity>) -> std::io::Result<()> {
@@ -530,11 +580,35 @@ pub fn spawn(shared: Arc<Shared>, identity: Arc<Identity>) -> std::io::Result<()
 async fn follow(shared: Arc<Shared>, identity: Arc<Identity>) {
     let mut backoff = Duration::from_secs(1);
     let section = || shared.config.lock().unwrap().running().controller.clone();
+    let state_dir = {
+        let m = shared.config.lock().unwrap();
+        m.path()
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+    // Zero-touch: an enrolment string handed over at boot, not used yet.
+    let mut zero_touch = super::enrolment::from_credential(&state_dir);
     loop {
         let Some(cfg) = section() else {
-            *shared.controller.lock().unwrap() = Status::default();
-            backoff = Duration::from_secs(1);
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            match zero_touch.take() {
+                Some(e) => {
+                    if let Some(retry) =
+                        enrol_from_credential(&shared, &state_dir, e, backoff).await
+                    {
+                        zero_touch = Some(retry);
+                        tokio::time::sleep(jittered(backoff)).await;
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                    } else {
+                        backoff = Duration::from_secs(1);
+                    }
+                }
+                None => {
+                    *shared.controller.lock().unwrap() = Status::default();
+                    backoff = Duration::from_secs(1);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
             continue;
         };
         let set = |state: State, error: Option<String>| {
