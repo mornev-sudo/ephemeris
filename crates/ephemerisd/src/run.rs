@@ -168,6 +168,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         },
         controller_identity,
         controller: Default::default(),
+        events: Default::default(),
         history: Default::default(),
         update: Default::default(),
         system: Default::default(),
@@ -175,6 +176,18 @@ pub fn run(config_path: &Path) -> Result<()> {
         detail,
         stop: &STOP,
     });
+    // A config that failed at this start (the last good one runs instead),
+    // or a data plane that couldn't start: the controller hears of it.
+    if let Some(f) = &shared.startup.fallback {
+        let detail = serde_json::json!({"error": f.error, "failed_file": f.failed_file});
+        shared.events.emit("config.failed_at_start", "", detail);
+    }
+    if let Some(e) = &shared.startup.dataplane_error {
+        let detail = serde_json::json!({"error": e, "dataplane": "not running"});
+        shared
+            .events
+            .emit("config.failed_at_start", "dataplane", detail);
+    }
     // The controller, if this router is enrolled with one (followed even
     // with management off: it's how a managed router is reached).
     if let Some(id) = shared.controller_identity.clone() {
@@ -912,10 +925,31 @@ fn path_loop(shared: &Shared, epoch: Instant, replay: &ReplayGuard, state_dir: &
         }
         let merged = Summary::collect(&shared.reports).tethers;
         let health = sel.health(&merged, epoch.elapsed().as_nanos() as u64);
-        *shared.health.write().unwrap() = health.clone();
+        let before = std::mem::replace(&mut *shared.health.write().unwrap(), health.clone());
+        for (t, (was, now)) in shared
+            .overlay
+            .tethers
+            .iter()
+            .zip(before.iter().zip(&health))
+        {
+            if was.up != now.up {
+                let kind = if now.up { "tether.up" } else { "tether.down" };
+                let site = shared.overlay.sites.get(t.site_idx).copied().unwrap_or(0);
+                shared.events.emit(
+                    kind,
+                    &t.name,
+                    serde_json::json!({"tether": t.name, "site": site}),
+                );
+            }
+        }
         if let Some((table, changes)) = sel.decide(&health) {
             for c in changes {
                 info!(target: crate::logging::cat::SDWAN, "SD-WAN path change: {c}");
+                shared.events.emit(
+                    "path.changed",
+                    &format!("{}/{}", c.site, c.class),
+                    serde_json::json!({"site": c.site, "class": c.class, "from": c.from, "to": c.to}),
+                );
             }
             let table = Arc::new(table);
             for tx in shared.control.lock().unwrap().iter() {

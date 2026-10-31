@@ -141,6 +141,11 @@ impl History {
             .collect()
     }
 
+    /// The samples newer than `t`, oldest first.
+    pub fn after(&self, t: u64) -> Vec<Sample> {
+        self.samples.iter().filter(|s| s.t > t).cloned().collect()
+    }
+
     pub fn latest(&self) -> Option<&Sample> {
         self.samples.back()
     }

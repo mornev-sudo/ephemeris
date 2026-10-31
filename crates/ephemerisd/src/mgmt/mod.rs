@@ -82,6 +82,8 @@ pub struct Shared {
     /// loaded, see the log), and where the link to it stands.
     pub controller_identity: Option<Arc<crate::controller::Identity>>,
     pub controller: Mutex<crate::controller::link::Status>,
+    /// What happened, waiting for the controller link to send it.
+    pub events: crate::controller::events::Events,
     /// Rates sampled every few seconds, for the Reporting graphs.
     pub history: Mutex<history::History>,
     /// What the software-update buttons know: the version being installed

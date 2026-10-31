@@ -8,6 +8,7 @@
 //! Nothing the controller sends is acted on yet: requests are answered
 //! `unknown_type` until the router learns them (config, telemetry...).
 
+use super::events::Events;
 use super::{tls, Identity};
 use crate::mgmt::Shared;
 use crate::sdwan::hex;
@@ -227,14 +228,58 @@ pub async fn enrol(e: &Enrolment, identity: &Identity, hello: Value) -> Result<u
     Ok(id)
 }
 
-/// One connected session: hello, then keep-alive and answering until the
-/// controller goes away, falls silent, or `wanted` says to stop (the
-/// `[controller]` section changed).
+/// What the link reports: the router's state (a test's stand-in).
+pub trait Telemetry {
+    /// `status`: the `GET /status` body.
+    fn status(&self) -> Value;
+    /// The parts of the status whose change is told at once (interfaces
+    /// and their addresses, tethers up or down, a pending confirm...), not
+    /// the counters that change all the time.
+    fn state(&self) -> Value;
+    /// The interfaces' names, and the samples newer than `t`.
+    fn samples_after(&self, t: u64) -> (Vec<String>, Vec<Value>);
+    fn events(&self) -> &Events;
+}
+
+/// How often things happen on a session (shorter in tests).
+pub struct Timing {
+    pub tick: Duration,
+    pub ping_every: Duration,
+    pub silent_after: Duration,
+    pub status_every: Duration,
+    /// A change of state is told at most this often.
+    pub status_at_most: Duration,
+    pub stats_every: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            tick: Duration::from_secs(1),
+            ping_every: PING_EVERY,
+            silent_after: SILENT_AFTER,
+            status_every: Duration::from_secs(30),
+            status_at_most: Duration::from_secs(5),
+            stats_every: Duration::from_secs(300),
+        }
+    }
+}
+
+/// `status` messages are at most this big.
+const STATUS_MAX: usize = 256 << 10;
+/// Samples per `stats` message, at most.
+const SAMPLES_MAX: usize = 720;
+
+/// One connected session: hello, then telemetry, keep-alive and answering
+/// until the controller goes away, falls silent, or `wanted` says to stop
+/// (the `[controller]` section changed).
 pub async fn session<S>(
     mut ws: WebSocketStream<S>,
     hello: Value,
     status: &Mutex<Status>,
     wanted: impl Fn() -> bool,
+    t: &dyn Telemetry,
+    timing: &Timing,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -247,31 +292,131 @@ where
         s.since_unix = Some(now_unix());
         s.error = None;
     }
-    let mut ping = tokio::time::interval(PING_EVERY);
-    ping.tick().await;
-    let mut heard = Instant::now();
+    // Straight away: where things stand, the samples still held (at most
+    // the last hour) and what happened meanwhile.
+    let mut state = t.state();
+    send_status(&mut ws, t).await?;
+    let mut newest = send_stats(&mut ws, t, 0).await?;
+    for e in t.events().take() {
+        send(&mut ws, e).await?;
+    }
+    let now = Instant::now();
+    let (mut heard, mut pinged, mut told, mut sampled) = (now, now, now, now);
+    let mut tick = tokio::time::interval(timing.tick);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
     loop {
         tokio::select! {
             msg = ws.next() => {
                 let Some(msg) = msg else { return Ok(()) };
                 heard = Instant::now();
                 match msg? {
-                    Message::Text(t) => answer_request(&mut ws, &t).await?,
+                    Message::Text(text) => answer_request(&mut ws, &text).await?,
                     Message::Close(_) => return Ok(()),
                     _ => {}
                 }
             }
-            _ = ping.tick() => {
-                if heard.elapsed() > SILENT_AFTER {
+            _ = tick.tick() => {
+                if heard.elapsed() > timing.silent_after {
                     bail!("the controller went silent");
                 }
                 if !wanted() {
                     let _ = ws.close(None).await;
                     return Ok(());
                 }
-                ws.send(Message::Ping(Vec::new())).await?;
+                for e in t.events().take() {
+                    send(&mut ws, e).await?;
+                }
+                let now_state = t.state();
+                let changed = now_state != state && told.elapsed() >= timing.status_at_most;
+                if changed || told.elapsed() >= timing.status_every {
+                    send_status(&mut ws, t).await?;
+                    (state, told) = (now_state, Instant::now());
+                }
+                if sampled.elapsed() >= timing.stats_every {
+                    newest = send_stats(&mut ws, t, newest).await?;
+                    sampled = Instant::now();
+                }
+                if pinged.elapsed() >= timing.ping_every {
+                    ws.send(Message::Ping(Vec::new())).await?;
+                    pinged = Instant::now();
+                }
             }
         }
+    }
+}
+
+async fn send_status<S>(ws: &mut WebSocketStream<S>, t: &dyn Telemetry) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let msg = json!({"type": "status", "status": t.status()});
+    if msg.to_string().len() > STATUS_MAX {
+        warn!(target: crate::logging::cat::MGMT, "status for the controller is over 256 KiB: not sent");
+        return Ok(());
+    }
+    send(ws, msg).await
+}
+
+/// The samples newer than `after`, in messages of at most 720; the newest
+/// sample's time sent.
+async fn send_stats<S>(ws: &mut WebSocketStream<S>, t: &dyn Telemetry, after: u64) -> Result<u64>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (interfaces, samples) = t.samples_after(after);
+    let mut newest = after;
+    for chunk in samples.chunks(SAMPLES_MAX) {
+        newest = chunk
+            .iter()
+            .filter_map(|s| s["t"].as_u64())
+            .fold(newest, u64::max);
+        let msg = json!({
+            "type": "stats",
+            "interval_secs": crate::mgmt::history::INTERVAL_SECS,
+            "interfaces": interfaces,
+            "samples": chunk,
+        });
+        send(ws, msg).await?;
+    }
+    Ok(newest)
+}
+
+impl Telemetry for Shared {
+    fn status(&self) -> Value {
+        crate::mgmt::api::status_body(self)
+    }
+
+    fn state(&self) -> Value {
+        let status = self.status();
+        let tethers: Vec<bool> = self.health.read().unwrap().iter().map(|h| h.up).collect();
+        json!({
+            "ports": status["ports"],
+            "tethers": tethers,
+            "pending_confirm": status["pending_confirm_secs"].is_number(),
+            "fallback": status["fallback"],
+            "dataplane_error": status["dataplane_error"],
+        })
+    }
+
+    fn samples_after(&self, t: u64) -> (Vec<String>, Vec<Value>) {
+        let names = self
+            .ports
+            .read()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let samples = self.history.lock().unwrap().after(t);
+        let samples = samples
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .collect();
+        (names, samples)
+    }
+
+    fn events(&self) -> &Events {
+        &self.events
     }
 }
 
@@ -385,7 +530,9 @@ async fn follow(shared: Arc<Shared>, identity: Arc<Identity>) {
             Ok(pin) => match connect(&cfg.url, pin, &identity).await {
                 Ok(ws) => {
                     let wanted = || section().as_ref() == Some(&cfg);
-                    session(ws, hello(&shared), &shared.controller, wanted).await
+                    let timing = Timing::default();
+                    let t: &Shared = &shared;
+                    session(ws, hello(&shared), &shared.controller, wanted, t, &timing).await
                 }
                 Err(e) => Err(e),
             },
@@ -570,6 +717,32 @@ mod tests {
         (format!("https://localhost:{}/", addr.port()), pin, task)
     }
 
+    /// A router's state, for sessions in tests.
+    #[derive(Default)]
+    struct Fake {
+        events: Events,
+    }
+
+    impl Telemetry for Fake {
+        fn status(&self) -> Value {
+            json!({"version": "test", "ports": []})
+        }
+        fn state(&self) -> Value {
+            json!({})
+        }
+        fn samples_after(&self, t: u64) -> (Vec<String>, Vec<Value>) {
+            let all = [1000u64, 1005].map(|t| json!({"t": t, "sessions": 3}));
+            let newer = all
+                .into_iter()
+                .filter(|s| s["t"].as_u64().unwrap() > t)
+                .collect();
+            (vec!["wan".into(), "lan".into()], newer)
+        }
+        fn events(&self) -> &Events {
+            &self.events
+        }
+    }
+
     fn hello_msg() -> Value {
         json!({"type": "hello", "protocol": PROTOCOL, "router": {}, "config": {}, "capabilities": []})
     }
@@ -606,21 +779,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_says_hello_and_answers_what_it_doesnt_know() {
+    async fn a_session_says_hello_then_tells_status_stats_and_events() {
         let (url, pin, server) = controller(true).await;
         let id = Identity::from_seed([6; 32]);
         let ws = connect(&url, pin, &id).await.unwrap();
         let status = Mutex::new(Status::default());
-        session(ws, hello_msg(), &status, || true).await.unwrap();
+        let fake = Fake::default();
+        fake.events
+            .emit("tether.down", "lte", json!({"tether": "lte"}));
+        session(ws, hello_msg(), &status, || true, &fake, &Timing::default())
+            .await
+            .unwrap();
         assert_eq!(status.lock().unwrap().state, State::Connected);
         assert_eq!(status.lock().unwrap().router_id, Some(12));
         let seen = server.await.unwrap();
-        assert_eq!(
-            (seen[0]["type"].as_str(), seen[0]["id"].as_u64()),
-            (Some("hello"), Some(1))
-        );
-        assert_eq!(seen[1]["error"]["code"], "unknown_type");
-        assert_eq!(seen[1]["id"], 1);
+        let kinds: Vec<&str> = seen.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["hello", "status", "stats", "event", "result"]);
+        assert_eq!(seen[0]["id"], 1);
+        // Telemetry carries no id; status is the GET /status body.
+        assert!(seen[1].get("id").is_none());
+        assert_eq!(seen[1]["status"]["version"], "test");
+        assert_eq!(seen[2]["interfaces"], json!(["wan", "lan"]));
+        assert_eq!(seen[2]["interval_secs"], 5);
+        let samples = seen[2]["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 2, "all it holds, on connecting");
+        assert_eq!(seen[3]["kind"], "tether.down");
+        assert_eq!(seen[3]["detail"]["tether"], "lte");
+        // And a request it doesn't know yet.
+        assert_eq!(seen[4]["error"]["code"], "unknown_type");
+        assert_eq!(seen[4]["id"], 1);
     }
 
     #[tokio::test]
@@ -629,7 +816,8 @@ mod tests {
         let id = Identity::from_seed([7; 32]);
         let ws = connect(&url, pin, &id).await.unwrap();
         let status = Mutex::new(Status::default());
-        let err = session(ws, hello_msg(), &status, || true)
+        let fake = Fake::default();
+        let err = session(ws, hello_msg(), &status, || true, &fake, &Timing::default())
             .await
             .unwrap_err();
         assert!(refused_with(&err, "not_enrolled"), "{err:#}");

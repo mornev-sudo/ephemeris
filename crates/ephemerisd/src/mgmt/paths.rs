@@ -69,9 +69,8 @@ impl PathSelector {
             .collect()
     }
 
-    /// New path table if any decision changed. Also returns human-readable
-    /// descriptions of what moved, for the log.
-    pub fn decide(&mut self, health: &[TetherHealth]) -> Option<(PathTable, Vec<String>)> {
+    /// New path table if any decision changed, and what moved.
+    pub fn decide(&mut self, health: &[TetherHealth]) -> Option<(PathTable, Vec<PathChange>)> {
         let next = select_paths(&self.overlay, health, &self.table);
         if next.gen == self.table.gen {
             return None;
@@ -86,18 +85,38 @@ impl PathSelector {
             for (class, &choice) in row.iter().enumerate() {
                 let before = self.table.get(site_idx, class as u8);
                 if before != choice {
-                    changes.push(format!(
-                        "site {} class {}: {} -> {}",
-                        self.overlay.sites[site_idx],
-                        self.overlay.classes[class].name,
-                        name(before),
-                        name(choice)
-                    ));
+                    changes.push(PathChange {
+                        site: self.overlay.sites[site_idx],
+                        class: self.overlay.classes[class].name.clone(),
+                        from: name(before),
+                        to: name(choice),
+                    });
                 }
             }
         }
         self.table = next.clone();
         Some((next, changes))
+    }
+}
+
+/// One (site, class) moving to another tether ("none": no tether up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathChange {
+    pub site: u16,
+    pub class: String,
+    pub from: String,
+    pub to: String,
+}
+
+impl std::fmt::Display for PathChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let PathChange {
+            site,
+            class,
+            from,
+            to,
+        } = self;
+        write!(f, "site {site} class {class}: {from} -> {to}")
     }
 }
 
@@ -208,11 +227,12 @@ mod tests {
         };
         let (t, changes) = p.decide(&[up(5), up(50)]).unwrap();
         assert_eq!(t.get(0, 0), Some(0));
-        assert_eq!(changes, ["site 2 class default: none -> fibre"]);
+        let text = |c: Vec<PathChange>| c.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        assert_eq!(text(changes), ["site 2 class default: none -> fibre"]);
         assert!(p.decide(&[up(5), up(50)]).is_none(), "nothing changed");
         let (t, changes) = p.decide(&[TetherHealth::default(), up(50)]).unwrap();
         assert_eq!(t.get(0, 0), Some(1));
-        assert_eq!(changes, ["site 2 class default: fibre -> lte"]);
+        assert_eq!(text(changes), ["site 2 class default: fibre -> lte"]);
     }
 
     #[test]

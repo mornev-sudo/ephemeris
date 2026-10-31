@@ -787,57 +787,62 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Cmd::Controller { cmd } => match cmd {
-            ControllerCmd::Status => {
-                let v = c.get("/controller")?;
-                if json {
-                    print(&v);
-                    return Ok(());
-                }
-                let state = str(&v["state"]);
-                match v["url"].as_str() {
-                    None => println!("Not managed by a controller (no [controller] section)."),
-                    Some(url) => {
-                        println!("Controller {url}: {state}");
-                        if let Some(id) = v["router_id"].as_u64() {
-                            println!("  router id: {id}");
-                        }
-                        if let Some(e) = v["error"].as_str() {
-                            println!("  last error: {e}");
-                        }
-                        if state == "not-enrolled" {
-                            println!(
-                                "  it needs a new enrolment: ephctl controller enrol <string>"
-                            );
+        Cmd::Controller { cmd } => {
+            match cmd {
+                ControllerCmd::Status => {
+                    let v = c.get("/controller")?;
+                    if json {
+                        print(&v);
+                        return Ok(());
+                    }
+                    let state = str(&v["state"]);
+                    match v["url"].as_str() {
+                        None => println!("Not managed by a controller (no [controller] section)."),
+                        Some(url) => {
+                            println!("Controller {url}: {state}");
+                            if let Some(id) = v["router_id"].as_u64() {
+                                println!("  router id: {id}");
+                            }
+                            if let Some(e) = v["error"].as_str() {
+                                println!("  last error: {e}");
+                            }
+                            if let Some(n) = v["events_dropped"].as_u64().filter(|&n| n > 0) {
+                                println!("  events not sent (over the rate limit, or queued too long): {n}");
+                            }
+                            if state == "not-enrolled" {
+                                println!(
+                                    "  it needs a new enrolment: ephctl controller enrol <string>"
+                                );
+                            }
                         }
                     }
                 }
-            }
-            ControllerCmd::Enrol { enrolment } => {
-                let body = serde_json::json!({ "enrolment": enrolment }).to_string();
-                let v = c.call(
-                    "POST",
-                    "/controller/enrol",
-                    Some(("application/json", &body)),
-                )?;
-                if json {
-                    print(&v);
-                    return Ok(());
+                ControllerCmd::Enrol { enrolment } => {
+                    let body = serde_json::json!({ "enrolment": enrolment }).to_string();
+                    let v = c.call(
+                        "POST",
+                        "/controller/enrol",
+                        Some(("application/json", &body)),
+                    )?;
+                    if json {
+                        print(&v);
+                        return Ok(());
+                    }
+                    println!("Enrolled: this router is {} there.", v["router_id"]);
                 }
-                println!("Enrolled: this router is {} there.", v["router_id"]);
-            }
-            ControllerCmd::Identity => {
-                let v = c.get("/controller/identity")?;
-                if json {
-                    print(&v);
-                    return Ok(());
+                ControllerCmd::Identity => {
+                    let v = c.get("/controller/identity")?;
+                    if json {
+                        print(&v);
+                        return Ok(());
+                    }
+                    match v["public_key"].as_str() {
+                        Some(k) => println!("{k}"),
+                        None => bail!("no controller key pair: see `ephctl log show -c mgmt`"),
+                    }
                 }
-                match v["public_key"].as_str() {
-                    Some(k) => println!("{k}"),
-                    None => bail!("no controller key pair: see `ephctl log show -c mgmt`"),
-                }
             }
-        },
+        }
         Cmd::Route { cmd } => {
             let v = match cmd {
                 RouteCmd::Add { prefix, via } => {

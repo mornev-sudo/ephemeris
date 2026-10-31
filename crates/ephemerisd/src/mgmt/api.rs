@@ -580,6 +580,11 @@ fn management(h: &eph_dataplane::host::HostAccess) -> Vec<&'static str> {
 }
 
 async fn status(State(s): St) -> Json<Value> {
+    Json(status_body(&s))
+}
+
+/// What `GET /status` returns (and the controller link's `status`).
+pub(crate) fn status_body(s: &Shared) -> Value {
     let sum = s.summary();
     let ports = s.ports.read().unwrap().clone();
     let ports: Vec<Value> = ports
@@ -599,7 +604,7 @@ async fn status(State(s): St) -> Json<Value> {
         })
         .collect();
     let cfg = s.config.lock().unwrap();
-    Json(json!({
+    json!({
         "version": env!("CARGO_PKG_VERSION"),
         "build": s.build,
         "uptime_secs": s.started.elapsed().as_secs(),
@@ -633,7 +638,7 @@ async fn status(State(s): St) -> Json<Value> {
         "candidate_staged": cfg.candidate_text().is_some(),
         "dataplane_error": s.startup.dataplane_error,
         "fallback": s.startup.fallback,
-    }))
+    })
 }
 
 #[derive(Deserialize)]
@@ -1087,7 +1092,11 @@ async fn controller_identity(State(s): St) -> Json<Value> {
 }
 
 async fn controller_status(State(s): St) -> Json<Value> {
-    Json(json!(s.controller.lock().unwrap().clone()))
+    let mut v = json!(s.controller.lock().unwrap().clone());
+    // Events that never reached the controller (over the rate cap, or
+    // pushed out of the queue while disconnected).
+    v["events_dropped"] = s.events.dropped().into();
+    Json(v)
 }
 
 #[derive(Deserialize)]
@@ -1412,7 +1421,25 @@ async fn commit(State(s): St, Query(q): Query<CommitQuery>) -> ApiResult {
 }
 
 /// Push a committed change into the data plane and describe the outcome.
-fn finish_commit(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>) -> ApiResult {
+fn finish_commit(s: &Arc<Shared>, c: Committed, confirm: Option<u64>) -> ApiResult {
+    finish(s, c, confirm, "config.committed")
+}
+
+/// The running config's SHA-256, as the controller knows configs by.
+fn running_sha256(s: &Shared) -> String {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(s.config.lock().unwrap().running_text()).into();
+    crate::sdwan::hex(&digest)
+}
+
+/// A config change for the controller's events.
+fn config_event(s: &Shared, kind: &str, apply: Apply) {
+    let apply = serde_json::to_value(apply).unwrap_or_default();
+    let detail = json!({"apply": apply, "sha256": running_sha256(s)});
+    s.events.emit(kind, "", detail);
+}
+
+fn finish(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>, kind: &str) -> ApiResult {
     if c.apply == Apply::Live {
         if s.startup.dataplane_error.is_some() {
             // No data plane to update: it takes effect when it starts.
@@ -1430,6 +1457,7 @@ fn finish_commit(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>) -> Api
             match expired {
                 Some(Ok(back)) => {
                     tracing::warn!(target: crate::logging::cat::CONFIG, "commit {id} not confirmed within {secs}s: rolled back");
+                    config_event(&s, "config.rolled_back", back.apply);
                     if back.apply == Apply::Live {
                         match s.apply_live(&back.config) {
                             Ok(()) => remember_good(&s),
@@ -1447,6 +1475,7 @@ fn finish_commit(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>) -> Api
         });
     }
     tracing::info!(target: crate::logging::cat::CONFIG, "config committed ({:?})", c.apply);
+    config_event(s, kind, c.apply);
     Ok(Json(json!({
         "applied": c.apply,
         "diff": c.diff,
@@ -1475,7 +1504,7 @@ struct RollbackQuery {
 
 async fn rollback(State(s): St, Query(q): Query<RollbackQuery>) -> ApiResult {
     let c = s.config.lock().unwrap().rollback(q.to.unwrap_or(1))?;
-    finish_commit(&s, c, None)
+    finish(&s, c, None, "config.rolled_back")
 }
 
 #[derive(Deserialize)]
@@ -1693,6 +1722,12 @@ async fn update_start(State(s): St) -> ApiResult {
         .filter(|v| !v.is_empty());
     s.update.lock().unwrap().target = target.clone();
     systemctl(&["start", "--no-block", "ephemeris-update.service"])?;
+    let version = target.clone().unwrap_or_default();
+    s.events.emit(
+        "update.progress",
+        "",
+        json!({"state": "started", "version": version}),
+    );
     let note = match &target {
         Some(v) => format!(
             "Installing {v} into the idle slot. The router keeps forwarding; reboot when it's installed."
@@ -1780,6 +1815,7 @@ address = "10.10.2.1/24"
             sdwan: Default::default(),
             controller_identity: Some(Arc::new(crate::controller::Identity::from_seed([7; 32]))),
             controller: Default::default(),
+            events: Default::default(),
             history: Default::default(),
             update: Default::default(),
             system: Default::default(),
@@ -1884,6 +1920,7 @@ address = "10.10.2.1/24"
         )
         .await;
         assert_eq!(v["state"], "off");
+        assert_eq!(v["events_dropped"], 0);
         // Already managed: refused before anything is sent anywhere.
         {
             let mut cfg = s.config.lock().unwrap();
