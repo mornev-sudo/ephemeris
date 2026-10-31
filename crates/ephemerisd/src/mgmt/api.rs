@@ -1092,7 +1092,11 @@ async fn controller_identity(State(s): St) -> Json<Value> {
 }
 
 async fn controller_status(State(s): St) -> Json<Value> {
-    Json(json!(s.controller.lock().unwrap().clone()))
+    let mut v = json!(s.controller.lock().unwrap().clone());
+    // Events that never reached the controller (over the rate cap, or
+    // pushed out of the queue while disconnected).
+    v["events_dropped"] = s.events.dropped().into();
+    Json(v)
 }
 
 #[derive(Deserialize)]
@@ -1916,6 +1920,7 @@ address = "10.10.2.1/24"
         )
         .await;
         assert_eq!(v["state"], "off");
+        assert_eq!(v["events_dropped"], 0);
         // Already managed: refused before anything is sent anywhere.
         {
             let mut cfg = s.config.lock().unwrap();
