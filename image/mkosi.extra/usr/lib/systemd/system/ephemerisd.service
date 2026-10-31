@@ -28,8 +28,9 @@ ReadWritePaths=/var/lib/ephemeris
 LogsDirectory=ephemeris
 LogsDirectoryMode=0700
 # /run/ephemeris-ssh: the SSH policy from the config ([ssh]), which sshd
-# includes. Kept across restarts so sshd always has it.
-RuntimeDirectory=ephemeris-ssh
+# includes. /run/ephemeris-issue: the controller line on the console's login
+# prompt (/etc/issue.d links to it). Both kept across restarts.
+RuntimeDirectory=ephemeris-ssh ephemeris-issue
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 ProtectHome=yes
