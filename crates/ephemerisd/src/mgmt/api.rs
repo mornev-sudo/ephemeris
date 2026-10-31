@@ -1426,7 +1426,7 @@ fn finish_commit(s: &Arc<Shared>, c: Committed, confirm: Option<u64>) -> ApiResu
 }
 
 /// The running config's SHA-256, as the controller knows configs by.
-fn running_sha256(s: &Shared) -> String {
+pub(crate) fn running_sha256(s: &Shared) -> String {
     use sha2::{Digest, Sha256};
     let digest: [u8; 32] = Sha256::digest(s.config.lock().unwrap().running_text()).into();
     crate::sdwan::hex(&digest)
@@ -1439,7 +1439,19 @@ fn config_event(s: &Shared, kind: &str, apply: Apply) {
     s.events.emit(kind, "", detail);
 }
 
-fn finish(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>, kind: &str) -> ApiResult {
+fn finish(s: &Arc<Shared>, c: Committed, confirm: Option<u64>, kind: &str) -> ApiResult {
+    Ok(Json(commit_done(s, c, confirm, kind)?))
+}
+
+/// After a commit, from the API or a controller: apply it live (or note
+/// that it needs a restart), time its confirmation, and tell the
+/// controller. What happened, as the API answers it.
+pub(crate) fn commit_done(
+    s: &Arc<Shared>,
+    mut c: Committed,
+    confirm: Option<u64>,
+    kind: &str,
+) -> anyhow::Result<Value> {
     if c.apply == Apply::Live {
         if s.startup.dataplane_error.is_some() {
             // No data plane to update: it takes effect when it starts.
@@ -1450,37 +1462,61 @@ fn finish(s: &Arc<Shared>, mut c: Committed, confirm: Option<u64>, kind: &str) -
         }
     }
     if let (Some(id), Some(secs)) = (c.confirm_id, confirm) {
-        let s = s.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(secs)).await;
-            let expired = s.config.lock().unwrap().expire_pending(id);
-            match expired {
-                Some(Ok(back)) => {
-                    tracing::warn!(target: crate::logging::cat::CONFIG, "commit {id} not confirmed within {secs}s: rolled back");
-                    config_event(&s, "config.rolled_back", back.apply);
-                    if back.apply == Apply::Live {
-                        match s.apply_live(&back.config) {
-                            Ok(()) => remember_good(&s),
-                            Err(e) => {
-                                tracing::error!(target: crate::logging::cat::CONFIG, "applying rollback: {e:#}")
-                            }
-                        }
-                    }
-                }
-                Some(Err(e)) => {
-                    tracing::error!(target: crate::logging::cat::CONFIG, "automatic rollback failed: {e:#}")
-                }
-                None => {}
-            }
-        });
+        watch_confirm(s.clone(), id, secs);
     }
     tracing::info!(target: crate::logging::cat::CONFIG, "config committed ({:?})", c.apply);
     config_event(s, kind, c.apply);
-    Ok(Json(json!({
+    Ok(json!({
         "applied": c.apply,
         "diff": c.diff,
         "confirm_within_secs": c.confirm_id.and(confirm),
-    })))
+    }))
+}
+
+/// A confirmed commit's deadline: if it passes unconfirmed, go back to the
+/// config before it. Also resumed at start for a commit still pending from
+/// before a restart.
+pub(crate) fn watch_confirm(s: Arc<Shared>, id: u64, secs: u64) {
+    let spawned = std::thread::Builder::new()
+        .name("eph-confirm".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            expire_confirm(&s, id);
+        });
+    if let Err(e) = spawned {
+        tracing::error!(target: crate::logging::cat::CONFIG, "can't time commit {id}'s confirmation: {e}");
+    }
+}
+
+/// Commit `id`'s deadline passed: roll it back if it's still unconfirmed.
+/// One that needed a restart is undone by restarting.
+fn expire_confirm(s: &Shared, id: u64) {
+    let expired = s.config.lock().unwrap().expire_pending(id);
+    match expired {
+        Some(Ok(back)) => {
+            tracing::warn!(target: crate::logging::cat::CONFIG, "commit {id} not confirmed in time: rolled back");
+            config_event(s, "config.rolled_back", back.apply);
+            match back.apply {
+                Apply::Live if s.startup.dataplane_error.is_none() => {
+                    match s.apply_live(&back.config) {
+                        Ok(()) => remember_good(s),
+                        Err(e) => {
+                            tracing::error!(target: crate::logging::cat::CONFIG, "applying rollback: {e:#}")
+                        }
+                    }
+                }
+                Apply::RestartRequired => {
+                    tracing::warn!(target: crate::logging::cat::CONFIG, "restarting to use the config from before commit {id}");
+                    s.stop.store(true, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        Some(Err(e)) => {
+            tracing::error!(target: crate::logging::cat::CONFIG, "automatic rollback failed: {e:#}")
+        }
+        None => {}
+    }
 }
 
 /// The running data plane now uses the committed config: if it ever has to
@@ -1941,6 +1977,70 @@ address = "10.10.2.1/24"
         let (code, v) = enrol(&good).await;
         assert_eq!(code, StatusCode::CONFLICT, "{v}");
         assert!(v["error"].as_str().unwrap().contains("c.example.net"));
+    }
+
+    #[test]
+    fn a_controller_pushes_reads_and_confirms_configs() {
+        use crate::controller::requests::handle;
+        let (s, _rx) = shared("ctl-push");
+        let code = |r: Result<Value, crate::controller::link::Refused>| r.unwrap_err().code;
+        let got = handle(&s, "config.get", &json!({})).unwrap();
+        let (v0, base) = (
+            got["version"].as_u64().unwrap(),
+            got["sha256"].as_str().unwrap().to_string(),
+        );
+        assert_eq!(got["config"], CONFIG);
+        let with_route =
+            format!("{CONFIG}\n[[route]]\nprefix = \"0.0.0.0/0\"\nvia = \"10.10.2.254\"\n");
+        let push = |base: &str, config: &str, secs: u64| json!({"type": "config.push", "id": 1, "base_sha256": base, "config": config, "confirm_within_secs": secs});
+        // Made from another config, or out of range, or broken: refused,
+        // and nothing changes.
+        assert_eq!(
+            code(handle(
+                &s,
+                "config.push",
+                &push(&"00".repeat(32), &with_route, 60)
+            )),
+            "conflict"
+        );
+        assert_eq!(
+            code(handle(&s, "config.push", &push(&base, &with_route, 5))),
+            "bad_request"
+        );
+        let broken = format!("{CONFIG}\n[[route]]\nprefix = \"nonsense\"\nvia = \"x\"\n");
+        assert_eq!(
+            code(handle(&s, "config.push", &push(&base, &broken, 60))),
+            "bad_request"
+        );
+        assert_eq!(s.config.lock().unwrap().version(), v0);
+
+        // A good one: committed, applied live, waiting for its confirm.
+        let ok = handle(&s, "config.push", &push(&base, &with_route, 60)).unwrap();
+        assert_eq!(ok["version"], v0 + 1);
+        assert_eq!(ok["applied"], "live");
+        assert_eq!(ok["confirm_within_secs"], 60);
+        assert_eq!(ok["restarting"], false);
+        assert!(ok["diff"].as_str().unwrap().contains("10.10.2.254"));
+        assert!(s.config.lock().unwrap().pending_confirm().is_some());
+        // Another push waits for that one.
+        let new_base = ok["sha256"].as_str().unwrap();
+        assert_eq!(
+            code(handle(&s, "config.push", &push(new_base, CONFIG, 60))),
+            "conflict"
+        );
+        // Confirmed: kept.
+        assert_eq!(
+            handle(&s, "config.confirm", &json!({})).unwrap()["version"],
+            v0 + 1
+        );
+        assert!(s.config.lock().unwrap().pending_confirm().is_none());
+        assert_eq!(
+            code(handle(&s, "config.confirm", &json!({}))),
+            "not_pending"
+        );
+        let h = handle(&s, "config.history", &json!({})).unwrap();
+        assert_eq!(h["history"].as_array().unwrap().len(), 1);
+        assert_eq!(code(handle(&s, "no.such", &json!({}))), "unknown_type");
     }
 
     #[tokio::test]

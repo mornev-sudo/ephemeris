@@ -188,6 +188,13 @@ pub fn run(config_path: &Path) -> Result<()> {
             .events
             .emit("config.failed_at_start", "dataplane", detail);
     }
+    // A confirmed commit still pending from before this start (a push that
+    // needed the restart, say): its deadline goes on.
+    let pending = shared.config.lock().unwrap().pending_confirm();
+    if let Some((id, left)) = pending {
+        info!(target: crate::logging::cat::CONFIG, "commit {id} still waits for confirmation: {left}s left");
+        api::watch_confirm(shared.clone(), id, left);
+    }
     // The controller, if this router is enrolled with one (followed even
     // with management off: it's how a managed router is reached).
     if let Some(id) = shared.controller_identity.clone() {

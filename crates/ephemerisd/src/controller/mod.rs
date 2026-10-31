@@ -13,6 +13,7 @@
 
 pub mod events;
 pub mod link;
+pub mod requests;
 pub mod tls;
 
 use crate::sdwan::{hex, parse_hex32};
