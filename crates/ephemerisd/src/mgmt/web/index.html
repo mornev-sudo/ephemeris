@@ -51,6 +51,8 @@
   th { font-size: 12px; font-weight: 500; color: var(--muted); }
   tr:last-child td { border-bottom: 0; }
   td.mono, .mono { font-family: var(--mono); font-size: 12.5px; }
+  input.wide { flex: 1 1 28em; min-width: 0; }
+  .key { overflow-wrap: anywhere; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; border: 1px solid var(--line); }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
   input, textarea, select { font: inherit; color: var(--text); background: var(--bg);
@@ -322,6 +324,18 @@
       </div>
       <div id="sysmsg"></div>
       <pre class="diff hidden" id="sysout"></pre>
+    </section>
+    <section><h2>Controller</h2>
+      <p class="s">A controller manages many routers from one place. This router connects out to it,
+        so it needs no open ports. To enrol it, paste the one-time enrolment string the controller's
+        administrator gives you.</p>
+      <div class="grid" id="ctlcards"></div>
+      <p class="s">This router's key, as the controller knows it: <span class="mono key" id="ctlkey"></span></p>
+      <form id="ctlform" class="row hidden" autocomplete="off">
+        <input id="ctlenrol" class="mono wide" placeholder="eph-enrol:v1:https://…" aria-label="Enrolment string" spellcheck="false" autocomplete="off">
+        <button class="btn primary" type="submit">Enrol</button>
+      </form>
+      <div id="ctlmsg"></div>
     </section>
     <section><h2>Admin password</h2>
       <p class="s">Used for the web portal (user admin) and for root on the console and SSH.</p>

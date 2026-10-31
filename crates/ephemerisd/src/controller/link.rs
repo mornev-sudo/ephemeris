@@ -61,13 +61,16 @@ pub enum State {
     /// No `[controller]` section: not managed.
     #[default]
     Off,
-    /// Enrolling by itself, from the boot credential (zero-touch).
+    /// Enrolling by itself, from a string handed over at deployment.
     Enrolling,
     Connecting,
     Connected,
     /// The controller doesn't know this router's key: it needs a new
     /// enrolment (an administrator's token). Retried with backoff anyway.
     NotEnrolled,
+    /// Enrolled with a claim token: waiting for an administrator to approve
+    /// this router (comparing its key). Retried with backoff.
+    Pending,
     /// The last attempt failed (see `error`); retrying with backoff.
     Failed,
 }
@@ -213,7 +216,7 @@ where
 /// Enrol with a one-time token: `enrol`, then `hello` on the same
 /// connection. A router the controller already knows (`already_enrolled`)
 /// just says hello. The controller's id for this router.
-pub async fn enrol(e: &Enrolment, identity: &Identity, hello: Value) -> Result<u64> {
+pub async fn enrol(e: &Enrolment, identity: &Identity, hello: Value) -> Result<Enrolled> {
     let mut ws = connect(&e.url, e.fingerprint, identity).await?;
     send(
         &mut ws,
@@ -221,13 +224,47 @@ pub async fn enrol(e: &Enrolment, identity: &Identity, hello: Value) -> Result<u
     )
     .await?;
     match answer(&mut ws, 1).await {
+        // A claim token: registered, waiting for an administrator.
+        Ok(ok) if ok["pending"] == true => {
+            let _ = ws.close(None).await;
+            let router_id = ok["router_id"]
+                .as_u64()
+                .context("the controller's pending answer has no router_id")?;
+            return Ok(Enrolled {
+                router_id,
+                pending: true,
+            });
+        }
         Ok(_) => {}
         Err(err) if refused_with(&err, "already_enrolled") => {}
         Err(err) => return Err(err),
     }
-    let id = say_hello(&mut ws, hello, 2).await?;
+    let router_id = say_hello(&mut ws, hello, 2).await?;
     let _ = ws.close(None).await;
-    Ok(id)
+    Ok(Enrolled {
+        router_id,
+        pending: false,
+    })
+}
+
+/// What enrolling got: the controller's id for this router, and whether it
+/// waits for an administrator's approval (a claim token) before `hello`
+/// works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Enrolled {
+    pub router_id: u64,
+    pub pending: bool,
+}
+
+/// A key as people compare it (on the console, in the controller): the
+/// first 32 hex characters in groups of four.
+pub fn key_groups(key: &[u8; 32]) -> String {
+    let h = hex(key);
+    h.as_bytes()[..32]
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).expect("hex"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The router as the link sees it: what it reports and what it does when
@@ -518,7 +555,7 @@ fn jittered(d: Duration) -> Duration {
 /// trying again (the controller couldn't be reached: the network may not
 /// be up yet); `None` once it worked, or can't (a refused token: spent,
 /// expired or revoked, so a new one is needed).
-async fn enrol_from_credential(
+async fn enrol_handed_over(
     shared: &Arc<Shared>,
     state_dir: &std::path::Path,
     e: Enrolment,
@@ -534,31 +571,85 @@ async fn enrol_from_credential(
     };
     set(State::Enrolling, None);
     match enrol(shared, &e).await {
-        Ok((id, _)) => {
+        Ok((enrolled, _)) => {
+            let id = enrolled.router_id;
             info!(target: crate::logging::cat::MGMT,
-                "enrolled with controller {} as router {id}, from the boot credential", e.url);
+                "enrolled with controller {} as router {id}, as handed over at deployment", e.url);
             mark_used(state_dir, &e);
             None
         }
         Err(EnrolError::Controller(err)) if err.downcast_ref::<Refused>().is_some() => {
             tracing::error!(target: crate::logging::cat::MGMT,
-                "controller {} refused the boot credential's enrolment ({err:#}): it needs a new one", e.url);
+                "controller {} refused the enrolment handed over at deployment ({err:#}): it needs a new one", e.url);
             set(State::Failed, Some(format!("{err:#}")));
             None
         }
         Err(EnrolError::Controller(err)) => {
             if backoff == Duration::from_secs(1) {
                 warn!(target: crate::logging::cat::MGMT,
-                    "enrolling with controller {} from the boot credential: {err:#} (retrying)", e.url);
+                    "enrolling with controller {} as handed over at deployment: {err:#} (retrying)", e.url);
             }
             set(State::Enrolling, Some(format!("{err:#}")));
             Some(e)
         }
         Err(err) => {
-            tracing::error!(target: crate::logging::cat::MGMT, "enrolling from the boot credential: {err}");
+            tracing::error!(target: crate::logging::cat::MGMT, "enrolling as handed over at deployment: {err}");
             set(State::Failed, Some(err.to_string()));
             None
         }
+    }
+}
+
+/// The console's login prompt shows this (`/etc/issue.d` links to it), so
+/// whoever installs a router sees its key and whether it's managed.
+const BANNER: &str = "/run/ephemeris-issue/controller.issue";
+
+/// The banner's lines for where the link stands.
+fn banner_text(status: &Status, key: Option<&str>) -> String {
+    let url = status.url.as_deref().unwrap_or("");
+    let short = |e: &Option<String>| {
+        let e = e.as_deref().unwrap_or("");
+        e.chars().take(60).collect::<String>()
+    };
+    let controller = match status.state {
+        State::Off => {
+            "not managed (enrol: ephctl controller enrol <string>, or the portal)".to_string()
+        }
+        State::Enrolling => format!("enrolling with {url}"),
+        State::Connecting => format!("connecting to {url}"),
+        State::Connected => match status.router_id {
+            Some(id) => format!("connected to {url} (router {id})"),
+            None => format!("connected to {url}"),
+        },
+        State::NotEnrolled => format!("{url} doesn't know this router: enrol it again"),
+        State::Pending => format!("waiting for approval at {url}: compare the key below there"),
+        State::Failed => format!("can't reach {url}: {}", short(&status.error)),
+    };
+    // agetty reads backslashes as escapes: none of ours.
+    let line = |label: &str, v: &str| format!("  {label} : {}\n", v.replace('\\', "/"));
+    format!(
+        "{}{}\n",
+        line("Controller", &controller),
+        line(
+            "Router key",
+            key.unwrap_or("(none: see `ephctl log show -c mgmt`)")
+        )
+    )
+}
+
+/// Keep [`BANNER`] up to date (where it can be written: on the router).
+async fn banner(shared: Arc<Shared>) {
+    let key = shared
+        .controller_identity
+        .as_ref()
+        .map(|i| format!("{} ...", key_groups(&i.public())));
+    let mut shown = String::new();
+    loop {
+        let text = banner_text(&shared.controller.lock().unwrap(), key.as_deref());
+        if text != shown && std::fs::write(BANNER, &text).is_ok() {
+            shown = text;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -578,6 +669,7 @@ pub fn spawn(shared: Arc<Shared>, identity: Arc<Identity>) -> std::io::Result<()
 }
 
 async fn follow(shared: Arc<Shared>, identity: Arc<Identity>) {
+    tokio::spawn(banner(shared.clone()));
     let mut backoff = Duration::from_secs(1);
     let section = || shared.config.lock().unwrap().running().controller.clone();
     let state_dir = {
@@ -588,14 +680,12 @@ async fn follow(shared: Arc<Shared>, identity: Arc<Identity>) {
             .to_path_buf()
     };
     // Zero-touch: an enrolment string handed over at boot, not used yet.
-    let mut zero_touch = super::enrolment::from_credential(&state_dir);
+    let mut zero_touch = super::enrolment::handed_over(&state_dir);
     loop {
         let Some(cfg) = section() else {
             match zero_touch.take() {
                 Some(e) => {
-                    if let Some(retry) =
-                        enrol_from_credential(&shared, &state_dir, e, backoff).await
-                    {
+                    if let Some(retry) = enrol_handed_over(&shared, &state_dir, e, backoff).await {
                         zero_touch = Some(retry);
                         tokio::time::sleep(jittered(backoff)).await;
                         backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -644,6 +734,12 @@ async fn follow(shared: Arc<Shared>, identity: Arc<Identity>) {
                 warn!(target: crate::logging::cat::MGMT, "controller {} doesn't know this router: it needs enrolling again", cfg.url);
                 set(State::NotEnrolled, Some(format!("{e:#}")));
             }
+            Err(e) if refused_with(&e, "pending") => {
+                if shared.controller.lock().unwrap().state != State::Pending {
+                    info!(target: crate::logging::cat::MGMT, "controller {}: waiting for an administrator to approve this router", cfg.url);
+                }
+                set(State::Pending, None);
+            }
             Err(e) => {
                 if !was_up {
                     warn!(target: crate::logging::cat::MGMT, "controller {}: {e:#}", cfg.url);
@@ -683,6 +779,30 @@ mod tests {
             ("10.0.0.5".into(), 8443, "/acme/v1/router".into())
         );
         assert!(split_url("http://c.example.net/").is_err());
+    }
+
+    #[test]
+    fn the_console_banner_says_where_the_link_stands() {
+        let key = "ab".repeat(32);
+        let off = banner_text(&Status::default(), Some(&key));
+        assert!(off.contains("not managed") && off.contains(&key), "{off}");
+        let up = Status {
+            state: State::Connected,
+            url: Some("https://c.example.net/".into()),
+            router_id: Some(12),
+            ..Default::default()
+        };
+        assert!(banner_text(&up, Some(&key))
+            .contains("connected to https://c.example.net/ (router 12)"));
+        let down = Status {
+            state: State::Failed,
+            url: Some("https://c.example.net/".into()),
+            error: Some(format!("C:\\{}", "x".repeat(200))),
+            ..Default::default()
+        };
+        let text = banner_text(&down, None);
+        assert!(!text.contains('\\'), "no escapes for agetty: {text}");
+        assert!(text.lines().all(|l| l.len() < 120), "{text}");
     }
 
     #[test]
@@ -734,6 +854,8 @@ mod tests {
     }
 
     const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO_-";
+    /// A reusable claim token: enrolled, but waiting for approval.
+    const CLAIM: &str = "CLAIMCLAIMCLAIMCLAIMCLAIMCLAIMCLAIMCLAIMCLA";
 
     /// A controller for one connection, playing the contract's part: it
     /// checks the token and that `enrol`'s key is the client certificate's,
@@ -775,21 +897,29 @@ mod tests {
             let mut ws = tokio_tungstenite::accept_async(tls).await.unwrap();
             let mut seen = Vec::new();
             let mut enrolled = known;
+            let mut pending = false;
             while let Some(Ok(msg)) = ws.next().await {
                 let Message::Text(t) = msg else { continue };
                 let v: Value = serde_json::from_str(&t).unwrap();
                 seen.push(v.clone());
                 let id = v["id"].clone();
                 let reply = match v["type"].as_str().unwrap() {
-                    "enrol" if v["token"] != TOKEN => {
+                    "enrol" if v["token"] != TOKEN && v["token"] != CLAIM => {
                         json!({"type": "result", "id": id, "error": {"code": "invalid_token", "message": ""}})
                     }
                     "enrol" if v["key"] != client_key.as_str() => {
                         json!({"type": "result", "id": id, "error": {"code": "bad_request", "message": "key"}})
                     }
+                    "enrol" if v["token"] == CLAIM => {
+                        pending = true;
+                        json!({"type": "result", "id": id, "ok": {"pending": true, "router_id": 13}})
+                    }
                     "enrol" => {
                         enrolled = true;
                         json!({"type": "result", "id": id, "ok": {"router_id": 12}})
+                    }
+                    "hello" if pending => {
+                        json!({"type": "result", "id": id, "error": {"code": "pending", "message": ""}})
                     }
                     "hello" if !enrolled => {
                         json!({"type": "result", "id": id, "error": {"code": "not_enrolled", "message": ""}})
@@ -860,7 +990,14 @@ mod tests {
         let (url, pin, server) = controller(false).await;
         let id = Identity::from_seed([5; 32]);
         let e = Enrolment::parse(&format!("eph-enrol:v1:{url}#{TOKEN}@{}", hex(&pin))).unwrap();
-        assert_eq!(enrol(&e, &id, hello_msg()).await.unwrap(), 12);
+        let got = enrol(&e, &id, hello_msg()).await.unwrap();
+        assert_eq!(
+            got,
+            Enrolled {
+                router_id: 12,
+                pending: false
+            }
+        );
         let seen = server.await.unwrap();
         assert_eq!(seen[0]["type"], "enrol");
         assert_eq!(seen[0]["key"], hex(&id.public()));
@@ -868,6 +1005,29 @@ mod tests {
             (seen[1]["type"].as_str(), seen[1]["id"].as_u64()),
             (Some("hello"), Some(2))
         );
+    }
+
+    #[tokio::test]
+    async fn a_claim_token_waits_for_approval() {
+        let (url, pin, server) = controller(false).await;
+        let id = Identity::from_seed([8; 32]);
+        let e = Enrolment::parse(&format!("eph-enrol:v1:{url}#{CLAIM}@{}", hex(&pin))).unwrap();
+        let got = enrol(&e, &id, hello_msg()).await.unwrap();
+        assert_eq!(
+            got,
+            Enrolled {
+                router_id: 13,
+                pending: true
+            }
+        );
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 1, "no hello while pending: {seen:?}");
+    }
+
+    #[test]
+    fn keys_are_compared_in_groups_of_four() {
+        let key = [0xab; 32];
+        assert_eq!(key_groups(&key), "abab abab abab abab abab abab abab abab");
     }
 
     #[tokio::test]

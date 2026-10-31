@@ -94,9 +94,34 @@ The router presents its client certificate (self-signed, its management
 key) on **every** connection, the enrolling one included; a controller
 refuses connections without one.
 
-**Zero-touch:** given the string as the `ephemeris.controller` credential
-(e.g. `ENROL=... lab/proxmox/deploy-image.sh`), a router with no
-`[controller]` section enrols by itself when it starts. It retries with
+**Claim tokens:** a controller may also hand out a reusable token, per
+organisation and optionally per site, so every router deployed there can
+carry the same string (an image, an installer, a VM template). It's
+revocable and may expire; the controller caps how many routers may wait
+on one. Enrolling with it answers
+
+```json
+{"type": "result", "id": 1, "ok": {"pending": true, "router_id": 13}}
+```
+
+and the router doesn't say `hello` on that connection. It commits its
+`[controller]` section and keeps connecting with its normal backoff; until
+an administrator approves it, `hello` is refused with `pending` and the
+connection closed. An administrator approves it after comparing its key
+with the one on the router's console, both shown the same way: the first
+32 hex characters of the management public key in groups of four
+(`e42f 3624 8630 d97c 2540 b12b 6160 28a2`). Rejecting a router blocks
+its key: further enrolments from it, with any claim token, get
+`invalid_token`. A controller stores no telemetry from a waiting router
+and pushes it no config. Single-use tokens work as before, with no
+approval.
+
+**Zero-touch:** given the string at deployment, a router with no
+`[controller]` section enrols by itself when it starts. The string comes
+from the `ephemeris.controller` credential (a VM's SMBIOS strings, e.g.
+`ENROL=... lab/proxmox/deploy-image.sh`) or, where a VM or a bare-metal
+install can't pass credentials, the file `/var/lib/ephemeris/enrolment`
+(written by an installer or by hand; removed once used). It retries with
 backoff while the controller can't be reached (the WAN may not be up
 yet), and gives up on a refused token, which then needs a new string. It
 remembers the SHA-256 of the string it enrolled with
@@ -173,6 +198,7 @@ whether a push is waiting:
 |---|---|---|
 | `invalid_token` | the token is wrong, used, revoked or expired (one code, so it doesn't say which) | the controller closes the connection |
 | `already_enrolled` | `enrol` from a key that's enrolled already | the router sends `hello` instead |
+| `pending` | `hello` from a router enrolled with a claim token that no administrator has approved yet | the controller closes the connection; the router keeps reconnecting with backoff and shows "waiting for approval" on its console |
 | `not_enrolled` | `hello` from a key the controller doesn't know | the controller closes the connection; the router keeps reconnecting with backoff and shows "not enrolled" in its status. It never re-enrols by itself: that takes a new token from an administrator |
 | `unsupported_protocol` | the controller doesn't speak the router's `protocol` | the controller closes the connection |
 | `bad_request` | a malformed message, or a field out of range | |

@@ -311,7 +311,50 @@ async function refreshSystem() {
   const c = card(t, v, note);
   if (s.update && s.update.phase === "installed") c.classList.add("warnbox");
   $("syscards").replaceChildren(card("Running version", "v" + s.version, "build " + s.build), c);
+  await refreshController();
 }
+
+// The link to a controller: where it stands, and enrolling.
+const ctlStates = {
+  off: ["Not managed", "Paste an enrolment string below to enrol"],
+  enrolling: ["Enrolling…", "with the string handed over at deployment"],
+  connecting: ["Connecting…", ""],
+  connected: ["Connected", ""],
+  "not-enrolled": ["Not enrolled", "The controller doesn't know this router: enrol it again"],
+  pending: ["Waiting for approval", "An administrator approves it there, comparing this router's key"],
+  failed: ["Can't reach it", ""],
+};
+async function refreshController() {
+  const [st, id] = await Promise.all([api("GET", "/controller"), api("GET", "/controller/identity")]);
+  const [v, note] = ctlStates[st.state] || [st.state, ""];
+  const sub = [st.url, st.router_id != null ? "router " + st.router_id : "", st.error || note]
+    .filter(Boolean).join(" · ");
+  const c = card("Controller", v, sub);
+  if (st.state === "failed" || st.state === "not-enrolled") c.classList.add("warnbox");
+  const cards = [c];
+  if (st.events_dropped) cards.push(card("Events not sent", String(st.events_dropped), "over the rate limit, or queued too long"));
+  $("ctlcards").replaceChildren(...cards);
+  // As people compare it: the first 32 hex characters in groups of four.
+  const k = id.public_key || "";
+  $("ctlkey").textContent = k ? `${k.slice(0, 32).match(/.{4}/g).join(" ")} … (${k})` : "none (see the log, category mgmt)";
+  // Only a router that isn't managed can be enrolled (remove [controller] first).
+  $("ctlform").classList.toggle("hidden", st.state !== "off");
+}
+function ctlmsg(t, cls) { $("ctlmsg").textContent = t; $("ctlmsg").className = cls || ""; }
+$("ctlform").onsubmit = async (e) => {
+  e.preventDefault();
+  const s = $("ctlenrol").value.trim();
+  if (!s) return;
+  ctlmsg("Enrolling…");
+  try {
+    const r = await api("POST", "/controller/enrol", JSON.stringify({ enrolment: s }), true);
+    $("ctlenrol").value = "";
+    ctlmsg(r.pending
+      ? `Enrolled as router ${r.router_id}: waiting for an administrator to approve it (they compare its key).`
+      : `Enrolled: this router is router ${r.router_id} there. It connects in a few seconds.`, "ok");
+  } catch (err) { ctlmsg(err.message, "bad"); }
+  refreshController().catch(() => {});
+};
 function sysmsg(t, cls) { $("sysmsg").textContent = t; $("sysmsg").className = cls || ""; }
 $("syscheck").onclick = async () => { sysmsg("Checking…"); try {
   const r = await api("POST", "/system/update/check");

@@ -1,9 +1,10 @@
-# Publish a release by *promoting* an image that the "image" workflow already
-# built and boot-tested for the tagged commit (or, if that commit only changed
-# docs, for the nearest earlier one). Nothing is rebuilt, so the released
-# bytes are exactly the bytes that passed the boot test.
+# Publish a release: build the tagged commit's image with the real signing
+# keys, test it in full (the same "image" workflow pull requests run: unit
+# tests, fuzzing, the SD-WAN lab, then the image's boot and end-to-end test),
+# and publish exactly the image that passed.
 #
-#   git tag v0.1.0 <commit> && git push origin v0.1.0
+#   (bump the version in Cargo.toml and add docs/releases/vX.Y.Z.md on main)
+#   git tag -a vX.Y.Z <commit> -m "Ephemeris vX.Y.Z: ..." && git push origin vX.Y.Z
 name: release
 
 on:
@@ -11,91 +12,73 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write # create the release
-  actions: read   # find the image run and download its artifact
+  contents: read
 
 jobs:
-  promote:
+  # Before anything is built: the tag must name the release in Cargo.toml,
+  # and its notes must be there.
+  check:
     runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag, version and notes
+        run: |
+          release=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [[ "v$release" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml's version ($release). Set version = \"${GITHUB_REF_NAME#v}\" in Cargo.toml, push, then tag that commit."
+            exit 1
+          fi
+          test -s "docs/releases/$GITHUB_REF_NAME.md" || {
+            echo "::error::no release notes: add docs/releases/$GITHUB_REF_NAME.md, push, then tag that commit."
+            exit 1
+          }
+
+  image:
+    needs: check
+    uses: ./.github/workflows/image.yml
+    with:
+      release: true
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  publish:
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release
+      actions: read   # download this run's image
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # History is needed to tell docs-only commits from code changes.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Find the tested image for this commit
-        id: run
-        run: |
-          # Docs-only commits don't get an image of their own (image.yml
-          # skips them), so a tag on one promotes the image of the nearest
-          # earlier commit that has one, provided nothing but docs changed
-          # since. Keep DOCS_ONLY in sync with paths-ignore in image.yml.
-          DOCS_ONLY='(\.md$|^docs/|^LICENSE-)'
-          tag_sha=$GITHUB_SHA
-
-          # The image run for one commit: waits while it's still running.
-          # Prints "<id> <conclusion>", or nothing if the commit has no run.
-          image_run() {
-            local run
-            for _ in $(seq 1 60); do
-              run=$(gh run list --workflow image.yml --commit "$1" --event push \
-                      --json databaseId,status,conclusion \
-                      -q 'map(select(.conclusion == "success" or .status != "completed")) | .[0] // empty')
-              [[ -n $run ]] || { gh run list --workflow image.yml --commit "$1" --event push \
-                      --json databaseId,conclusion -q '.[0] | select(.) | "\(.databaseId) \(.conclusion)"'; return; }
-              [[ $(jq -r .status <<<"$run") == completed ]] && { jq -r '"\(.databaseId) \(.conclusion)"' <<<"$run"; return; }
-              echo "image run $(jq -r .databaseId <<<"$run") for ${1::8} still in progress, waiting..." >&2
-              sleep 30
-            done
-          }
-
-          for sha in $(git rev-list --max-count=100 "$tag_sha"); do
-            if [[ $sha != "$tag_sha" ]] && git diff --name-only "$sha" "$tag_sha" | grep -qvE "$DOCS_ONLY"; then
-              echo "::error::No successful 'image' run for ${tag_sha::8}, and code changed since the last tested commit. Push it to main, wait for its image build to pass, then tag it."
-              exit 1
-            fi
-            read -r id conclusion <<<"$(image_run "$sha")"
-            [[ -z ${id:-} ]] && continue   # no image for this commit: docs only
-            if [[ $conclusion != success ]]; then
-              echo "::error::The image run for ${sha::8} ($id) didn't pass. Fix it, push, wait for CI, then tag."
-              exit 1
-            fi
-            [[ $sha == "$tag_sha" ]] || echo "${tag_sha::8} only changes docs: promoting the image tested at ${sha::8}"
-            echo "id=$id" >> "$GITHUB_OUTPUT"
-            echo "Promoting image from run $id"
-            exit 0
-          done
-          echo "::error::No tested image found for ${tag_sha::8} or the commits before it."
-          exit 1
 
       - name: Download the tested image
-        run: gh run download "${{ steps.run.outputs.id }}" -n ephemeris-image -D dist
+        run: gh run download "$GITHUB_RUN_ID" -n ephemeris-image -D dist
 
       - name: Verify and publish
         run: |
           cd dist
           sha256sum -c SHA256SUMS
-          # The image must be the release the tag names: v0.5.0 only for an
-          # image built from a commit whose Cargo.toml says 0.5.0.
+          # The image must be the release the tag names, built from this
+          # commit: v0.5.0 only for build 0.5.0-<this commit>.
           build=$(cat VERSION)
           rel=${GITHUB_REF_NAME#v}
-          if [[ ! $build =~ ^${rel//./\\.}-[0-9a-f]{7}$ ]]; then
-            echo "::error::tag $GITHUB_REF_NAME doesn't match the image's release (build $build). Set version = \"${GITHUB_REF_NAME#v}\" in Cargo.toml, push, wait for CI, then tag that commit."
+          if [[ $build != "$rel-${GITHUB_SHA::7}" ]]; then
+            echo "::error::the image is build $build, not $rel-${GITHUB_SHA::7}"
             exit 1
           fi
-          test -s SHA256SUMS.gpg || { echo "::error::image run produced no SHA256SUMS.gpg"; exit 1; }
+          test -s SHA256SUMS.gpg || { echo "::error::the build produced no SHA256SUMS.gpg"; exit 1; }
           # The release notes live in the repo, written with the release
           # commit; the build line and GitHub's list of PRs go under them.
-          notes_file=../docs/releases/$GITHUB_REF_NAME.md
-          test -s "$notes_file" || { echo "::error::no release notes: add docs/releases/$GITHUB_REF_NAME.md to the release commit, then tag it again."; exit 1; }
-          notes="$(cat "$notes_file")
+          notes="$(cat "../docs/releases/$GITHUB_REF_NAME.md")
 
           ---
 
-          Image build \`$build\` (commit ${GITHUB_SHA::8}), boot-tested in [run ${{ steps.run.outputs.id }}](https://github.com/$GH_REPO/actions/runs/${{ steps.run.outputs.id }})."
+          Image build \`$build\` (commit ${GITHUB_SHA::8}), signed and boot-tested in [run $GITHUB_RUN_ID](https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID)."
           # The qcow2 is for new routers; the .raw.xz and .efi files are what
           # existing routers download to update themselves (systemd-sysupdate).
           gh release create "$GITHUB_REF_NAME" --title "Ephemeris $GITHUB_REF_NAME" \

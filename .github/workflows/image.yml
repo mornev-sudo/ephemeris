@@ -1,20 +1,25 @@
-# Test, build the Ephemeris OS image and boot it in QEMU. Every successful run
-# leaves a tested image as an artifact; tagging that commit v* later promotes
-# the very same image to a release (release.yml), without rebuilding.
+# Test, build the Ephemeris OS image and boot it in QEMU.
+#
+# Pull requests run it in full before they're merged, so merging doesn't run
+# it again. A release runs it too (release.yml calls it for a v* tag, with
+# `release: true`): that build alone is signed with the real keys and
+# attested, and the image that passes its boot test is the one published.
 name: image
 
-# Commits that only change documentation don't build or test an image
-# (keep this list in sync with DOCS_ONLY in release.yml).
+# Pull requests that only change documentation don't build or test an image.
 on:
-  push:
-    branches: [main]
-    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
   pull_request:
     paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: "Sign with the real keys and attest (release.yml only)"
+        type: boolean
+        default: false
 
-# A newer push to a pull request cancels its run still going. Builds of
-# main each get their own group, so every commit there is built and tested.
+# A newer push to a pull request cancels its run still going. Other runs
+# (releases, manual ones) each get their own group.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -95,12 +100,12 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # main uses the environment holding the real signing keys (only main
-    # may); everything else a key-less one.
-    environment: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'release-signing' || 'ci-test' }}
+    # A release uses the environment holding the real signing keys (only
+    # release tags may); everything else a key-less one.
+    environment: ${{ inputs.release && startsWith(github.ref, 'refs/tags/v') && 'release-signing' || 'ci-test' }}
     permissions:
       contents: read
-      id-token: write      # build provenance attestation (main only)
+      id-token: write      # build provenance attestation (releases only)
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,17 +136,17 @@ jobs:
       - name: Tools for converting and booting the image
         run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-utils qemu-system-x86 ovmf xz-utils
 
-      # Builds of main (the only ones that can become a release) are signed
-      # with the real keys, which live in the "release-signing" environment:
-      # only main may use it, so a pull request can't reach them, whatever
-      # its workflow file says. Every other build gets throwaway keys made
-      # here, built into that image instead of the real ones, so the boot
-      # test still checks Secure Boot and signed updates end to end.
+      # Release builds are signed with the real keys, which live in the
+      # "release-signing" environment: only v* tags may use it, so a pull
+      # request can't reach them, whatever its workflow file says. Every
+      # other build gets throwaway keys made here, built into that image
+      # instead of the real ones, so the boot test still checks Secure Boot
+      # and signed updates end to end.
       - name: Signing keys
         env:
           SECUREBOOT_KEY: ${{ secrets.SECUREBOOT_KEY }}
           RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
-          RELEASE_BUILD: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          RELEASE_BUILD: ${{ inputs.release && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           umask 077
           if [[ $RELEASE_BUILD == true ]]; then
@@ -185,7 +190,7 @@ jobs:
       # these exact files were built by this workflow from this commit.
       # Check one with: gh attestation verify <file> -R <owner>/<repo>
       - name: Attest build provenance
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: inputs.release && startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: image/mkosi.output/SHA256SUMS
@@ -214,7 +219,7 @@ jobs:
       - name: Upload image
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # Fixed name, so release.yml can find it.
+          # Fixed name: release.yml publishes it.
           name: ephemeris-image
           path: |
             image/mkosi.output/*.qcow2

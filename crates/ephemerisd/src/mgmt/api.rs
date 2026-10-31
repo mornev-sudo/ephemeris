@@ -1112,7 +1112,7 @@ async fn controller_enrol(State(s): St, Json(r): Json<EnrolReq>) -> ApiResult {
     use crate::controller::enrolment::{enrol, EnrolError};
     let e = eph_config::Enrolment::parse(&r.enrolment)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let (router_id, mut v) = enrol(&s, &e).await.map_err(|err| {
+    let (enrolled, mut v) = enrol(&s, &e).await.map_err(|err| {
         let code = match err {
             EnrolError::Managed(_) => StatusCode::CONFLICT,
             EnrolError::NoIdentity => StatusCode::SERVICE_UNAVAILABLE,
@@ -1121,7 +1121,8 @@ async fn controller_enrol(State(s): St, Json(r): Json<EnrolReq>) -> ApiResult {
         };
         ApiError(code, err.to_string())
     })?;
-    v["router_id"] = router_id.into();
+    v["router_id"] = enrolled.router_id.into();
+    v["pending"] = enrolled.pending.into();
     Ok(Json(v))
 }
 
