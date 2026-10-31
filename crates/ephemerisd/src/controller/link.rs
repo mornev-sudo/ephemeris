@@ -228,8 +228,9 @@ pub async fn enrol(e: &Enrolment, identity: &Identity, hello: Value) -> Result<u
     Ok(id)
 }
 
-/// What the link reports: the router's state (a test's stand-in).
-pub trait Telemetry {
+/// The router as the link sees it: what it reports and what it does when
+/// asked (the router itself, or a test's stand-in).
+pub trait Managed {
     /// `status`: the `GET /status` body.
     fn status(&self) -> Value;
     /// The parts of the status whose change is told at once (interfaces
@@ -239,6 +240,10 @@ pub trait Telemetry {
     /// The interfaces' names, and the samples newer than `t`.
     fn samples_after(&self, t: u64) -> (Vec<String>, Vec<Value>);
     fn events(&self) -> &Events;
+    /// The running config's version and SHA-256.
+    fn config_version(&self) -> (u64, String);
+    /// Answer request `typ` (see `requests`).
+    fn request(&self, typ: &str, msg: &Value) -> Result<Value, Refused>;
 }
 
 /// How often things happen on a session (shorter in tests).
@@ -278,7 +283,7 @@ pub async fn session<S>(
     hello: Value,
     status: &Mutex<Status>,
     wanted: impl Fn() -> bool,
-    t: &dyn Telemetry,
+    t: &dyn Managed,
     timing: &Timing,
 ) -> Result<()>
 where
@@ -295,6 +300,7 @@ where
     // Straight away: where things stand, the samples still held (at most
     // the last hour) and what happened meanwhile.
     let mut state = t.state();
+    let mut known = t.config_version().0;
     send_status(&mut ws, t).await?;
     let mut newest = send_stats(&mut ws, t, 0).await?;
     for e in t.events().take() {
@@ -311,7 +317,11 @@ where
                 let Some(msg) = msg else { return Ok(()) };
                 heard = Instant::now();
                 match msg? {
-                    Message::Text(text) => answer_request(&mut ws, &text).await?,
+                    Message::Text(text) => {
+                        answer_request(&mut ws, t, &text).await?;
+                        // Changes the controller asked for aren't news to it.
+                        known = t.config_version().0;
+                    }
                     Message::Close(_) => return Ok(()),
                     _ => {}
                 }
@@ -326,6 +336,14 @@ where
                 }
                 for e in t.events().take() {
                     send(&mut ws, e).await?;
+                }
+                // Changed here (the portal, ephctl, a confirm running out):
+                // the controller sees the drift.
+                let (version, sha256) = t.config_version();
+                if version != known {
+                    let msg = json!({"type": "config.changed", "version": version, "sha256": sha256, "by": "local"});
+                    send(&mut ws, msg).await?;
+                    known = version;
                 }
                 let now_state = t.state();
                 let changed = now_state != state && told.elapsed() >= timing.status_at_most;
@@ -346,7 +364,7 @@ where
     }
 }
 
-async fn send_status<S>(ws: &mut WebSocketStream<S>, t: &dyn Telemetry) -> Result<()>
+async fn send_status<S>(ws: &mut WebSocketStream<S>, t: &dyn Managed) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -360,7 +378,7 @@ where
 
 /// The samples newer than `after`, in messages of at most 720; the newest
 /// sample's time sent.
-async fn send_stats<S>(ws: &mut WebSocketStream<S>, t: &dyn Telemetry, after: u64) -> Result<u64>
+async fn send_stats<S>(ws: &mut WebSocketStream<S>, t: &dyn Managed, after: u64) -> Result<u64>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -382,7 +400,7 @@ where
     Ok(newest)
 }
 
-impl Telemetry for Shared {
+impl Managed for Arc<Shared> {
     fn status(&self) -> Value {
         crate::mgmt::api::status_body(self)
     }
@@ -418,10 +436,20 @@ impl Telemetry for Shared {
     fn events(&self) -> &Events {
         &self.events
     }
+
+    fn config_version(&self) -> (u64, String) {
+        let m = self.config.lock().unwrap();
+        let sha: [u8; 32] = Sha256::digest(m.running_text().as_bytes()).into();
+        (m.version(), hex(&sha))
+    }
+
+    fn request(&self, typ: &str, msg: &Value) -> Result<Value, Refused> {
+        super::requests::handle(self, typ, msg)
+    }
 }
 
-/// A request from the controller. None are known yet.
-async fn answer_request<S>(ws: &mut WebSocketStream<S>, text: &str) -> Result<()>
+/// A request from the controller: answered by the router (see `requests`).
+async fn answer_request<S>(ws: &mut WebSocketStream<S>, t: &dyn Managed, text: &str) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -440,23 +468,19 @@ where
         )
         .await;
     }
-    send(
-        ws,
-        error(
-            id,
-            "unknown_type",
-            format!("this router doesn't know {typ:?}"),
-        ),
-    )
-    .await
+    let answer = match t.request(typ, &v) {
+        Ok(ok) => json!({"type": "result", "id": id, "ok": ok}),
+        Err(r) => error(id, &r.code, r.message),
+    };
+    send(ws, answer).await
 }
 
 /// `hello`'s contents: the router and its running config.
 pub fn hello(shared: &Shared) -> Value {
-    let (sha, pending) = {
+    let (version, sha, pending) = {
         let mgr = shared.config.lock().unwrap();
         let sha: [u8; 32] = Sha256::digest(mgr.running_text().as_bytes()).into();
-        (hex(&sha), mgr.pending_confirm_secs())
+        (mgr.version(), hex(&sha), mgr.pending_confirm_secs())
     };
     let hostname = std::fs::read_to_string("/etc/hostname")
         .map(|h| h.trim().to_string())
@@ -465,11 +489,9 @@ pub fn hello(shared: &Shared) -> Value {
         "type": "hello",
         "protocol": PROTOCOL,
         "router": {"version": shared.build, "hostname": hostname},
-        // No version number yet: config history only counts back from the
-        // running one. `sha256` identifies the config meanwhile.
-        "config": {"version": Value::Null, "sha256": sha, "schema": schema()},
+        "config": {"version": version, "sha256": sha, "schema": schema()},
         "pending_confirm": pending,
-        "capabilities": [],
+        "capabilities": ["config", "telemetry"],
     })
 }
 
@@ -531,7 +553,7 @@ async fn follow(shared: Arc<Shared>, identity: Arc<Identity>) {
                 Ok(ws) => {
                     let wanted = || section().as_ref() == Some(&cfg);
                     let timing = Timing::default();
-                    let t: &Shared = &shared;
+                    let t: &Arc<Shared> = &shared;
                     session(ws, hello(&shared), &shared.controller, wanted, t, &timing).await
                 }
                 Err(e) => Err(e),
@@ -707,7 +729,7 @@ mod tests {
                 ws.send(Message::Text(reply.to_string())).await.unwrap();
                 if hello_ok && known {
                     ws.send(Message::Ping(Vec::new())).await.unwrap();
-                    let req = json!({"type": "config.push", "id": 1});
+                    let req = json!({"type": "nothing.known", "id": 1});
                     ws.send(Message::Text(req.to_string())).await.unwrap();
                 }
             }
@@ -723,7 +745,7 @@ mod tests {
         events: Events,
     }
 
-    impl Telemetry for Fake {
+    impl Managed for Fake {
         fn status(&self) -> Value {
             json!({"version": "test", "ports": []})
         }
@@ -740,6 +762,18 @@ mod tests {
         }
         fn events(&self) -> &Events {
             &self.events
+        }
+        fn config_version(&self) -> (u64, String) {
+            (7, "ab".repeat(32))
+        }
+        fn request(&self, typ: &str, _: &Value) -> Result<Value, Refused> {
+            match typ {
+                "config.get" => Ok(json!({"version": 7})),
+                _ => Err(Refused {
+                    code: "unknown_type".into(),
+                    message: typ.into(),
+                }),
+            }
         }
     }
 

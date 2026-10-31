@@ -9,7 +9,7 @@
 use super::diff::diff;
 use crate::config::{Config, Live};
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
@@ -52,11 +52,19 @@ pub struct HistoryEntry {
     pub file: String,
 }
 
+/// A confirmed commit waiting for its confirmation. Kept on disk too
+/// ([`PENDING_FILE`]), so a restart (which a commit may need) neither loses
+/// the deadline nor the config to go back to.
+#[derive(Serialize, Deserialize)]
 struct Pending {
     id: u64,
     deadline_unix: u64,
     previous_text: String,
 }
+
+/// Next to the config: the pending confirm, and the version counter.
+const PENDING_FILE: &str = "pending-confirm.json";
+const VERSION_FILE: &str = "config-version";
 
 /// Largest configuration accepted for staging.
 pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
@@ -70,6 +78,10 @@ pub struct ConfigManager {
     candidate: Option<(String, Config)>,
     pending: Option<Pending>,
     next_id: u64,
+    /// Counts up with every change of the running config (commits and
+    /// rollbacks alike), across restarts: what a controller knows a
+    /// config by, with its SHA-256.
+    version: u64,
     /// Lists the router's NICs, to refuse interfaces on cards that don't
     /// exist. None (tests, `--check`) skips that check.
     nics: Option<fn() -> Vec<super::nics::Nic>>,
@@ -97,17 +109,63 @@ impl ConfigManager {
             }
         }
         crate::files::tighten(state);
-        Ok(ConfigManager {
+        let version = std::fs::read_to_string(dir.join(VERSION_FILE))
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        let pending: Option<Pending> = std::fs::read(dir.join(PENDING_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        let next_id = pending.as_ref().map_or(1, |p| p.id + 1);
+        let mut m = ConfigManager {
             path: path.to_owned(),
             history_dir,
             running_text: text,
             running,
             candidate: None,
-            pending: None,
-            next_id: 1,
+            pending,
+            next_id,
+            version,
             nics: None,
             leases: None,
-        })
+        };
+        // A confirm that ran out while the router was down: go back now,
+        // before anything runs the config that wasn't confirmed.
+        if let Some(p) = m.pending.as_ref().filter(|p| p.deadline_unix <= now_unix()) {
+            let id = p.id;
+            if let Some(r) = m.expire_pending(id) {
+                r.context("rolling back a commit that wasn't confirmed in time")?;
+                tracing::warn!(target: crate::logging::cat::CONFIG,
+                    "commit {id} wasn't confirmed before its deadline: rolled back at start");
+            }
+        }
+        Ok(m)
+    }
+
+    fn state_file(&self, name: &str) -> PathBuf {
+        self.path.parent().unwrap_or(Path::new(".")).join(name)
+    }
+
+    /// The running config's version (see the field).
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The pending confirm, if any: its id and the seconds left.
+    pub fn pending_confirm(&self) -> Option<(u64, u64)> {
+        let p = self.pending.as_ref()?;
+        Some((p.id, p.deadline_unix.saturating_sub(now_unix())))
+    }
+
+    fn save_pending(&self) -> Result<()> {
+        let p = self.state_file(PENDING_FILE);
+        match &self.pending {
+            Some(pending) => crate::files::write_private_atomic(&p, &serde_json::to_vec(pending)?),
+            None => match std::fs::remove_file(&p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            },
+        }
     }
 
     /// Also check new configs with the router's current DHCP leases applied.
@@ -265,6 +323,11 @@ impl ConfigManager {
         self.save_history(&previous)?;
         write_atomic(&self.path, &self.running_text)?;
         self.running = cfg.clone();
+        self.version += 1;
+        write_atomic(
+            &self.state_file(VERSION_FILE),
+            &format!("{}\n", self.version),
+        )?;
         let confirm_id = confirm_secs.map(|secs| {
             let id = self.next_id;
             self.next_id += 1;
@@ -275,6 +338,9 @@ impl ConfigManager {
             });
             id
         });
+        if confirm_id.is_some() {
+            self.save_pending()?;
+        }
         Ok(Committed {
             diff: d,
             apply,
@@ -287,8 +353,8 @@ impl ConfigManager {
     pub fn confirm(&mut self) -> Result<()> {
         self.pending
             .take()
-            .map(drop)
-            .ok_or_else(|| anyhow!("no commit is waiting for confirmation"))
+            .ok_or_else(|| anyhow!("no commit is waiting for confirmation"))?;
+        self.save_pending()
     }
 
     /// Called when a confirmed commit's timer fires: if commit `id` still
@@ -298,6 +364,9 @@ impl ConfigManager {
             return None; // confirmed, or superseded
         }
         let p = self.pending.take().unwrap();
+        if let Err(e) = self.save_pending() {
+            return Some(Err(e));
+        }
         // Restoring what ran before must not be blocked by this machine's
         // checks (e.g. a card that has since gone): skip them.
         let nics = self.nics.take();
@@ -744,6 +813,62 @@ address = "10.10.2.1/24"
         m.confirm().unwrap();
         assert!(m.expire_pending(id).is_none());
         assert_eq!(m.running().routes.len(), 1);
+    }
+
+    #[test]
+    fn the_version_counts_every_change_and_survives_a_restart() {
+        let mut m = manager("version");
+        assert_eq!(m.version(), 1);
+        let text = m.with_route("0.0.0.0/0", "10.10.1.254").unwrap();
+        m.set_candidate(text.clone()).unwrap();
+        m.commit(None).unwrap();
+        assert_eq!(m.version(), 2);
+        m.set_candidate(text).unwrap();
+        m.commit(None).unwrap();
+        assert_eq!(m.version(), 2, "no change, no new version");
+        m.rollback(1).unwrap();
+        assert_eq!(m.version(), 3, "a rollback is a change too");
+        let reopened = ConfigManager::open(m.path()).unwrap();
+        assert_eq!(reopened.version(), 3);
+    }
+
+    #[test]
+    fn a_pending_confirm_survives_a_restart_and_runs_out_during_one() {
+        let mut m = manager("pending");
+        let text = m.with_route("0.0.0.0/0", "10.10.1.254").unwrap();
+        m.set_candidate(text).unwrap();
+        let id = m.commit(Some(600)).unwrap().confirm_id.unwrap();
+        // Restarted (as a push may need): still pending, same deadline.
+        let mut m = ConfigManager::open(m.path()).unwrap();
+        let (again, left) = m.pending_confirm().unwrap();
+        assert_eq!(again, id);
+        assert!((590..=600).contains(&left));
+        assert_eq!(m.running().routes.len(), 1);
+        // Confirmed: nothing pending, before or after another restart.
+        m.confirm().unwrap();
+        assert!(ConfigManager::open(m.path())
+            .unwrap()
+            .pending_confirm()
+            .is_none());
+
+        // A deadline that passed while the router was down: rolled back
+        // as it starts, before the unconfirmed config is used.
+        let text = m.with_route("0.0.0.0/0", "10.10.2.254").unwrap();
+        m.set_candidate(text).unwrap();
+        m.commit(Some(600)).unwrap();
+        let file = m.path().parent().unwrap().join(PENDING_FILE);
+        let mut p: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        p["deadline_unix"] = 1.into();
+        std::fs::write(&file, p.to_string()).unwrap();
+        let m = ConfigManager::open(m.path()).unwrap();
+        assert!(m.pending_confirm().is_none());
+        assert_eq!(
+            m.running().routes[0].via,
+            "10.10.1.254",
+            "the confirmed one again"
+        );
+        assert!(!file.exists());
     }
 
     #[test]

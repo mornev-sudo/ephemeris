@@ -167,7 +167,9 @@ whether a push is waiting:
 | `unsupported_protocol` | the controller doesn't speak the router's `protocol` | the controller closes the connection |
 | `bad_request` | a malformed message, or a field out of range | |
 | `unknown_type` | a message type the receiver doesn't know | |
-| `conflict` | a push whose `base_sha256` isn't the running config's (see [Config](#config)) | |
+| `conflict` | a push whose `base_sha256` isn't the running config's, or while another confirmed commit waits (see [Config](#config)) | |
+| `not_pending` | `config.confirm` with nothing waiting | |
+| `failed` | the router couldn't do it (applying a commit, reading its history); the message says why | |
 
 ## Config
 
@@ -190,15 +192,25 @@ The router:
 
 1. Refuses it if `base_sha256` isn't its running config's (someone changed
    it locally since: `"code": "conflict"`, with the running config's
-   version and hash, so the controller can show the drift and decide).
+   version and hash in the message, so the controller can show the drift
+   and decide), or while an earlier confirmed commit still waits
+   (`conflict` too).
 2. Validates it exactly as `PUT /config` does; errors come back as they
    would in the portal.
 3. Keeps its own `[controller]` section, whatever the push says.
 4. Commits it as a confirmed commit (`confirm_within_secs`, 30 s to
-   1 h), applying it live or after a restart, as `POST /config/commit`
-   does.
-5. Answers with the diff, how it was applied (`live` or
-   `restart-required`) and the new version and hash.
+   1 h; anything else is `bad_request`), applying it live or after a
+   restart, as `POST /config/commit` does. A config staged in the portal
+   but not committed is discarded.
+5. Answers:
+
+   ```json
+   {"type": "result", "id": 7, "ok": {"applied": "live", "diff": "...",
+     "version": 43, "sha256": "...", "confirm_within_secs": 300, "restarting": false}}
+   ```
+
+   `applied` is `live` or `restart-required`; a config that doesn't
+   validate is `bad_request`, with the reason as the portal gives it.
 
 The controller then sends **`config.confirm`** once the router is back
 and healthy with the new config: still connected (or reconnected), and,
@@ -206,17 +218,32 @@ for its own checks, whatever it considers healthy (sessions, tethers up).
 Without it, the router rolls back when the timer runs out, and says so in
 its next `hello`.
 
-**Restart-required pushes** (interfaces, workers, table sizes): the push
-says `"restart": true` and the router restarts itself after committing;
-the confirm timer runs across the restart.
+**Restart-required pushes** (interfaces, workers, table sizes): with
+`"restart": true` the router restarts itself a second after answering
+(`"restarting": true`). The pending confirm is saved on disk, so its
+deadline runs across the restart; if it passed while the router was
+down, the router rolls back as it starts, before the unconfirmed config
+runs. An unconfirmed commit that needed a restart is also undone by
+restarting.
 
-**Local changes** while managed: the router sends `config.changed`
-(version, hash, who: `local:admin` or `local:ssh`) after every commit not
-made by the controller. The controller decides what to do with the drift
-(adopt it into its records, or push its own back).
+**`config.confirm`** answers `{"version": n}`, or `not_pending` when
+nothing waits.
 
-**Reading:** `config.get` returns the running config, its version and
-hash; `config.history` the list of versions (as `GET /config/history`).
+**Local changes** while managed: within a second of any change the
+controller didn't ask for (a commit in the portal or `ephctl`, a rollback,
+a confirm running out), the router sends
+`{"type": "config.changed", "version": n, "sha256": "...", "by": "local"}`.
+The controller decides what to do with the drift (adopt it into its
+records, or push its own back). Changes made while disconnected show in
+the next `hello`.
+
+**Reading:** `config.get` returns `{"config", "version", "sha256"}` for
+the running config; `config.history` returns `{"version", "history"}`,
+the list as `GET /config/history` gives it.
+
+`version` counts up with every change of the running config, commits and
+rollbacks alike, and survives restarts. `hello` carries it, and its
+`capabilities` include `config` and `telemetry`.
 
 ## Telemetry
 
