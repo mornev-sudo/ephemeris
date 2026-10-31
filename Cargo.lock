@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "eph-config"
-version = "0.12.3"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "eph-dataplane",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "eph-dataplane"
-version = "0.12.3"
+version = "0.13.0"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305 0.11.0",
@@ -557,22 +557,22 @@ dependencies = [
 
 [[package]]
 name = "eph-fib"
-version = "0.12.3"
+version = "0.13.0"
 
 [[package]]
 name = "eph-packet"
-version = "0.12.3"
+version = "0.13.0"
 
 [[package]]
 name = "eph-xdp"
-version = "0.12.3"
+version = "0.13.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ephctl"
-version = "0.12.3"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "ephemerisd"
-version = "0.12.3"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "axum",
