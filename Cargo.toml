@@ -59,7 +59,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["h
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 # RFC 3339 timestamps on events for the controller.
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 # The handshake's mac1 (a keyed BLAKE2s, as in WireGuard).
