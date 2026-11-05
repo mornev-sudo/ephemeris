@@ -63,7 +63,7 @@ sha2 = { version = "0.10", default-features = false }
 # RFC 3339 timestamps on events for the controller.
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 # The handshake's mac1 (a keyed BLAKE2s, as in WireGuard).
-blake2 = { version = "0.10", default-features = false }
+blake2 = { version = "0.11", default-features = false }
 # CHAP-MD5 for PPPoE logins (RFC 1994 mandates MD5; nothing else uses it).
 md-5 = { version = "0.11", default-features = false }
 
