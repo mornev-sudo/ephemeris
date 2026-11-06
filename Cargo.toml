@@ -61,7 +61,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
 sha2 = { version = "0.11", default-features = false }
 # RFC 3339 timestamps on events for the controller.
-time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing"] }
 # The handshake's mac1 (a keyed BLAKE2s, as in WireGuard).
 blake2 = { version = "0.11", default-features = false }
 # CHAP-MD5 for PPPoE logins (RFC 1994 mandates MD5; nothing else uses it).

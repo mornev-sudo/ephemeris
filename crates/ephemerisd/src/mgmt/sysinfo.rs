@@ -17,6 +17,17 @@ pub struct CpuTimes {
     pub total: u64,
 }
 
+/// This router's host name: the kernel's (set from the `system.hostname`
+/// credential at boot, which doesn't write `/etc/hostname`), else
+/// `/etc/hostname`; `None` if neither has one.
+pub fn hostname() -> Option<String> {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .map(|h| h.trim().to_string())
+        .find(|h| !h.is_empty() && h != "localhost" && h != "(none)")
+}
+
 /// `/proc/stat`: the "cpu" line (all CPUs), then "cpu0", "cpu1"...
 pub fn parse_proc_stat(text: &str) -> (CpuTimes, Vec<CpuTimes>) {
     let mut all = CpuTimes::default();

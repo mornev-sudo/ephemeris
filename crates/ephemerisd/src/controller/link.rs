@@ -282,7 +282,11 @@ pub trait Managed {
     /// The running config's version and SHA-256.
     fn config_version(&self) -> (u64, String);
     /// Answer request `typ` (see `requests`).
-    fn request(&self, typ: &str, msg: &Value) -> Result<Value, Refused>;
+    fn request<'a>(
+        &'a self,
+        typ: &'a str,
+        msg: &'a Value,
+    ) -> futures_util::future::LocalBoxFuture<'a, Result<Value, Refused>>;
 }
 
 /// How often things happen on a session (shorter in tests).
@@ -482,8 +486,12 @@ impl Managed for Arc<Shared> {
         (m.version(), hex(&sha))
     }
 
-    fn request(&self, typ: &str, msg: &Value) -> Result<Value, Refused> {
-        super::requests::handle(self, typ, msg)
+    fn request<'a>(
+        &'a self,
+        typ: &'a str,
+        msg: &'a Value,
+    ) -> futures_util::future::LocalBoxFuture<'a, Result<Value, Refused>> {
+        Box::pin(super::requests::handle(self, typ, msg))
     }
 }
 
@@ -507,7 +515,7 @@ where
         )
         .await;
     }
-    let answer = match t.request(typ, &v) {
+    let answer = match t.request(typ, &v).await {
         Ok(ok) => json!({"type": "result", "id": id, "ok": ok}),
         Err(r) => error(id, &r.code, r.message),
     };
@@ -521,16 +529,14 @@ pub fn hello(shared: &Shared) -> Value {
         let sha: [u8; 32] = Sha256::digest(mgr.running_text().as_bytes()).into();
         (mgr.version(), hex(&sha), mgr.pending_confirm_secs())
     };
-    let hostname = std::fs::read_to_string("/etc/hostname")
-        .map(|h| h.trim().to_string())
-        .unwrap_or_default();
+    let hostname = crate::mgmt::sysinfo::hostname().unwrap_or_default();
     json!({
         "type": "hello",
         "protocol": PROTOCOL,
         "router": {"version": shared.build, "hostname": hostname},
         "config": {"version": version, "sha256": sha, "schema": schema()},
         "pending_confirm": pending,
-        "capabilities": ["config", "telemetry"],
+        "capabilities": ["config", "telemetry", "operations", "tables"],
     })
 }
 
@@ -597,6 +603,33 @@ async fn enrol_handed_over(
             set(State::Failed, Some(err.to_string()));
             None
         }
+    }
+}
+
+/// Tell the controller how a software update goes: an `update.progress`
+/// event whenever its phase changes (installing, installed and waiting for
+/// a reboot, failed). Checked every 10 s while the router is managed.
+async fn update_progress(shared: Arc<Shared>) {
+    let mut last: Option<Value> = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if shared.config.lock().unwrap().running().controller.is_none() {
+            continue;
+        }
+        let (_, update) = crate::mgmt::api::update_now(&shared).await;
+        let phase = update["phase"].clone();
+        // The first look only learns where things stand.
+        if last.as_ref().is_some_and(|p| *p != phase) {
+            if let Some(state) = phase.as_str().filter(|p| *p != "idle") {
+                let detail = json!({
+                    "state": state,
+                    "version": update["version"].as_str().unwrap_or(""),
+                    "reason": update["detail"].as_str().unwrap_or(""),
+                });
+                shared.events.emit("update.progress", "", detail);
+            }
+        }
+        last = Some(phase);
     }
 }
 
@@ -670,6 +703,7 @@ pub fn spawn(shared: Arc<Shared>, identity: Arc<Identity>) -> std::io::Result<()
 
 async fn follow(shared: Arc<Shared>, identity: Arc<Identity>) {
     tokio::spawn(banner(shared.clone()));
+    tokio::spawn(update_progress(shared.clone()));
     let mut backoff = Duration::from_secs(1);
     let section = || shared.config.lock().unwrap().running().controller.clone();
     let state_dir = {
@@ -970,14 +1004,20 @@ mod tests {
         fn config_version(&self) -> (u64, String) {
             (7, "ab".repeat(32))
         }
-        fn request(&self, typ: &str, _: &Value) -> Result<Value, Refused> {
-            match typ {
-                "config.get" => Ok(json!({"version": 7})),
-                _ => Err(Refused {
-                    code: "unknown_type".into(),
-                    message: typ.into(),
-                }),
-            }
+        fn request<'a>(
+            &'a self,
+            typ: &'a str,
+            _: &'a Value,
+        ) -> futures_util::future::LocalBoxFuture<'a, Result<Value, Refused>> {
+            Box::pin(async move {
+                match typ {
+                    "config.get" => Ok(json!({"version": 7})),
+                    _ => Err(Refused {
+                        code: "unknown_type".into(),
+                        message: typ.into(),
+                    }),
+                }
+            })
         }
     }
 

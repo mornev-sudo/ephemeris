@@ -342,10 +342,7 @@ impl Service<'_> {
         self.servers = servers;
 
         // Clients: kept while the interface stays on DHCP.
-        let hostname = std::fs::read_to_string("/etc/hostname")
-            .ok()
-            .map(|h| h.trim().to_string())
-            .filter(|h| !h.is_empty());
+        let hostname = crate::mgmt::sysinfo::hostname();
         let mut clients = HashMap::new();
         for i in running.interfaces.iter().filter(|i| i.is_dhcp_client()) {
             let Some((port, mac)) = mac_of(&i.name) else {

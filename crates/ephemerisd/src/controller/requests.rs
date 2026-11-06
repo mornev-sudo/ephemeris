@@ -1,7 +1,13 @@
-//! What a controller may ask of the router (docs/controller-api.md,
-//! Config): its config, read and pushed. Everything goes through the same
-//! candidate → check → commit path as a change in the portal, and a push is
-//! always a confirmed commit, so a bad one undoes itself.
+//! What a controller may ask of the router (docs/controller-api.md):
+//!
+//! - **Config:** read and pushed. Everything goes through the same
+//!   candidate → check → commit path as a change in the portal, and a push
+//!   is always a confirmed commit, so a bad one undoes itself.
+//! - **Live tables:** what the portal's pages show, for a controller's
+//!   page someone has open.
+//! - **Operations:** the router's SD-WAN key, software updates, a reboot
+//!   (now or at a set time), restarting ephemerisd: what the portal's
+//!   buttons do, audited as the controller's.
 
 use super::link::Refused;
 use crate::mgmt::configmgr::Apply;
@@ -11,6 +17,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use toml_edit::{value, DocumentMut, Item, Table};
+
+/// Items in a live table's answer, at most (and by default).
+const TABLE_MAX: usize = 1000;
 
 /// How long a push may wait for its confirmation.
 const CONFIRM_SECS: std::ops::RangeInclusive<u64> = 30..=3600;
@@ -29,9 +38,44 @@ fn refused(code: &str, message: impl Into<String>) -> Refused {
     }
 }
 
+fn failed(e: crate::mgmt::api::ApiError) -> Refused {
+    refused("failed", e.1)
+}
+
 /// Answer request `typ` (`ok`, or what to refuse it with).
-pub fn handle(s: &Arc<Shared>, typ: &str, msg: &Value) -> Result<Value, Refused> {
+pub async fn handle(s: &Arc<Shared>, typ: &str, msg: &Value) -> Result<Value, Refused> {
+    use crate::mgmt::api;
+    // Lists: at most `limit` items (1000 at most), and how many there are.
+    let limit = msg["limit"]
+        .as_u64()
+        .map_or(TABLE_MAX, |n| (n as usize).min(TABLE_MAX));
+    let list = |v: Value, total: Option<usize>| {
+        let all = v.as_array().cloned().unwrap_or_default();
+        let total = total.unwrap_or(all.len());
+        json!({ "items": all.into_iter().take(limit).collect::<Vec<_>>(), "total": total })
+    };
     match typ {
+        "sessions.get" => {
+            let total = s.summary().sessions_active as usize;
+            Ok(list(api::sessions_body(s, Some(limit)).await, Some(total)))
+        }
+        "routes.get" => Ok(list(api::routes_body(s), None)),
+        "neighbors.get" => Ok(list(api::neighbors_body(s).await, None)),
+        "dhcp.get" => Ok(api::dhcp_body(s)),
+        "wan.get" => Ok(api::wan_body(s)),
+        "overlay.get" => Ok(api::overlay_body(s)),
+        "overlay.identity" => Ok(crate::mgmt::api::overlay_identity_body(s)),
+        "system.update.check" => crate::mgmt::api::update_check_body().await.map_err(failed),
+        "system.update" => {
+            tracing::info!(target: "audit", "controller: software update started");
+            crate::mgmt::api::update_start_body(s).await.map_err(failed)
+        }
+        "system.reboot" => reboot(msg).await,
+        "restart" => {
+            tracing::warn!(target: "audit", "controller: restart requested");
+            later(s, Duration::from_secs(1));
+            Ok(json!({ "restarting": true }))
+        }
         "config.get" => {
             let m = s.config.lock().unwrap();
             Ok(json!({
@@ -60,6 +104,38 @@ pub fn handle(s: &Arc<Shared>, typ: &str, msg: &Value) -> Result<Value, Refused>
             format!("this router doesn't know {typ:?}"),
         )),
     }
+}
+
+/// `system.reboot`: now, or at `"at"` (RFC 3339, in the next week).
+async fn reboot(msg: &Value) -> Result<Value, Refused> {
+    let secs = match msg["at"].as_str() {
+        None => None,
+        Some(at) => {
+            use time::format_description::well_known::Rfc3339;
+            let when = time::OffsetDateTime::parse(at, &Rfc3339)
+                .map_err(|e| refused("bad_request", format!("at: an RFC 3339 time ({e})")))?;
+            let secs = (when - time::OffsetDateTime::now_utc()).whole_seconds();
+            if !(0..=7 * 86_400).contains(&secs) {
+                return Err(refused("bad_request", "at: within the next week"));
+            }
+            Some(secs as u64)
+        }
+    };
+    match secs {
+        Some(n) if n > 0 => tracing::warn!(target: "audit", "controller: reboot in {n}s"),
+        _ => tracing::warn!(target: "audit", "controller: reboot now"),
+    }
+    crate::mgmt::api::reboot_in(secs).await.map_err(failed)?;
+    Ok(json!({ "in_secs": secs.unwrap_or(0) }))
+}
+
+/// Restart ephemerisd after `delay` (so the answer goes out first).
+fn later(s: &Arc<Shared>, delay: Duration) {
+    let s = s.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        s.stop.store(true, Ordering::Relaxed);
+    });
 }
 
 /// `config.push`: a complete config, made from the running one
@@ -121,11 +197,7 @@ fn push(s: &Arc<Shared>, msg: &Value) -> Result<Value, Refused> {
     let restarting = restart && apply == Apply::RestartRequired;
     if restarting {
         tracing::warn!(target: crate::logging::cat::CONFIG, "restarting for the pushed config");
-        let s = s.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(1));
-            s.stop.store(true, Ordering::Relaxed);
-        });
+        later(s, Duration::from_secs(1));
     }
     v["restarting"] = restarting.into();
     Ok(v)

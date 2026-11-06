@@ -8,4 +8,7 @@ After=network-online.target ephemeris-update-source.service
 
 [Service]
 Type=oneshot
+# Where from: [system] update_url, the deployment's credential or GitHub,
+# as the config says now.
+ExecStartPre=/usr/lib/ephemeris/update-source
 ExecStart=/usr/lib/systemd/systemd-sysupdate update

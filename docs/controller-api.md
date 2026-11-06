@@ -1,15 +1,17 @@
-# The controller contract (draft)
+# The controller contract
 
-**Status: draft, not implemented.** This describes how an Ephemeris router
+**Status:** implemented from router 0.13.0 (config and telemetry); live
+tables and operations from the release after it. This describes how an
+Ephemeris router
 is managed by a controller: one place from which an organisation runs all
 its routers. It's the router's side of the contract: what a router
 promises, and what it accepts. Any controller that speaks it can manage
 Ephemeris routers. How a controller organises sites, templates or users is
 up to the controller, and not described here.
 
-Everything here may still change until the first router release that
-implements it; the protocol is versioned from then on (see
-[Versioning](#versioning)).
+The protocol is versioned (see [Versioning](#versioning)); additions come
+with a capability in `hello`, so a controller can tell what each router
+answers.
 
 ## Principles
 
@@ -178,7 +180,7 @@ The first message after connecting, from the router:
   "router": {"version": "0.13.0-abc1234", "hostname": "cpt-br1"},
   "config": {"version": 42, "sha256": "...", "schema": "0.13"},
   "pending_confirm": null,
-  "capabilities": ["config", "telemetry", "update", "sdwan"]
+  "capabilities": ["config", "telemetry", "operations", "tables"]
 }
 ```
 
@@ -329,6 +331,9 @@ The router sends these unasked. They carry no `id` and get no answer.
   `config.committed`, `config.rolled_back`, `config.failed_at_start`,
   `update.progress`. New releases add kinds; a controller keeps the ones it
   doesn't know as text.
+- `update.progress` has `"state"`: `started` (asked for), `installing`,
+  `installed` (waiting for a reboot to switch), or `failed` (with
+  `"reason"`), and the `"version"` being installed.
 - **Floods are coalesced on the router:** the same kind for the same
   subject (one tether, one interface) within 10 s becomes one event, with
   `"repeats": n` in its `detail`. The router sends at most 60 events a
@@ -364,18 +369,27 @@ capability in `hello`; a controller sends them to no other router.
 
 ## Operations
 
-| Request | Does |
+Routers that answer these list the `operations` capability in `hello`.
+
+| Request | Answer `ok` |
 |---|---|
-| `system.update.check` | as `POST /system/update/check` |
-| `system.update` | install the newest release into the idle slot, from the router's configured update source (which may be the controller, see below) |
-| `system.reboot` | reboot, optionally at a given time (`"at": "2026-11-02T02:00:00Z"`) |
-| `restart` | restart ephemerisd |
-| `overlay.identity` | the router's SD-WAN public key |
+| `overlay.identity` | `{"public_key": "<64 lowercase hex>"}` (or `null`: the router's SD-WAN key pair couldn't be loaded), as `GET /overlay/identity` |
+| `system.update.check` | `{"versions", "available"}`, as `POST /system/update/check` |
+| `system.update` | starts installing the newest release into the idle slot: `{"ok", "version", "note"}`, as `POST /system/update`. Progress follows as `update.progress` events |
+| `system.reboot` | `{"in_secs": n}`: reboots now, or at `"at"` (RFC 3339, within the next week, e.g. `"2026-11-02T02:00:00Z"`; a later or earlier time is `bad_request`) |
+| `restart` | `{"restarting": true}`: restarts ephemerisd a second after answering |
+
+A request the router can't carry out (systemd refusing, say) is `failed`,
+with the reason. All of them are in the router's audit log as the
+controller's.
 
 **Update source.** A controller may serve release files itself, for
 staged rollouts and sites without internet access: it pushes
-`[system] update_url` (a config setting replacing the boot-time
-credential). Whatever the source, the router only installs updates signed
+`[system] update_url` (a directory URL ending in `/`, `http://` or
+`https://`), which wins over the `ephemeris.update_url` credential given at
+deployment. The router uses it from the next update check or install; no
+restart. A router older than the setting refuses such a push as
+`bad_request`. Whatever the source, the router only installs updates signed
 by the Ephemeris release key (chapter 11). The controller chooses *when*,
 never *what*.
 
@@ -416,21 +430,13 @@ on the router for that beyond `overlay.identity`.
 
 ## Router-side work
 
-In this repo, in this order:
+Done: the `eph-config` crate, the management identity, enrolment
+(including zero-touch and claim tokens) and the connection, config push
+with confirms across restarts, telemetry, live tables, operations and
+`[system] update_url`.
 
-1. **`eph-config` crate:** move the config model, parsing and validation
-   out of `ephemerisd` into a library crate, unchanged in behaviour, so a
-   controller can link against it.
-2. **Management identity** (Ed25519) and `ephctl controller identity`.
-3. **`[controller]` section, enrolment** and the connection (WebSocket,
-   pinning, reconnects, `hello`).
-4. **Config push** with conflict check, `[controller]` kept, confirmed
-   commits across restarts, `config.changed`.
-5. **Telemetry:** `status`, `stats`, `event`.
-6. **Operations**, and `[system] update_url` as a config setting.
-7. **Tests:** a minimal test controller in `ci/` that enrols a router,
-   pushes a config, lets one roll back, and checks telemetry, in the
-   end-to-end test.
+Left: an end-to-end test in this repo's CI with a minimal test controller
+(the Orrery side runs one against releases meanwhile).
 
 ## Open questions
 
