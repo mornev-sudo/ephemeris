@@ -38,6 +38,9 @@ pub struct Config {
     /// SSH logins: keys only, or keys and the admin password.
     #[serde(default)]
     pub ssh: SshCfg,
+    /// The router's own software: where updates come from.
+    #[serde(default, skip_serializing_if = "SystemCfg::is_default")]
+    pub system: SystemCfg,
     #[serde(rename = "interface")]
     pub interfaces: Vec<InterfaceCfg>,
     #[serde(default, rename = "route")]
@@ -64,6 +67,44 @@ pub struct Config {
     /// (docs/controller-api.md). Written by enrolment; removing it unenrols.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<ControllerCfg>,
+}
+
+/// `[system]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SystemCfg {
+    /// Where software updates are downloaded from (a directory holding a
+    /// release's files), instead of the deployment's (the
+    /// `ephemeris.update_url` credential) or GitHub's. A controller can
+    /// serve updates for staged rollouts this way. Updates are only
+    /// installed if signed by the release key, whatever the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_url: Option<String>,
+}
+
+impl SystemCfg {
+    fn is_default(&self) -> bool {
+        *self == SystemCfg::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let Some(url) = &self.update_url else {
+            return Ok(());
+        };
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .context("system.update_url must start with https:// or http://")?;
+        let plain = |c: char| c.is_ascii_alphanumeric() || ":/._~%+=,@-".contains(c);
+        if rest.is_empty()
+            || rest.starts_with('/')
+            || !rest.chars().all(plain)
+            || !url.ends_with('/')
+        {
+            bail!("system.update_url must be a plain URL of a directory, ending in /");
+        }
+        Ok(())
+    }
 }
 
 /// `[controller]`: where the router's controller is, and its pinned key.
@@ -1086,6 +1127,7 @@ impl Config {
         if let Some(c) = &self.controller {
             c.validate()?;
         }
+        self.system.validate()?;
         let d = &self.dataplane;
         if d.workers == 0 {
             bail!("dataplane.workers must be at least 1");
@@ -2473,6 +2515,26 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
         assert_eq!(c.management.bind_addr(), (addr("0.0.0.0:9000"), false));
         assert!(with(r#"hostnames = ["evil name"]"#).is_err());
         assert!(with(r#"hostnames = ["router.example.net"]"#).is_ok());
+    }
+
+    #[test]
+    fn the_update_url_is_a_plain_directory_url() {
+        let base = "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n";
+        let with = |url: &str| parse(&format!("{base}[system]\nupdate_url = \"{url}\"\n"));
+        for ok in ["https://mirror.example.net/eph/", "http://10.0.2.2:8000/"] {
+            assert_eq!(with(ok).unwrap().system.update_url.as_deref(), Some(ok));
+        }
+        for bad in [
+            "ftp://x/",
+            "https://mirror.example.net/eph",
+            "https://a b/",
+            "https://x/|rm -rf/",
+            "https://x/&/",
+            "https:///",
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+        assert!(parse(base).unwrap().system.update_url.is_none());
     }
 
     #[test]

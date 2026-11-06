@@ -164,6 +164,17 @@ qm set 9100 --args "$(qm config 9100 | sed -n 's/^args: //p') \
 `ephemeris-update-source.service` then writes overrides to `/run/sysupdate.d/`.
 CI uses exactly this to serve a test update from the build machine.
 
+The same can be set in the router's config, where it wins over the
+credential, and a controller can push it (for staged rollouts):
+
+```toml
+[system]
+update_url = "https://updates.example.net/ephemeris/"
+```
+
+It's read again before every update check and install, so it needs no
+restart.
+
 **Which way the download goes.** By default the router's own connections
 (the update download, DNS, time) use the management port, like any Linux
 machine's. A router with no management network, only its LAN and WAN,

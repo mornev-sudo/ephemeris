@@ -647,12 +647,17 @@ struct Limit {
 }
 
 async fn sessions(State(s): St, Query(q): Query<Limit>) -> Json<Value> {
+    Json(sessions_body(&s, q.limit).await)
+}
+
+/// The newest sessions, at most `limit` (1000): the API, and a controller's
+/// `sessions.get`.
+pub(crate) async fn sessions_body(s: &Shared, limit: Option<usize>) -> Value {
     // The newest sessions (each worker gathers its newest 1000 while
     // someone looks; together, the newest 1000 of those).
     let mut list = s.detail().await.sessions;
     list.sort_by_key(|v| std::cmp::Reverse(v.session.created_ns));
-    let limit = q
-        .limit
+    let limit = limit
         .unwrap_or(crate::report::SESSION_DETAIL)
         .min(crate::report::SESSION_DETAIL);
     let (f, r) = (Dir::Forward as usize, Dir::Reverse as usize);
@@ -674,7 +679,7 @@ async fn sessions(State(s): St, Query(q): Query<Limit>) -> Json<Value> {
             })
         })
         .collect();
-    Json(Value::Array(out))
+    Value::Array(out)
 }
 
 #[derive(Deserialize)]
@@ -841,6 +846,11 @@ async fn stats_resources(State(s): St) -> Json<Value> {
 }
 
 async fn neighbors(State(s): St) -> Json<Value> {
+    Json(neighbors_body(&s).await)
+}
+
+/// The neighbours (ARP): the API, and a controller's `neighbors.get`.
+pub(crate) async fn neighbors_body(s: &Shared) -> Value {
     let ports = s.ports.read().unwrap().clone();
     let out: Vec<Value> = s
         .detail()
@@ -855,11 +865,16 @@ async fn neighbors(State(s): St) -> Json<Value> {
             })
         })
         .collect();
-    Json(Value::Array(out))
+    Value::Array(out)
 }
 
 /// Every outside interface: how it gets its address and how that's going.
 async fn wan_status(State(s): St) -> Json<Value> {
+    Json(wan_body(&s))
+}
+
+/// The internet connections: the API, and a controller's `wan.get`.
+pub(crate) fn wan_body(s: &Shared) -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -911,12 +926,17 @@ async fn wan_status(State(s): St) -> Json<Value> {
             }
         })
         .collect();
-    Json(Value::Array(out))
+    Value::Array(out)
 }
 
 /// DHCP: what each DHCP-client interface holds, and what each served LAN
 /// has handed out. Times are seconds from now.
 async fn dhcp_status(State(s): St) -> Json<Value> {
+    Json(dhcp_body(&s))
+}
+
+/// DHCP clients and servers: the API, and a controller's `dhcp.get`.
+pub(crate) fn dhcp_body(s: &Shared) -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -980,10 +1000,15 @@ async fn dhcp_status(State(s): St) -> Json<Value> {
         })
         .collect();
     servers.sort_by(|a, b| a["interface"].as_str().cmp(&b["interface"].as_str()));
-    Json(json!({ "clients": clients, "servers": servers }))
+    json!({ "clients": clients, "servers": servers })
 }
 
 async fn routes(State(s): St) -> Json<Value> {
+    Json(routes_body(&s))
+}
+
+/// The forwarding table: the API, and a controller's `routes.get`.
+pub(crate) fn routes_body(s: &Shared) -> Value {
     let ports = s.ports.read().unwrap().clone();
     let fib = s.fib.read().unwrap().clone();
     let out: Vec<Value> = fib
@@ -1004,10 +1029,15 @@ async fn routes(State(s): St) -> Json<Value> {
             }),
         })
         .collect();
-    Json(Value::Array(out))
+    Value::Array(out)
 }
 
 async fn overlay(State(s): St) -> Json<Value> {
+    Json(overlay_body(&s))
+}
+
+/// The SD-WAN overlay: the API, and a controller's `overlay.get`.
+pub(crate) fn overlay_body(s: &Shared) -> Value {
     let o = &s.overlay;
     let sum = s.summary();
     let health = s.health.read().unwrap().clone();
@@ -1054,14 +1084,14 @@ async fn overlay(State(s): St) -> Json<Value> {
             }));
         }
     }
-    Json(json!({
+    json!({
         "enabled": o.enabled(),
         "site_id": o.site_id,
         "mtu": o.mtu,
         "path_generation": paths.gen,
         "tethers": tethers,
         "paths": choices,
-    }))
+    })
 }
 
 /// How a tether's packets are protected, in words.
@@ -1079,7 +1109,13 @@ fn crypto_name(
 /// This router's SD-WAN public key: what other routers put in their
 /// `[[site]]` entry for it.
 async fn overlay_identity(State(s): St) -> Json<Value> {
-    Json(json!({ "public_key": s.sdwan.public_key.map(|k| crate::sdwan::hex(&k)) }))
+    Json(overlay_identity_body(&s))
+}
+
+/// This router's SD-WAN public key (the API, and a controller's
+/// `overlay.identity`).
+pub(crate) fn overlay_identity_body(s: &Shared) -> Value {
+    json!({ "public_key": s.sdwan.public_key.map(|k| crate::sdwan::hex(&k)) })
 }
 
 /// This router's public key towards a controller (its management identity).
@@ -1190,11 +1226,7 @@ fn this_site(s: &Shared, cfg: &crate::config::Config) -> Option<crate::config::S
         }
     }
     let name = o.name.clone().unwrap_or_else(|| {
-        std::fs::read_to_string("/etc/hostname")
-            .map(|h| h.trim().to_string())
-            .ok()
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| format!("site{}", o.site_id))
+        super::sysinfo::hostname().unwrap_or_else(|| format!("site{}", o.site_id))
     });
     // Without a fixed address, the other router learns each of our WAN
     // links: tell it how many there are.
@@ -1693,6 +1725,18 @@ fn systemctl(args: &[&str]) -> Result<String, ApiError> {
 }
 
 async fn system(State(s): St) -> Json<Value> {
+    let (job, update) = update_now(&s).await;
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": s.build,
+        "update_job": job,
+        "update": update,
+    }))
+}
+
+/// The update job's state and where an update stands (the System tab, and
+/// the controller's `update.progress` events).
+pub(crate) async fn update_now(s: &Shared) -> (Value, Value) {
     // "ActiveState=activating\nResult=success\n" -> {"active_state": .., "result": ..}
     let job = systemctl(&[
         "show",
@@ -1711,32 +1755,42 @@ async fn system(State(s): St) -> Json<Value> {
     })
     .unwrap_or(Value::Null);
     let update = update_status(
-        &s,
+        s,
         job["state"].as_str().unwrap_or(""),
         job["result"].as_str().unwrap_or(""),
     )
     .await;
-    Json(json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "build": s.build,
-        "update_job": job,
-        "update": update,
-    }))
+    (job, json!(update))
 }
 
 async fn update_check() -> ApiResult {
+    Ok(Json(update_check_body().await?))
+}
+
+/// What's installed and what's available (the API, and a controller's
+/// `system.update.check`).
+pub(crate) async fn update_check_body() -> Result<Value, ApiError> {
+    // Where from, as the config says now ([system] update_url).
+    systemd_run(&["/usr/lib/ephemeris/update-source"]).await?;
     let list = systemd_run(&["/usr/lib/systemd/systemd-sysupdate", "list"]).await?;
     let newest = systemd_run(&["/usr/lib/systemd/systemd-sysupdate", "check-new"])
         .await
         .map(|o| o.trim().to_string())
         .unwrap_or_default();
-    Ok(Json(json!({
+    Ok(json!({
         "versions": list,
         "available": (!newest.is_empty()).then_some(newest),
-    })))
+    }))
 }
 
 async fn update_start(State(s): St) -> ApiResult {
+    Ok(Json(update_start_body(&s).await?))
+}
+
+/// Install the newest version into the idle slot (the API, and a
+/// controller's `system.update`).
+pub(crate) async fn update_start_body(s: &Shared) -> Result<Value, ApiError> {
+    systemd_run(&["/usr/lib/ephemeris/update-source"]).await?;
     // Which version it will install, for the messages while it runs.
     let target = systemd_run(&["/usr/lib/systemd/systemd-sysupdate", "check-new"])
         .await
@@ -1757,7 +1811,32 @@ async fn update_start(State(s): St) -> ApiResult {
         ),
         None => "Installing the newest version into the idle slot. The router keeps forwarding; reboot when it's installed.".into(),
     };
-    Ok(Json(json!({ "ok": true, "version": target, "note": note })))
+    Ok(json!({ "ok": true, "version": target, "note": note }))
+}
+
+/// Reboot in `secs` seconds (a one-off systemd timer), or now.
+pub(crate) async fn reboot_in(secs: Option<u64>) -> Result<(), ApiError> {
+    match secs {
+        None | Some(0) => systemctl(&["reboot", "--no-block"]).map(drop),
+        Some(secs) => {
+            let when = format!("--on-active={secs}s");
+            let out = std::process::Command::new("systemd-run")
+                .args([
+                    &when,
+                    "--unit=ephemeris-reboot",
+                    "--description=Scheduled reboot",
+                ])
+                .args(["/usr/bin/systemctl", "reboot"])
+                .output()
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, err))
+            }
+        }
+    }
 }
 
 async fn reboot() -> ApiResult {
@@ -1966,12 +2045,12 @@ address = "10.10.2.1/24"
         assert!(v["error"].as_str().unwrap().contains("c.example.net"));
     }
 
-    #[test]
-    fn a_controller_pushes_reads_and_confirms_configs() {
+    #[tokio::test]
+    async fn a_controller_pushes_reads_and_confirms_configs() {
         use crate::controller::requests::handle;
         let (s, _rx) = shared("ctl-push");
         let code = |r: Result<Value, crate::controller::link::Refused>| r.unwrap_err().code;
-        let got = handle(&s, "config.get", &json!({})).unwrap();
+        let got = handle(&s, "config.get", &json!({})).await.unwrap();
         let (v0, base) = (
             got["version"].as_u64().unwrap(),
             got["sha256"].as_str().unwrap().to_string(),
@@ -1983,26 +2062,24 @@ address = "10.10.2.1/24"
         // Made from another config, or out of range, or broken: refused,
         // and nothing changes.
         assert_eq!(
-            code(handle(
-                &s,
-                "config.push",
-                &push(&"00".repeat(32), &with_route, 60)
-            )),
+            code(handle(&s, "config.push", &push(&"00".repeat(32), &with_route, 60)).await),
             "conflict"
         );
         assert_eq!(
-            code(handle(&s, "config.push", &push(&base, &with_route, 5))),
+            code(handle(&s, "config.push", &push(&base, &with_route, 5)).await),
             "bad_request"
         );
         let broken = format!("{CONFIG}\n[[route]]\nprefix = \"nonsense\"\nvia = \"x\"\n");
         assert_eq!(
-            code(handle(&s, "config.push", &push(&base, &broken, 60))),
+            code(handle(&s, "config.push", &push(&base, &broken, 60)).await),
             "bad_request"
         );
         assert_eq!(s.config.lock().unwrap().version(), v0);
 
         // A good one: committed, applied live, waiting for its confirm.
-        let ok = handle(&s, "config.push", &push(&base, &with_route, 60)).unwrap();
+        let ok = handle(&s, "config.push", &push(&base, &with_route, 60))
+            .await
+            .unwrap();
         assert_eq!(ok["version"], v0 + 1);
         assert_eq!(ok["applied"], "live");
         assert_eq!(ok["confirm_within_secs"], 60);
@@ -2012,22 +2089,88 @@ address = "10.10.2.1/24"
         // Another push waits for that one.
         let new_base = ok["sha256"].as_str().unwrap();
         assert_eq!(
-            code(handle(&s, "config.push", &push(new_base, CONFIG, 60))),
+            code(handle(&s, "config.push", &push(new_base, CONFIG, 60)).await),
             "conflict"
         );
         // Confirmed: kept.
         assert_eq!(
-            handle(&s, "config.confirm", &json!({})).unwrap()["version"],
+            handle(&s, "config.confirm", &json!({})).await.unwrap()["version"],
             v0 + 1
         );
         assert!(s.config.lock().unwrap().pending_confirm().is_none());
         assert_eq!(
-            code(handle(&s, "config.confirm", &json!({}))),
+            code(handle(&s, "config.confirm", &json!({})).await),
             "not_pending"
         );
-        let h = handle(&s, "config.history", &json!({})).unwrap();
+        let h = handle(&s, "config.history", &json!({})).await.unwrap();
         assert_eq!(h["history"].as_array().unwrap().len(), 1);
-        assert_eq!(code(handle(&s, "no.such", &json!({}))), "unknown_type");
+        assert_eq!(
+            code(handle(&s, "no.such", &json!({})).await),
+            "unknown_type"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_controller_asks_for_the_sdwan_key_and_a_reboot_time_is_checked() {
+        use crate::controller::requests::handle;
+        let (s, _rx) = shared("ctl-ops");
+        let ok = handle(&s, "overlay.identity", &json!({})).await.unwrap();
+        assert!(ok.get("public_key").is_some(), "{ok}");
+        let code = |r: Result<Value, crate::controller::link::Refused>| r.unwrap_err().code;
+        // Refused before anything is scheduled: not a time, or too far off.
+        let at = |t: &str| json!({ "at": t });
+        assert_eq!(
+            code(handle(&s, "system.reboot", &at("tomorrow")).await),
+            "bad_request"
+        );
+        assert_eq!(
+            code(handle(&s, "system.reboot", &at("2001-01-01T00:00:00Z")).await),
+            "bad_request"
+        );
+        assert_eq!(
+            code(handle(&s, "system.reboot", &at("2999-01-01T00:00:00Z")).await),
+            "bad_request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_controller_reads_the_live_tables() {
+        use crate::controller::requests::handle;
+        let (s, _rx) = shared("ctl-tables");
+        // A list: its items (at most `limit`) and how many there are.
+        let all = handle(&s, "routes.get", &json!({})).await.unwrap();
+        let total = all["total"].as_u64().unwrap();
+        assert!(total >= 2, "the two connected subnets: {all}");
+        assert_eq!(all["items"].as_array().unwrap().len() as u64, total);
+        let one = handle(&s, "routes.get", &json!({ "limit": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                one["items"].as_array().unwrap().len(),
+                one["total"].as_u64()
+            ),
+            (1, Some(total))
+        );
+        let huge = handle(&s, "routes.get", &json!({ "limit": 1_000_000 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            huge["total"].as_u64(),
+            Some(total),
+            "treated as 1000, not refused"
+        );
+        // The others: exactly their GET body.
+        assert!(handle(&s, "dhcp.get", &json!({}))
+            .await
+            .unwrap()
+            .get("clients")
+            .is_some());
+        assert!(handle(&s, "wan.get", &json!({})).await.unwrap().is_array());
+        assert!(handle(&s, "overlay.get", &json!({}))
+            .await
+            .unwrap()
+            .is_object());
     }
 
     #[tokio::test]

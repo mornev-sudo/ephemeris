@@ -1,9 +1,24 @@
 #!/bin/sh
-# If the "ephemeris.update_url" credential is set, install copies of the
-# sysupdate transfer files that download from there instead of GitHub.
+# Where systemd-sysupdate downloads updates from: [system] update_url in the
+# router's config (a controller can push it), else the "ephemeris.update_url"
+# credential given at deployment, else GitHub (the .transfer files' own
+# Path=). Run at boot, and before every update check or install, so a
+# changed config applies. Signatures are checked whatever the source.
 # /run/sysupdate.d overrides /usr/lib/sysupdate.d file by file.
-url=$(cat "$CREDENTIALS_DIRECTORY/ephemeris.update_url" 2>/dev/null) || exit 0
+CONFIG=/var/lib/ephemeris/ephemeris.toml
+SAVED=/run/ephemeris-update-url   # the credential, kept for this boot
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -r "$CREDENTIALS_DIRECTORY/ephemeris.update_url" ]; then
+    cat "$CREDENTIALS_DIRECTORY/ephemeris.update_url" > "$SAVED"
+fi
+url=$(sed -n '/^\[system\]/,/^\[/s/^[[:space:]]*update_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" 2>/dev/null | head -n1)
+[ -n "$url" ] || url=$(cat "$SAVED" 2>/dev/null)
+rm -rf /run/sysupdate.d
 [ -n "$url" ] || exit 0
+# The config's checks allow only plain URLs; refuse anything that could
+# break out of the sed below anyway.
+case $url in
+    *[!A-Za-z0-9:/._~%+=,@-]*) echo "update URL $url refused: unexpected characters" >&2; exit 1 ;;
+esac
 mkdir -p /run/sysupdate.d
 for f in /usr/lib/sysupdate.d/*.transfer; do
     sed "s|^Path=http.*|Path=$url|" "$f" > "/run/sysupdate.d/$(basename "$f")"

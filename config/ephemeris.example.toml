@@ -79,6 +79,13 @@ early_drop = true
 # password). Recommended once SSH is offered on an interface (management).
 password_login = true
 
+# [system]
+# Where software updates come from, instead of GitHub (or the
+# ephemeris.update_url credential given at deployment): a directory holding
+# a release's files, e.g. a mirror or a controller. Updates are only
+# installed if signed by the release key, whatever the source.
+# update_url = "https://updates.example.net/ephemeris/"
+
 [logging]
 # Each category logs at its own level: error, warn, info, debug, trace
 # (`ephctl log levels` lists them). Set here, a level stays; raised with
