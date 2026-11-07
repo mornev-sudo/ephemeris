@@ -15,6 +15,9 @@ use std::net::Ipv4Addr;
 /// The config as it applies right now, with what the outside interfaces
 /// learned while running.
 pub trait Live {
+    /// Only the tests look at leases alone; the router applies them with
+    /// its PPPoE sessions (`with_links`).
+    #[cfg(test)]
     fn with_leases(
         &self,
         leases: &std::collections::HashMap<String, crate::dhcp::client::ClientLease>,
