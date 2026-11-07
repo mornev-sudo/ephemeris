@@ -153,6 +153,24 @@ jobs:
             [[ -n $SECUREBOOT_KEY && -n $RELEASE_GPG_KEY ]] || { echo "::error::signing secrets missing from the release-signing environment"; exit 1; }
             printf '%s\n' "$SECUREBOOT_KEY" > image/mkosi.key
             printf '%s\n' "$RELEASE_GPG_KEY" | gpg --batch --import
+            # The secrets must be the halves of what routers already trust:
+            # the certificate they enrol (image/mkosi.crt) and the key their
+            # updates are checked against (import-pubring.gpg). Anything else
+            # builds images no deployed router would boot or install.
+            # Checked here, before the build, not found out at signing.
+            sb_key=$(openssl pkey -in image/mkosi.key -pubout 2>/dev/null) || {
+              echo "::error::SECUREBOOT_KEY isn't a readable private key"; exit 1; }
+            [[ $sb_key == "$(openssl x509 -in image/mkosi.crt -noout -pubkey)" ]] || {
+              echo "::error::SECUREBOOT_KEY doesn't match image/mkosi.crt (the certificate routers trust)"; exit 1; }
+            gpg_fprs=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "sec" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }')
+            [[ -n $gpg_fprs ]] || { echo "::error::RELEASE_GPG_KEY holds no secret key"; exit 1; }
+            trusted=$(gpg --batch --no-default-keyring --keyring "$PWD/image/mkosi.extra/etc/systemd/import-pubring.gpg" \
+              --with-colons --list-keys | awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }')
+            for f in $gpg_fprs; do
+              grep -qx "$f" <<<"$trusted" || {
+                echo "::error::RELEASE_GPG_KEY ($f) isn't in import-pubring.gpg (the key routers check updates against)"; exit 1; }
+            done
+            echo "Signing keys match image/mkosi.crt and import-pubring.gpg ($gpg_fprs)"
           else
             echo "Test build: throwaway signing keys (this image can never be released)"
             openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
