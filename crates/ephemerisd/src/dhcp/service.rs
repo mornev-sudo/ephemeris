@@ -14,7 +14,7 @@
 use super::client::{Client, Event};
 use super::server::{Lease, Server, ServerCfg};
 use super::{ClientStatus, PppoeStatus};
-use crate::config::Config;
+use crate::config::{Config, Live};
 use crate::mgmt::Shared;
 use crate::pppoe::client::{self as ppp, Client as Dialer};
 use crate::report::Control;
