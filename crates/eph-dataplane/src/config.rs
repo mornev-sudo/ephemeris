@@ -35,6 +35,12 @@ pub struct Port {
     /// a gateway outside a /32 DHCP lease, routes the DHCP server said are
     /// on-link, a PPPoE link's far end. Connected routes, like `subnet`.
     pub onlink: Vec<Prefix>,
+    /// Only accept packets whose source routes back out this port (strict
+    /// reverse path, RFC 3704), not just any source outside the other
+    /// ports' subnets: an inside host can't then pass for a network that
+    /// lies behind another port. Off where traffic comes back another way
+    /// than it left (asymmetric routing).
+    pub strict_source: bool,
     /// Largest IP packet this link carries (1500 on Ethernet, 1492 over
     /// PPPoE). Bigger ones get "fragmentation needed" (or are dropped).
     pub mtu: u16,

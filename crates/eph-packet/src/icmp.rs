@@ -20,6 +20,7 @@ pub const ECHO_REPLY: u8 = 0;
 pub const DEST_UNREACHABLE: u8 = 3;
 pub const ECHO_REQUEST: u8 = 8;
 pub const TIME_EXCEEDED: u8 = 11;
+pub const PARAMETER_PROBLEM: u8 = 12;
 
 /// Destination Unreachable codes.
 pub const CODE_NET_UNREACHABLE: u8 = 0;

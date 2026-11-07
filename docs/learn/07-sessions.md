@@ -34,7 +34,15 @@ A conversation is identified by five values:
 | destination IP : port | 10.10.2.10 : 443 (the web server) |
 
 Ping has no ports, but each ping run picks an *identifier* that the replies
-echo back, so we use that in place of the ports.
+echo back, so we use that in place of the ports. A ping session carries
+requests one way and replies the other: a request coming back the other way
+(the far end pinging your host through it) is refused, and so is an echo
+reply that no request asked for.
+
+Other ICMP messages (redirects, timestamps, address masks, router
+advertisements) have nothing a reply could be matched by, so they get no
+session at all. They're forwarded like a later fragment: only from
+interfaces that may start sessions, and never when they'd need NAT.
 
 ## Forward and reverse: one key for both directions
 
@@ -106,6 +114,10 @@ but it *quotes* the header of A's packet. We read the quoted header, rebuild
 *that* packet's key, and if the session exists, let the error through. Linux
 calls this state `RELATED`. Without it, the closed side could never tell you
 "nothing's listening here", and things like path MTU discovery would break.
+Destination Unreachable, Time Exceeded and Parameter Problem are handled
+this way. An error from inside about a packet no session knows, which would
+need NAT to leave, is dropped (`nat-untranslatable`) rather than sent out
+carrying the inside host's address.
 
 ## Forgetting: the timer wheel
 

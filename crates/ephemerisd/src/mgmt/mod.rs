@@ -273,14 +273,26 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The shortest API token accepted: anything shorter could be guessed, or
+/// be a file that isn't a token at all.
+const TOKEN_MIN: usize = 32;
+
 /// Read the API token, or create one (32 random bytes, hex) on first start.
+/// A file holding something too short to be a token is refused, not
+/// replaced: it may be another file's contents.
 pub fn load_or_create_token(path: &str) -> Result<String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     if let Ok(t) = std::fs::read_to_string(path) {
         let t = t.trim().to_string();
-        if !t.is_empty() {
+        if t.len() >= TOKEN_MIN {
             return Ok(t);
+        }
+        if !t.is_empty() {
+            anyhow::bail!(
+                "{path} holds {} characters, not a token (at least {TOKEN_MIN})",
+                t.len()
+            );
         }
     }
     let mut bytes = [0u8; 32];
@@ -299,4 +311,27 @@ pub fn load_or_create_token(path: &str) -> Result<String> {
         .with_context(|| format!("writing {path}"))?
         .write_all(format!("{token}\n").as_bytes())?;
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_isnt_a_token_is_refused_not_replaced() {
+        let d = std::env::temp_dir().join(format!("eph-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // Another file's contents (the config version, say): refused, kept.
+        let other = d.join("config-version");
+        std::fs::write(&other, "7\n").unwrap();
+        assert!(load_or_create_token(other.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "7\n");
+        // None yet: made, then read back the same.
+        let path = d.join("api-token");
+        let made = load_or_create_token(path.to_str().unwrap()).unwrap();
+        assert_eq!(made.len(), 64);
+        assert_eq!(load_or_create_token(path.to_str().unwrap()).unwrap(), made);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -41,6 +41,7 @@ pub fn run(shared: &Shared, punts: Receiver<Punt>, stop: &AtomicBool, state_dir:
         seen: None,
         learned_dns: vec![],
         retry_apply: None,
+        ignored: vec![],
     };
     let mut last_tick = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -82,6 +83,9 @@ struct Service<'a> {
     learned_dns: Vec<std::net::Ipv4Addr>,
     /// When to try again to apply leases / sessions that failed to apply.
     retry_apply: Option<u64>,
+    /// What of the leases and sessions was last left out (logged once, when
+    /// it changes; the WAN status shows it all along).
+    ignored: Vec<crate::config::Ignored>,
 }
 
 impl Service<'_> {
@@ -126,6 +130,19 @@ impl Service<'_> {
         let running = self.shared.config.lock().unwrap().running().clone();
         let result = self.shared.apply_live(&running);
         let mut st = self.shared.dhcp.lock().unwrap();
+        let ignored = running.ignored_links(&st);
+        for x in ignored.iter().filter(|x| !self.ignored.contains(x)) {
+            let pppoe = running
+                .interfaces
+                .iter()
+                .any(|i| i.name == x.interface && i.is_pppoe());
+            if pppoe {
+                warn!(target: crate::logging::cat::PPPOE, "interface {}: ignoring {}", x.interface, x.what);
+            } else {
+                warn!(target: crate::logging::cat::DHCP_CLIENT, "interface {}: ignoring {}", x.interface, x.what);
+            }
+        }
+        self.ignored = ignored;
         match result {
             Ok(()) => {
                 if st.apply_error.take().is_some() {

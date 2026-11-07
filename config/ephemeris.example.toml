@@ -28,7 +28,8 @@ show_sessions = 10
 # HTTPS: https://<router>:8443/
 enabled = true
 listen = "127.0.0.1:8080"
-# Bearer token for the API; generated on first start if missing.
+# Bearer token for the API; generated on first start if missing. Kept by
+# the router when a controller pushes a config.
 token_file = "/var/lib/ephemeris/api-token"
 # Host names the portal may be reached by, besides addresses, localhost and
 # the router's own name (anything else is refused: DNS rebinding).
@@ -108,6 +109,10 @@ name = "lan"
 device = "ens19"
 address = "10.10.1.1/24"
 role = "inside"
+# Packets here must come from addresses that route back out this interface
+# (a strict reverse-path check; the default on inside interfaces). Turn it
+# off only where traffic returns another way than it left.
+# strict_source = false
 
 # The router's own portal (https://10.10.1.1:8443/) and SSH on this
 # interface's address, besides the management NIC. Inside interfaces only:

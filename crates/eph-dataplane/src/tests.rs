@@ -44,6 +44,7 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
             onlink: vec![],
+            strict_source: false,
             mtu: 1500,
         },
         Port {
@@ -62,6 +63,7 @@ fn router_with(b_open: bool, sessions: SessionConfig) -> Pipeline {
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
             onlink: vec![],
+            strict_source: false,
             mtu: 1500,
         },
     ]);
@@ -163,6 +165,43 @@ fn arp_from_an_on_link_gateway_outside_the_subnet() {
     );
     r.process(1, &mut b, 0, n);
     assert!(!r.neighbors().any(|x| x.ip == ip("100.64.0.9")));
+}
+
+/// A request can name any sender MAC and carry anything after the ARP
+/// message: the reply goes to a host's own MAC only, and carries none of it.
+#[test]
+fn arp_replies_go_to_one_host_and_carry_nothing_extra() {
+    let mut r = router();
+    for sha in [eth::BROADCAST, [0x01, 0, 0x5e, 0, 0, 1], eth::ZERO] {
+        let (mut b, n) = arp_frame(
+            arp::OP_REQUEST,
+            sha,
+            "10.10.1.10",
+            "10.10.1.1",
+            eth::BROADCAST,
+        );
+        assert_eq!(dropped(r.process(0, &mut b, 0, n)), DropReason::ArpConsumed);
+    }
+    let (mut b, _) = arp_frame(
+        arp::OP_REQUEST,
+        HOST_A,
+        "10.10.1.10",
+        "10.10.1.1",
+        eth::BROADCAST,
+    );
+    b[42..200].fill(0xaa);
+    assert_eq!(
+        r.process(0, &mut b, 0, 200),
+        Verdict::Tx {
+            port: 0,
+            off: 0,
+            len: 60
+        }
+    );
+    assert!(
+        b[42..60].iter().all(|&x| x == 0),
+        "padding, not the trailer"
+    );
 }
 
 #[test]
@@ -420,6 +459,7 @@ fn static_route_gateway_must_be_connected() {
         gateway: None,
         pppoe: crate::config::Pppoe::Off,
         onlink: vec![],
+        strict_source: false,
         mtu: 1500,
     }];
     let bad = [StaticRoute {
@@ -450,6 +490,7 @@ fn on_link_gateway_outside_the_subnet() {
         gateway: Some(ip("100.64.0.1")),
         pppoe: crate::config::Pppoe::Off,
         onlink,
+        strict_source: false,
         mtu: 1500,
     };
     let default = [StaticRoute {
@@ -901,9 +942,69 @@ fn sessions_only_accept_each_direction_where_it_arrived() {
         dropped(r.process(0, &mut b, 0, n)),
         DropReason::SessionMismatch
     );
-    // The real one comes from the gateway on lan-b.
+    // The routes change (to the same thing, say): the first packet after
+    // still can't claim the reply direction from the wrong port...
+    let ports = r.ports().clone();
+    let statics = [StaticRoute {
+        prefix: "192.168.50.0/24".parse().unwrap(),
+        via: ip("10.10.2.254"),
+    }];
+    r.set_fib(Arc::new(build_fib(&ports, &statics, &[]).unwrap()));
+    let (mut b, n) = seg(
+        R0,
+        HOST_A,
+        ("192.168.50.5", 80),
+        ("10.10.1.10", 40000),
+        None,
+    );
+    assert_eq!(
+        dropped(r.process(0, &mut b, 0, n)),
+        DropReason::SessionMismatch
+    );
+    // ...and the real one, from where the routes lead, still gets through.
     let (mut b, n) = seg(R1, GW, ("192.168.50.5", 80), ("10.10.1.10", 40000), None);
     assert_eq!(port_of_tx(r.process(1, &mut b, 0, n)), 0);
+    // Routes that really move: the network is behind lan-a now, and its
+    // packets come from there.
+    let moved = [StaticRoute {
+        prefix: "192.168.50.0/24".parse().unwrap(),
+        via: ip("10.10.1.254"),
+    }];
+    r.set_fib(Arc::new(build_fib(&ports, &moved, &[]).unwrap()));
+    let (mut b, n) = seg(R0, GW, ("192.168.50.5", 80), ("10.10.1.10", 40000), None);
+    assert_eq!(port_of_tx(r.process(0, &mut b, 0, n)), 0);
+}
+
+/// With a strict source check, a host on lan-a can't pass for the network
+/// routed behind lan-b's gateway, nor for the internet; without one it can.
+#[test]
+fn a_strict_source_check_refuses_sources_routed_elsewhere() {
+    let mut r = resolved(true);
+    learn(&mut r, 1, GW, "10.10.2.254");
+    let strict = |r: &mut Pipeline, on: bool| {
+        let mut ports = r.ports().to_vec();
+        ports[0].strict_source = on;
+        r.set_ports(ports.into());
+    };
+    let from_a = |src: &str| seg(R0, HOST_A, (src, 40000), ("10.10.2.10", 80), None);
+    strict(&mut r, true);
+    for src in ["192.168.50.5", "8.8.8.8"] {
+        let (mut b, n) = from_a(src);
+        assert_eq!(
+            dropped(r.process(0, &mut b, 0, n)),
+            DropReason::SpoofedSource,
+            "{src}"
+        );
+    }
+    let (mut b, n) = from_a("10.10.1.10");
+    assert_eq!(port_of_tx(r.process(0, &mut b, 0, n)), 1, "its own address");
+    strict(&mut r, false);
+    let (mut b, n) = from_a("192.168.50.5");
+    assert_eq!(
+        port_of_tx(r.process(0, &mut b, 0, n)),
+        1,
+        "loose: let through"
+    );
 }
 
 #[test]

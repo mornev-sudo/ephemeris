@@ -72,10 +72,14 @@ pub struct HandshakeIn {
 
 /// What a tether packet is sealed with (see `Pipeline::next_seal`).
 #[derive(Clone, Copy)]
-enum SealWith {
+pub(crate) enum SealWith {
     PreShared(TetherKey),
-    /// The current session with the site at this index.
-    Session(usize),
+    /// The session with the site at this index that has this serial: the
+    /// one `next_seal` numbered the packet for. Looked up again by serial,
+    /// not as "the current one": another worker may confirm a newer session
+    /// in between, and sealing with that under this session's numbering
+    /// would reuse a nonce.
+    Session(usize, u64),
 }
 
 /// NAT ports of a worker's own looked at, at most, for one new flow.
@@ -945,7 +949,9 @@ impl Pipeline {
             );
         }
 
-        if a.op == arp::OP_REQUEST && for_us {
+        // Answered only to a host's own address: a reply sent to broadcast
+        // or multicast, as a request can ask, would reach the whole link.
+        if a.op == arp::OP_REQUEST && for_us && !eth::is_multicast(&a.sha) && a.sha != eth::ZERO {
             // Answer in place: turn the request around.
             eth::write(buf, a.sha, my_mac, eth::TYPE_ARP);
             arp::write(
@@ -958,6 +964,10 @@ impl Pipeline {
                     tpa: a.spa,
                 },
             );
+            // Just the ARP message, padded to the shortest frame: none of
+            // what the request carried after it.
+            let len = arp::MIN_FRAME.min(buf.len());
+            buf[ETH + arp::LEN..len].fill(0);
             self.stats.originated += 1;
             return Verdict::Tx {
                 port: ingress,
@@ -1188,6 +1198,16 @@ impl Pipeline {
                     return Verdict::Drop(DropReason::TooBig); // fragmentation not implemented
                 }
                 let mtu = self.overlay.mtu as u32;
+                // A reply to a NATed session (a hub NATs its spokes' internet
+                // traffic) was already translated to the inside host. Quote
+                // it as it arrived: the sender knows that packet, and the
+                // inside host's address and port stay private.
+                let n = sess.and_then(|idx| self.sessions.get(idx).nat);
+                if let Some(n) = n.filter(|n| h.dst == n.orig_addr) {
+                    let ip = off + ETH..off + ETH + h.total_len;
+                    nat::translate_dst(&mut frame[ip], n.addr, n.port);
+                    h.dst = n.addr;
+                }
                 return self.icmp_error(
                     ingress,
                     frame,
@@ -1234,7 +1254,12 @@ impl Pipeline {
         let now = self.now_ns;
         let ip = off + ETH..off + ETH + h.total_len;
         match flow_of(&frame[off + ETH..off + ETH + h.total_len], h)? {
-            Flow::Tracked { key, lo_to_hi, tcp } => {
+            Flow::Tracked {
+                key,
+                lo_to_hi,
+                tcp,
+                echo,
+            } => {
                 let tcp_flags = tcp.map_or(0, |t| t.flags);
                 if let Some(idx) = self.sessions.lookup(&key) {
                     // Known session: the common case. A packet carrying the
@@ -1253,10 +1278,26 @@ impl Pipeline {
                     if nat.is_some() && !translated_side && dir == Dir::Reverse {
                         return Err(Verdict::Drop(DropReason::SessionMismatch));
                     }
-                    // Each direction keeps arriving where it first did (until
-                    // the routes change), or the packet is spoofed.
+                    // A ping session carries requests one way and replies the
+                    // other: a request back would be the far end pinging the
+                    // inside host through it.
+                    let want = match dir {
+                        Dir::Forward => icmp::ECHO_REQUEST,
+                        Dir::Reverse => icmp::ECHO_REPLY,
+                    };
+                    if echo.is_some_and(|t| t != want) {
+                        return Err(Verdict::Drop(DropReason::SessionMismatch));
+                    }
+                    // Each direction keeps arriving where it first did, or
+                    // the packet is spoofed. Once the routes change it may
+                    // also arrive where they now lead back to its sender;
+                    // anywhere else still isn't trusted, or any port could
+                    // claim a session with the first packet after a change.
                     let fib_changed = s.fib_gen != self.fib_gen;
-                    if !fib_changed && s.ingress[dir as usize].is_some_and(|p| p != at) {
+                    let came_back = || self.fib.lookup(h.src).map(|nh| egress_of(*nh)) == Some(at);
+                    if s.ingress[dir as usize].is_some_and(|p| p != at)
+                        && !(fib_changed && came_back())
+                    {
                         return Err(Verdict::Drop(DropReason::SessionMismatch));
                     }
                     let flags = match tcp {
@@ -1301,8 +1342,8 @@ impl Pipeline {
                     s.ingress[other] = s.ingress[other].or(Some(egress_of(nh)));
                     return Ok((nh, Some(idx)));
                 }
-                // First packet of a new session.
-                if !allow_new {
+                // First packet of a new session: for a ping, the request.
+                if !allow_new || echo == Some(icmp::ECHO_REPLY) {
                     return Err(Verdict::Drop(DropReason::NoSession));
                 }
                 if !self.sessions.can_create(key.proto, tcp_flags) {
@@ -1437,7 +1478,20 @@ impl Pipeline {
                         None => {}
                     }
                 }
-                Ok((self.route(ingress, frame, off, h)?, None))
+                let nh = self.route(ingress, frame, off, h)?;
+                // About no session here: nothing says how to translate it, so
+                // one that would need source NAT mustn't leave with the inside
+                // address (as with untracked packets, below).
+                if let (None, NextHop::Ip { port: egress, .. }) = (found, nh) {
+                    if self
+                        .nat
+                        .decide(&self.ports, ingress, egress, h.src, h.dst)
+                        .is_some()
+                    {
+                        return Err(Verdict::Drop(DropReason::NatUntranslatable));
+                    }
+                }
+                Ok((nh, None))
             }
             // Non-first fragments carry no ports, so they can't be matched to
             // a session. Forwarded only from ports that may start sessions.
@@ -1468,10 +1522,13 @@ impl Pipeline {
                 let site = self.overlay.tethers[t as usize].site_idx;
                 matches!(self.fib.lookup(src), Some(&NextHop::Site(s)) if s == site)
             }
-            None => self
-                .ports
-                .iter()
-                .all(|p| p.id == ingress || !p.subnet.contains(src)),
+            None => {
+                self.ports
+                    .iter()
+                    .all(|p| p.id == ingress || !p.subnet.contains(src))
+                    && (!self.ports[ingress as usize].strict_source
+                        || matches!(self.fib.lookup(src), Some(&NextHop::Ip { port, .. }) if port == ingress))
+            }
         }
     }
 
@@ -1828,7 +1885,9 @@ impl Pipeline {
             return Verdict::Drop(DropReason::NoRoute);
         }
         let (key, lo_to_hi, tcp) = match flow_of(&frame[ip.clone()], &h) {
-            Ok(Flow::Tracked { key, lo_to_hi, tcp }) => (key, lo_to_hi, tcp),
+            Ok(Flow::Tracked {
+                key, lo_to_hi, tcp, ..
+            }) => (key, lo_to_hi, tcp),
             Ok(_) => return Verdict::Drop(DropReason::LocalUnhandled),
             Err(v) => return v,
         };
@@ -2233,7 +2292,7 @@ impl Pipeline {
     /// the site's current session), and its header version, key id and
     /// packet number. `None`: nothing to seal with, or this key's packet
     /// numbers are used up (a nonce must never repeat).
-    fn next_seal(&mut self, tether: TetherId) -> Option<(SealWith, u8, u8, u64)> {
+    pub(crate) fn next_seal(&mut self, tether: TetherId) -> Option<(SealWith, u8, u8, u64)> {
         let t = &self.overlay.tethers[tether as usize];
         match self.overlay.crypto(t.site_idx) {
             PeerCrypto::PreShared => {
@@ -2256,7 +2315,7 @@ impl Pipeline {
                 }
                 next.1 += 1;
                 Some((
-                    SealWith::Session(t.site_idx),
+                    SealWith::Session(t.site_idx, s.serial),
                     overlay::VERSION_HANDSHAKE,
                     s.peer_id,
                     next.1 - 1,
@@ -2313,17 +2372,29 @@ impl Pipeline {
         buf[r..r + overlay::HDR_LEN].copy_from_slice(&hdr);
         let body = r + overlay::HDR_LEN;
         let payload = &mut buf[body..body + payload_len];
-        let tag = match with {
-            SealWith::PreShared(key) => key.seal(&hdr, payload),
-            // The session `next_seal` picked: nothing replaced it since.
-            SealWith::Session(site_idx) => self
-                .keys
-                .sending(site_idx, self.now_ns)?
-                .tx
-                .seal(&hdr, payload),
-        };
+        let tag = self.seal(with, &hdr, payload)?;
         buf[body + payload_len..body + payload_len + TAG_LEN].copy_from_slice(&tag);
         Some(body + payload_len + TAG_LEN)
+    }
+
+    /// Encrypt `payload` in place with what `next_seal` chose; the tag.
+    pub(crate) fn seal(
+        &self,
+        with: SealWith,
+        hdr: &[u8; overlay::HDR_LEN],
+        payload: &mut [u8],
+    ) -> Option<[u8; TAG_LEN]> {
+        Some(match with {
+            SealWith::PreShared(key) => key.seal(hdr, payload),
+            SealWith::Session(site_idx, serial) => self
+                .keys
+                .peers
+                .get(site_idx)?
+                .iter()
+                .find(|s| s.serial == serial)?
+                .tx
+                .seal(hdr, payload),
+        })
     }
 
     /// An overlay packet addressed to us: data to decapsulate, or a probe.
@@ -2795,6 +2866,8 @@ enum Flow {
         lo_to_hi: bool,
         /// TCP only.
         tcp: Option<TcpSegment>,
+        /// ICMP echo only: request or reply.
+        echo: Option<u8>,
     },
     Related {
         key: FlowKey,
@@ -2812,6 +2885,7 @@ fn flow_of(ip: &[u8], h: &ipv4::Header) -> Result<Flow, Verdict> {
     }
     let l4 = &ip[h.hdr_len..];
     let short = || Verdict::Drop(DropReason::BadL4Header);
+    let mut echo = None;
     let (sport, dport, tcp) = match h.proto {
         ipv4::PROTO_TCP => {
             if l4.len() < l4::TCP_MIN_HDR_LEN {
@@ -2850,21 +2924,32 @@ fn flow_of(ip: &[u8], h: &ipv4::Header) -> Result<Flow, Verdict> {
                 // plays the role of a port in both directions.
                 icmp::ECHO_REQUEST | icmp::ECHO_REPLY => {
                     let id = u16::from_be_bytes([l4[4], l4[5]]);
+                    echo = Some(l4[0]);
                     (id, id, None)
                 }
-                icmp::DEST_UNREACHABLE | icmp::TIME_EXCEEDED => {
+                icmp::DEST_UNREACHABLE | icmp::TIME_EXCEEDED | icmp::PARAMETER_PROBLEM => {
                     return Ok(related_key(&l4[icmp::HDR_LEN..]).map_or(
                         Flow::Untracked,
                         |(key, quoted_src)| Flow::Related { key, quoted_src },
                     ));
                 }
-                _ => (0, 0, None),
+                // Anything else (redirects, timestamps, address masks...)
+                // has nothing to match a reply to: keyed on addresses alone,
+                // one message out would let any of these back in. Forwarded
+                // like a later fragment: only from where sessions may start,
+                // and never needing NAT.
+                _ => return Ok(Flow::Untracked),
             }
         }
         _ => (0, 0, None),
     };
     let (key, lo_to_hi) = FlowKey::new(h.src, sport, h.dst, dport, h.proto);
-    Ok(Flow::Tracked { key, lo_to_hi, tcp })
+    Ok(Flow::Tracked {
+        key,
+        lo_to_hi,
+        tcp,
+        echo,
+    })
 }
 
 /// The session an ICMP error refers to, and the quoted packet's source,

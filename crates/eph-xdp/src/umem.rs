@@ -95,13 +95,13 @@ impl Umem {
     #[allow(clippy::mut_from_ref)]
     #[inline(always)]
     pub unsafe fn frame_mut(&self, addr: u64) -> &mut [u8] {
-        let end = self.frame_base(addr) + self.frame_size as u64;
+        let end = self.frame_base(addr).checked_add(self.frame_size as u64);
         // A real check, not a debug_assert: the release build is the one
         // that runs on a router. One comparison per packet.
-        assert!(
-            end <= self.len as u64,
-            "frame address {addr:#x} outside the UMEM"
-        );
+        let end = match end {
+            Some(end) if end <= self.len as u64 => end,
+            _ => panic!("frame address {addr:#x} outside the UMEM"),
+        };
         // SAFETY: `addr..end` lies inside the mapping (checked above), which
         // lives as long as `self`; the caller guarantees nobody else uses
         // this frame for the slice's lifetime.

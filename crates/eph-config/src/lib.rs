@@ -467,6 +467,13 @@ pub struct InterfaceCfg {
     /// inside and no on outside interfaces (only replies get in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_new_sessions: Option<bool>,
+    /// Only accept packets whose source address routes back out this
+    /// interface (a strict reverse-path check). Defaults to yes on inside
+    /// and no on outside interfaces (several WANs, SD-WAN tethers on any of
+    /// them). Turn it off where traffic comes back by another way than it
+    /// left (asymmetric routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_source: Option<bool>,
     /// TCP MSS adjust: lower the MSS that TCP SYNs through this interface
     /// announce to at most this value (e.g. 1452 for PPPoE). Unset: no change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -992,7 +999,9 @@ pub struct ManagementCfg {
     /// requests on. A non-loopback address is only used with
     /// `insecure_remote_http`.
     pub listen: String,
-    /// API token; generated on first start if the file doesn't exist.
+    /// API token; generated on first start if the file doesn't exist. A
+    /// file holding fewer than 32 characters is refused (token
+    /// authentication stays off). A controller's push can't change it.
     pub token_file: String,
     /// Host names the portal may be reached by, besides addresses,
     /// `localhost` and the router's own host name (requests for any other
@@ -1441,6 +1450,7 @@ impl Config {
                     },
                     gateway: i.gateway.as_deref().and_then(|g| g.parse().ok()),
                     onlink: i.onlink.clone(),
+                    strict_source: i.strict_source.unwrap_or(i.role == RoleCfg::Inside),
                     mtu: i.ip_mtu(),
                     card: cards.iter().position(|&c| c == i.device).unwrap_or(0) as u16,
                     vlan: i.vlan,
@@ -1936,6 +1946,19 @@ mod tests {
         let c = parse(text).unwrap();
         let ports = c.ports(|_| Ok([0; 6])).unwrap();
         c.fib(&ports).unwrap();
+    }
+
+    #[test]
+    fn inside_interfaces_check_sources_strictly_unless_told_not_to() {
+        let c = parse(
+            "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n\n\
+             [[interface]]\nname = \"dmz\"\ndevice = \"eth2\"\naddress = \"10.0.1.1/24\"\nstrict_source = false\n\n\
+             [[interface]]\nname = \"wan\"\ndevice = \"eth3\"\naddress = \"192.0.2.2/24\"\nrole = \"outside\"\n",
+        )
+        .unwrap();
+        let ports = c.ports(|_| Ok([0; 6])).unwrap();
+        let strict: Vec<_> = ports.iter().map(|p| p.strict_source).collect();
+        assert_eq!(strict, [true, false, false]);
     }
 
     #[test]

@@ -124,8 +124,14 @@ fn traffic_flows_once_keys_are_agreed() {
     install(&mut r1, vec![s1]);
     install(&mut r2, vec![s2.clone()]);
 
-    // R2 answered the handshake: it waits for proof R1 has the keys.
-    assert_eq!(drop_reason(reply_from_b(&mut r2).0), DropReason::NoPath);
+    // R2 answered the handshake: it waits for proof R1 has the keys. (B's
+    // own ping: an identifier of its own.)
+    let (mut f, n) = packet(mac(2, 0), HOST_B, "10.2.0.10", "10.1.0.10", None, 8, true);
+    f[OFF + 38] = 0x0b;
+    assert_eq!(
+        drop_reason(r2.process(0, &mut f, OFF, n)),
+        DropReason::NoPath
+    );
 
     let (v, mut f) = ping_from_a(&mut r1);
     let (port, off, len) = tx(v);
@@ -330,4 +336,34 @@ fn a_handshake_reply_goes_where_the_initiation_came_from() {
     let mut r2 = router(2);
     assert!(!r2.send_handshake(0, Some((ip("192.0.2.9"), 4800)), &payload));
     assert!(!r2.emits.is_empty(), "an ARP request went out");
+}
+
+/// Another worker can confirm a newer session between numbering a packet
+/// and sealing it. The packet must still be sealed with the session it was
+/// numbered for: sealing with the newer one under the older one's packet
+/// numbers would repeat a nonce once the newer one's numbers got there.
+#[test]
+fn a_packet_is_sealed_with_the_session_it_was_numbered_for() {
+    let mut r2 = router(2);
+    r2.set_time(NOW);
+    let (old1, old2) = sessions(1, (5, 9), NOW);
+    let (_, new2) = sessions(2, (6, 10), NOW);
+    old2.accept(0, 0, 0, NOW); // the old one is in use
+    install(&mut r2, vec![new2.clone(), old2]);
+    let (with, _, key_id, counter) = r2.next_seal(0).expect("the old session");
+    assert_eq!((key_id, counter), (5, 0));
+    new2.accept(1, 0, 0, NOW); // a sibling worker confirms the new one
+    let mut hdr = [0u8; overlay::HDR_LEN];
+    hdr[7] = key_id;
+    hdr[8..16].copy_from_slice(&counter.to_be_bytes());
+    let mut payload = *b"sealed with the old session";
+    let tag = r2.seal(with, &hdr, &mut payload).unwrap();
+    assert!(
+        old1.rx.open(&hdr, &mut payload, &tag),
+        "the key id's session opens it"
+    );
+    assert_eq!(&payload, b"sealed with the old session");
+    // The next packet moves to the new session, numbered from 0.
+    let (_, _, key_id, counter) = r2.next_seal(0).unwrap();
+    assert_eq!((key_id, counter), (6, 0));
 }

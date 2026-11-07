@@ -379,6 +379,7 @@ mod tests {
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
             onlink: vec![],
+            strict_source: false,
             mtu: 1500,
         }
     }

@@ -155,6 +155,7 @@ pub(crate) fn port(id: u16, name: &str, mac: Mac, addr: &str) -> Port {
         gateway: None,
         pppoe: crate::config::Pppoe::Off,
         onlink: vec![],
+        strict_source: false,
         mtu: 1500,
     }
 }
@@ -392,6 +393,90 @@ fn oversized_packets_get_frag_needed_with_the_overlay_mtu() {
     assert_eq!(
         r1.process(0, &mut f, OFF, n),
         Verdict::Drop(DropReason::TooBig)
+    );
+}
+
+/// A hub that NATs a spoke's internet traffic: a reply too big for the
+/// tether gets "packet too big" quoting the packet as the server sent it,
+/// not as translated to the spoke's host (whose address stays private, and
+/// which the server couldn't match to its socket anyway).
+#[test]
+fn too_big_errors_from_a_nating_hub_quote_the_untranslated_packet() {
+    use crate::nat::{NatAction, NatConfig, NatRule};
+    let (mut r1, mut r2) = (router(1), router(2));
+    let ports = |site: u8| -> Arc<[Port]> {
+        Arc::new([
+            port(0, "lan", mac(site, 0), &format!("10.{site}.0.1/24")),
+            port(1, "wan1", mac(site, 1), &format!("192.0.2.{site}/30")),
+            port(2, "wan2", mac(site, 2), &format!("198.51.100.{site}/30")),
+        ])
+    };
+    let everything = |site_idx| OverlayRoute {
+        prefix: "0.0.0.0/0".parse().unwrap(),
+        site_idx,
+    };
+    // The spoke sends everything to the hub; the hub's internet is wan2.
+    r1.set_fib(Arc::new(
+        build_fib(&ports(1), &[], &[everything(0)]).unwrap(),
+    ));
+    let internet = StaticRoute {
+        prefix: "0.0.0.0/0".parse().unwrap(),
+        via: ip("198.51.100.1"),
+    };
+    let spoke = OverlayRoute {
+        prefix: "10.1.0.0/24".parse().unwrap(),
+        site_idx: 0,
+    };
+    r2.set_fib(Arc::new(
+        build_fib(&ports(2), &[internet], &[spoke]).unwrap(),
+    ));
+    r2.set_nat(Arc::new(NatConfig {
+        rules: vec![NatRule {
+            name: "spokes".into(),
+            source: Some("10.1.0.0/24".parse().unwrap()),
+            destination: None,
+            outbound: Some(2),
+            action: NatAction::Interface,
+        }],
+        ..Default::default()
+    }));
+    // Host A pings 8.8.8.8: through the tether, NATed out of the hub.
+    let (mut f, n) = packet(mac(1, 0), HOST_A, "10.1.0.10", "8.8.8.8", None, 8, true);
+    let (_, off, len) = tx(r1.process(0, &mut f, OFF, n));
+    let (port, off, _) = tx(r2.process(1, &mut f, off, len));
+    assert_eq!(port, 2);
+    let out = &f[off + 14..];
+    assert_eq!(&out[12..16], &[198, 51, 100, 2], "NATed");
+    let id = [out[24], out[25]];
+    // A big echo reply comes back, too big for the tether.
+    let (mut f, n) = packet(
+        mac(2, 2),
+        mac(1, 2),
+        "8.8.8.8",
+        "198.51.100.2",
+        None,
+        1480,
+        true,
+    );
+    let l = &mut f[OFF + 34..OFF + n];
+    l[0] = icmp::ECHO_REPLY;
+    l[4..6].copy_from_slice(&id);
+    l[2..4].fill(0);
+    let c = checksum::checksum(l);
+    l[2..4].copy_from_slice(&c.to_be_bytes());
+    let (port, off, len) = tx(r2.process(2, &mut f, OFF, n));
+    assert_eq!(port, 2, "back to the server");
+    let m = &f[off + 34..off + len];
+    assert_eq!(
+        (m[0], m[1]),
+        (icmp::DEST_UNREACHABLE, icmp::CODE_FRAG_NEEDED)
+    );
+    let quoted = &m[8..];
+    assert_eq!(&quoted[16..20], &[198, 51, 100, 2], "as the server sent it");
+    assert_eq!(&quoted[24..26], &id);
+    assert!(
+        !m.windows(4).any(|w| w == [10, 1, 0, 10]),
+        "no private address"
     );
 }
 
@@ -647,8 +732,10 @@ fn a_tether_inside_a_tether_is_rejected() {
 fn a_peer_without_a_fixed_address_is_learned_from_its_packets() {
     // R2 (a hub) doesn't know R1's (a spoke's) WAN addresses.
     let (mut r1, mut r2) = (router(1), router_opts(2, Some(KEY), true));
-    // Before R1 says anything, R2 has nowhere to send.
+    // Before R1 says anything, R2 has nowhere to send. (B's own ping: an
+    // identifier of its own.)
     let (mut f, n) = packet(mac(2, 0), HOST_B, "10.2.0.10", "10.1.0.10", None, 8, true);
+    f[OFF + 38] = 0x0b;
     assert_eq!(
         r2.process(0, &mut f, OFF, n),
         Verdict::Drop(DropReason::NoPath)
@@ -685,6 +772,7 @@ fn a_peer_without_a_fixed_address_is_learned_from_its_packets() {
         Verdict::Drop(DropReason::OverlayAuth)
     );
     let (mut f, n) = packet(mac(2, 0), HOST_B, "10.2.0.10", "10.1.0.10", None, 8, true);
+    f[OFF + 34] = icmp::ECHO_REPLY;
     let (_, off, len) = tx(r2.process(0, &mut f, OFF, n));
     assert_eq!(
         ipv4::parse(&f[off + 14..off + len]).unwrap().dst,

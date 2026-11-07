@@ -882,6 +882,17 @@ pub(crate) fn wan_body(s: &Shared) -> Value {
     let cfg = s.config.lock().unwrap().running().clone();
     let st = s.dhcp.lock().unwrap().clone();
     let ports = s.ports.read().unwrap().clone();
+    let ignored = {
+        use crate::config::Live;
+        cfg.ignored_links(&st)
+    };
+    let ignored_on = |name: &str| -> Vec<&str> {
+        ignored
+            .iter()
+            .filter(|x| x.interface == name)
+            .map(|x| x.what.as_str())
+            .collect()
+    };
     let out: Vec<Value> = cfg
         .interfaces
         .iter()
@@ -895,6 +906,7 @@ pub(crate) fn wan_body(s: &Shared) -> Value {
                 let l = ps.and_then(|x| x.link.as_ref());
                 json!({
                     "interface": i.name, "mode": "pppoe", "apply_error": st.apply_error,
+                    "ignored": ignored_on(&i.name),
                     "state": ps.map(|x| x.phase), "address": addr, "gateway": gw,
                     "dns": l.map(|l| l.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
                     "pppoe": {
@@ -911,6 +923,7 @@ pub(crate) fn wan_body(s: &Shared) -> Value {
                 let l = c.and_then(|c| c.lease.as_ref());
                 json!({
                     "interface": i.name, "mode": "dhcp", "apply_error": st.apply_error,
+                    "ignored": ignored_on(&i.name),
                     "state": c.map(|c| c.phase), "address": addr, "gateway": gw,
                     "dns": l.map(|l| l.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
                     "dhcp": {

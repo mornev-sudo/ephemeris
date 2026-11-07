@@ -41,6 +41,7 @@ pub(crate) fn router(nat: NatConfig) -> Pipeline {
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
             onlink: vec![],
+            strict_source: false,
             mtu: 1500,
         },
         Port {
@@ -59,6 +60,7 @@ pub(crate) fn router(nat: NatConfig) -> Pipeline {
             gateway: None,
             pppoe: crate::config::Pppoe::Off,
             onlink: vec![],
+            strict_source: false,
             mtu: 1500,
         },
     ]);
@@ -213,6 +215,57 @@ fn ping_to_the_internet_is_masqueraded() {
     assert_eq!((h.src, h.dst), (ip("8.8.8.8"), ip("10.0.0.10")));
     assert_eq!(u16::from_be_bytes([f[off + 38], f[off + 39]]), 77);
     assert_eq!(checksum::checksum(&f[off + 34..off + len]), 0);
+}
+
+/// A ping lets its replies back, and nothing else: not a ping from the far
+/// end to the inside host, nor other ICMP types that once rode on an
+/// address-only key (redirects, timestamps...).
+#[test]
+fn a_ping_session_only_lets_echo_replies_back() {
+    let mut r = router(NatConfig::default());
+    let (mut f, n) = packet(
+        R_LAN,
+        HOST_A,
+        "10.0.0.10",
+        "8.8.8.8",
+        L4::Echo(icmp::ECHO_REQUEST, 77),
+    );
+    let (_, off, _) = tx(r.process(0, &mut f, OFF, n));
+    let id = u16::from_be_bytes([f[off + 38], f[off + 39]]);
+    let from_8888 = |t| packet(R_WAN, ISP, "8.8.8.8", "203.0.113.1", L4::Echo(t, id));
+    // 8.8.8.8 pinging host A through the session: refused.
+    let (mut f, n) = from_8888(icmp::ECHO_REQUEST);
+    assert_eq!(
+        dropped(r.process(1, &mut f, OFF, n)),
+        DropReason::SessionMismatch
+    );
+    // A redirect or a timestamp request: no session for those, so they
+    // stop at the router.
+    for t in [5, 13] {
+        let (mut f, n) = from_8888(t);
+        assert!(
+            matches!(r.process(1, &mut f, OFF, n), Verdict::Drop(_)),
+            "type {t}"
+        );
+    }
+    // The reply itself still gets in.
+    let (mut f, n) = from_8888(icmp::ECHO_REPLY);
+    assert_eq!(tx(r.process(1, &mut f, OFF, n)).0, 0);
+    // From inside: an echo reply nobody asked for starts nothing, and a
+    // timestamp request out to the internet would need NAT it can't get.
+    let (mut f, n) = packet(
+        R_LAN,
+        HOST_A,
+        "10.0.0.10",
+        "8.8.4.4",
+        L4::Echo(icmp::ECHO_REPLY, 5),
+    );
+    assert_eq!(dropped(r.process(0, &mut f, OFF, n)), DropReason::NoSession);
+    let (mut f, n) = packet(R_LAN, HOST_A, "10.0.0.10", "8.8.4.4", L4::Echo(13, 5));
+    assert_eq!(
+        dropped(r.process(0, &mut f, OFF, n)),
+        DropReason::NatUntranslatable
+    );
 }
 
 #[test]
@@ -545,6 +598,20 @@ fn icmp_errors_from_inside_leave_translated() {
         checksum::checksum(&e[off + 34..off + len]),
         0,
         "ICMP checksum"
+    );
+}
+
+/// An error from inside about a packet no session knows: nothing says how
+/// to translate it, so it mustn't leave carrying host A's private address.
+#[test]
+fn icmp_errors_from_inside_about_no_session_are_not_leaked() {
+    let mut r = router(NatConfig::default());
+    let (f, n) = packet(R_LAN, ISP, "8.8.8.8", "10.0.0.10", L4::Udp(53, 40000));
+    let quoted = f[OFF + 14..OFF + n].to_vec();
+    let (mut e, n) = unreachable(0, "10.0.0.10", "8.8.8.8", &quoted);
+    assert_eq!(
+        dropped(r.process(0, &mut e, OFF, n)),
+        DropReason::NatUntranslatable
     );
 }
 
