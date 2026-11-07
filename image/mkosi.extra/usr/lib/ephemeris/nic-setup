@@ -3,8 +3,20 @@
 set -u
 CONFIG=/var/lib/ephemeris/ephemeris.toml
 udevadm settle --timeout=30 || true   # let udev finish naming NICs (ens19...)
-devices=$(sed -n 's/^[[:space:]]*device[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG")
-workers=$(sed -n 's/^[[:space:]]*workers[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$CONFIG" | head -n1)
+# What to prepare, as ephemerisd reads the config (TOML, so a "device ="
+# line inside a string is just text). Only if it isn't TOML at all, a
+# line-by-line guess, as before: ephemerisd may still fall back to an
+# earlier config, and its cards want preparing too.
+if info=$(/usr/bin/ephemerisd --nic-setup --config "$CONFIG" 2>/dev/null); then
+    devices=$(printf '%s\n' "$info" | sed -n 's/^device //p')
+    workers=$(printf '%s\n' "$info" | sed -n 's/^workers //p')
+    outbound=$(printf '%s\n' "$info" | sed -n 's/^outbound //p')
+else
+    echo "nic-setup: $CONFIG isn't valid TOML; reading it line by line" >&2
+    devices=$(sed -n 's/^[[:space:]]*device[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG")
+    workers=$(sed -n 's/^[[:space:]]*workers[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$CONFIG" | head -n1)
+    outbound=$(sed -n '/^\[management\]/,/^\[/p' "$CONFIG" | sed -n 's/^[[:space:]]*outbound[[:space:]]*=[[:space:]]*"\([a-z]*\)".*/\1/p')
+fi
 workers=${workers:-1}
 for dev in $devices; do
     [ -e "/sys/class/net/$dev" ] || { echo "nic-setup: no such device $dev" >&2; continue; }
@@ -47,7 +59,7 @@ ip rule add from 169.254.240.0/20 lookup 240 priority 100
 # eph-host (no carrier) the kernel ignores it, so the management port's
 # default route, if any, takes over.
 sysctl -qw net.ipv4.conf.eph-host.ignore_routes_with_linkdown=1 2>/dev/null || true
-if sed -n '/^\[management\]/,/^\[/p' "$CONFIG" | grep -q '^[[:space:]]*outbound[[:space:]]*=[[:space:]]*"dataplane"'; then
+if [ "${outbound:-}" = dataplane ]; then
     ip route replace default dev eph-host src 169.254.255.254 metric 50
 else
     ip route del default dev eph-host metric 50 2>/dev/null || true

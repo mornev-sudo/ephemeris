@@ -951,6 +951,7 @@ address = "10.10.2.1/24"
                 pppoe_session: None,
                 addr_now: None,
                 onlink: vec![],
+                strict_source: None,
             });
             m.text_from_model(&cfg).unwrap()
         };

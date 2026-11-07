@@ -56,6 +56,7 @@ fn port(id: u16, name: &str, card: u16, vlan: Option<u16>, addr: &str, len: u8) 
         gateway: None,
         pppoe: Pppoe::Off,
         onlink: vec![],
+        strict_source: false,
         mtu: 1500,
         card,
         vlan,

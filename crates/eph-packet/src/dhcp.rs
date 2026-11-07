@@ -291,7 +291,9 @@ pub fn parse_frame(f: &[u8]) -> Option<Received> {
     if h.proto != ipv4::PROTO_UDP || ipv4::is_fragment(ip) {
         return None;
     }
-    let udp = ip.get(h.hdr_len..h.total_len)?;
+    // The frame's length says nothing about the UDP header's: IP options
+    // and a short total length can leave fewer than 8 bytes of it.
+    let udp = ip.get(h.hdr_len..h.total_len).filter(|u| u.len() >= 8)?;
     let (sport, dport) = (
         u16::from_be_bytes([udp[0], udp[1]]),
         u16::from_be_bytes([udp[2], udp[3]]),
@@ -448,6 +450,24 @@ mod tests {
         let n = bad.len();
         bad[n - 1] ^= 0xff;
         assert!(parse_frame(&bad).is_none());
+    }
+
+    #[test]
+    fn a_udp_header_cut_short_is_rejected() {
+        // IP options (IHL 6) and a total length leaving 4 bytes of UDP,
+        // padded to the minimum frame: long enough as a frame, not as UDP.
+        let mut f = vec![0u8; 60];
+        f[12..14].copy_from_slice(&eth::TYPE_IPV4.to_be_bytes());
+        let ip = &mut f[eth::HDR_LEN..];
+        ip[0] = 0x46;
+        ip[2..4].copy_from_slice(&28u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = ipv4::PROTO_UDP;
+        ip[24..28].copy_from_slice(&[0, 67, 0, 68]);
+        let c = crate::checksum::checksum(&ip[..24]);
+        ip[10..12].copy_from_slice(&c.to_be_bytes());
+        assert!(ipv4::parse(ip).is_ok());
+        assert!(parse_frame(&f).is_none());
     }
 
     #[test]

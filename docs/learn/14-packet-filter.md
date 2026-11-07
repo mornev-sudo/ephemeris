@@ -57,6 +57,7 @@ knows about its interfaces and sessions:
 | Dropped | Why | Counter |
 |---|---|---|
 | A source on one of the router's connected subnets, arriving on a different port | Anti-spoofing (RFC 3704): a LAN host's packets can only come from the LAN | `spoofed-source` |
+| On an inside interface, a source that doesn't route back out the interface it arrived on | Strict reverse path (RFC 3704): a LAN host can't pass for a network behind another port, or for the internet, e.g. to match `management_from`. `strict_source = false` turns it off on an interface where traffic returns another way than it left (asymmetric routing); outside interfaces only get the check above, since several WANs and SD-WAN tethers may use any of them | `spoofed-source` |
 | A packet out of an SD-WAN tether whose source isn't one of that site's prefixes | Same, for the overlay | `spoofed-source` |
 | A packet that matches a session but arrives on a different port than that direction does | The session's 5-tuple guessed or copied from elsewhere. Replies are expected where the first packet left | `session-mismatch` |
 | A reply to a NATed session sent to the inside host's own (private) address | Going around the NAT: replies come to the translated address | `session-mismatch` |

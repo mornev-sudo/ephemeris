@@ -154,11 +154,9 @@ pub fn run(config_path: &Path) -> Result<()> {
         } else {
             String::new()
         },
-        auth: crate::mgmt::auth::Auth::new(
-            std::path::Path::new(&m.token_file)
-                .parent()
-                .unwrap_or(std::path::Path::new("/var/lib/ephemeris")),
-        ),
+        // Next to the config, wherever the token file is: the admin
+        // password's hash mustn't move with a config change.
+        auth: crate::mgmt::auth::Auth::new(&state_dir),
         startup,
         dhcp: dhcp_state,
         endpoints,
@@ -1176,6 +1174,7 @@ mod tests {
             gateway: None,
             pppoe: eph_dataplane::Pppoe::Off,
             onlink: vec![],
+            strict_source: false,
             mtu: 1492,
             card: 0,
             vlan: None,

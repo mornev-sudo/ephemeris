@@ -53,6 +53,12 @@ struct Args {
     /// there isn't one. The key pair lives next to the config file.
     #[arg(long)]
     controller_identity: bool,
+    /// Print what nic-setup prepares before the router starts, read from
+    /// the config file: each data-plane `device`, then `workers` and
+    /// `outbound`, one "key value" line each. The file is parsed as TOML,
+    /// not checked: the router may yet start from it, or fall back.
+    #[arg(long)]
+    nic_setup: bool,
     /// Measure how fast this machine seals SD-WAN packets with each cipher
     /// (one core), and whether it has AES in hardware.
     #[arg(long)]
@@ -72,6 +78,11 @@ fn main() -> anyhow::Result<()> {
         std::io::stdin().read_line(&mut pw)?;
         let pw = pw.strip_suffix('\n').unwrap_or(&pw);
         println!("{}", mgmt::auth::hash_password(pw)?);
+        return Ok(());
+    }
+    if args.nic_setup {
+        let text = std::fs::read_to_string(&args.config)?;
+        print!("{}", config::nic_setup(&text)?);
         return Ok(());
     }
     if args.bench_crypto {

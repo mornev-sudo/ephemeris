@@ -235,7 +235,8 @@ The router:
    (`conflict` too).
 2. Validates it exactly as `PUT /config` does; errors come back as they
    would in the portal.
-3. Keeps its own `[controller]` section, whatever the push says.
+3. Keeps its own `[controller]` section and `[management] token_file`,
+   whatever the push says.
 4. Commits it as a confirmed commit (`confirm_within_secs`, 30 s to
    1 h; anything else is `bad_request`), applying it live or after a
    restart, as `POST /config/commit` does. A config staged in the portal
@@ -418,6 +419,9 @@ on the router for that beyond `overlay.identity`.
 - **What a stolen controller can't do:** install software not signed by
   the release key, change what boots, change or remove `[controller]`, or
   read the admin password (only its hash exists, and it's never sent).
+  Nor can it reach the admin password another way: a push keeps the
+  router's own `[management] token_file`, so the API token stays one the
+  controller doesn't know.
 - **What it can do:** change configs within the rules above, so it can
   disrupt or redirect traffic. That's inherent to central management;
   protect the controller accordingly, and every change remains visible and
@@ -446,4 +450,5 @@ Left: an end-to-end test in this repo's CI with a minimal test controller
   forever (the default assumption: it's just a router with a config).
 - Whether the controller may push `[management]` and `[ssh]` (e.g. keys
   only): useful fleet-wide, but a bad push could lock local access out;
-  the confirm timer covers it if the controller connection survives.
+  the confirm timer covers it if the controller connection survives. Today
+  it may, except `token_file`, which stays the router's.

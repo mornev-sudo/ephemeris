@@ -101,6 +101,11 @@ ISP's concentrator, so:
   is the gateway and the only directly reachable neighbour. The forwarding
   table gets a /32 route to it, and the default route via it (unless you
   configured a static one).
+  An address or far end that lies inside a network configured here (an
+  interface's subnet, another site's prefixes, an overlay route) makes
+  the router ignore the session, with a warning in the log: it would take that
+  network's traffic out of the WAN (see chapter 15, "What a server can't
+  hand out").
 - **No ARP:** every packet goes to the concentrator's MAC address, learned
   during discovery.
 - **8 bytes less:** the PPPoE header and the PPP protocol number take 8 of

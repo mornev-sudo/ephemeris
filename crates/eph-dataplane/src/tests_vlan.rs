@@ -50,6 +50,7 @@ fn port(id: u16, name: &str, card: u16, vlan: Option<u16>, mac: Mac, addr: &str)
         gateway: None,
         pppoe: Pppoe::Off,
         onlink: vec![],
+        strict_source: false,
         mtu: 1500,
     }
 }

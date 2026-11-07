@@ -44,6 +44,7 @@ fn port(id: u16, addr: &str, subnet: &str, mss_adjust: Option<u16>) -> Port {
         gateway: None,
         pppoe: crate::config::Pppoe::Off,
         onlink: vec![],
+        strict_source: false,
         mtu: 1500,
     }
 }

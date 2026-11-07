@@ -154,6 +154,31 @@ requires, when they're present the plain Router option is ignored, and the
 default route comes from their `0.0.0.0/0` entry. A static route you
 configure for the same prefix wins.
 
+### What a server can't hand out
+
+Whoever answers on the WAN decides what a lease says, and the WAN is the
+side that isn't trusted. A lease's subnet or route that falls *inside* a
+network configured on this router would win the route lookup (the same or
+a longer prefix), and send traffic meant for the LAN, a static route or
+another SD-WAN site out of the WAN to whoever answered there, in plain
+text. So the router ignores:
+
+- a lease whose subnet or gateway lies inside a fixed interface's subnet,
+  another site's `prefixes` or an `[[overlay_route]]`;
+- any option 121 route into one of those or into a static route's prefix,
+  or via a gateway inside one of those.
+
+Each shows in the WAN status (`ephctl wan`: `IGNORED: <what>`; the
+dashboard: "ignored") for as long as it holds, and is logged as a warning
+when it first appears (`ephctl log show -c dhcp-client`); the rest of the
+lease still applies. A WAN subnet *broader* than the LAN (a
+`10.0.0.0/8` lease with a `10.10.1.0/24` LAN) is fine: the LAN's longer
+prefix still wins. So is a WAN address inside a broad static route
+(`192.168.1.50/24` from an upstream router, with `192.168.0.0/16` routed
+inside): that's an ordinary double NAT. A PPPoE session whose address or
+far end lies inside one of these networks is ignored the same way
+(chapter 16).
+
 If a lease still can't be put into effect, the WAN status says so
 (`ephctl wan`: `NOT APPLIED: <reason>`; the dashboard: "not applied"),
 and the router tries again every 10 seconds. Before 0.9.1 that only went

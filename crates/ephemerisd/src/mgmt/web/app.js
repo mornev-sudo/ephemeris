@@ -172,13 +172,14 @@ async function refreshDash() {
   $("dashwarn").classList.toggle("hidden", !warn.length);
   const wan = await api("GET", "/wan");
   table($("wantab"), ["Interface", "Mode", "State", "Address", "Gateway", "DNS", ""], wan.map(w => {
-    const ok = (w.state === "up" || w.state === "bound") && !w.apply_error;
+    const ok = (w.state === "up" || w.state === "bound") && !w.apply_error && !(w.ignored || []).length;
     let detail = "";
     if (w.mode === "pppoe") detail = w.pppoe.session != null
       ? `${w.pppoe.concentrator || "ISP"} · session ${w.pppoe.session} · MTU ${w.pppoe.mtu} · up ${dur(w.pppoe.up_for_secs)}`
       : (w.pppoe.last_error ? "last error: " + w.pppoe.last_error : "dialling as " + w.pppoe.username);
     if (w.mode === "dhcp" && w.dhcp.server) detail = `from ${w.dhcp.server} · lease ends in ${dur(w.dhcp.expires_in_secs)}`;
     if (w.apply_error) detail = "not applied: " + w.apply_error + (detail ? " · " + detail : "");
+    if ((w.ignored || []).length) detail = "ignored: " + w.ignored.join("; ") + (detail ? " · " + detail : "");
     return [w.interface, { pppoe: "PPPoE", dhcp: "DHCP", static: "static" }[w.mode], td(w.state || "—", ok ? "ok" : "warn"),
       td(w.address || "—", "mono"), td(w.gateway || "—", "mono"), td((w.dns || []).join(", ") || "—", "mono"), td(detail, "s")];
   }));
@@ -532,7 +533,7 @@ function renderNics() {
 }
 
 const newInterface = device => ({ name: "", device, vlan: null, address: "", role: "inside", allow_new_sessions: null,
-  mss_adjust: null, mtu: null, gateway: null, dhcp: null });
+  strict_source: null, mss_adjust: null, mtu: null, gateway: null, dhcp: null });
 
 /// Which of the router's own services (SSH, the portal) this interface
 /// offers on its address. Inside interfaces only.
@@ -645,6 +646,9 @@ function renderIfaces() {
         placeholder: i.mtu && i.mtu < 1500 ? `auto (${i.mtu - 40})` : (mode === "pppoe" ? "auto (1452)" : "off") },
       { key: "allow_new_sessions", label: "New sessions from here", type: "select", bool: true,
         options: [["", "default for the role"], ["true", "allowed"], ["false", "replies only"]] },
+      { key: "strict_source", label: "Source check", type: "select", bool: true,
+        options: [["", "default for the role"], ["true", "strict"], ["false", "loose"]],
+        help: "Strict: packets must come from addresses that route back out this interface (default on inside). Loose only where traffic returns another way than it left." },
     ]);
     c.append(link);
     c.append(accessFields(i));

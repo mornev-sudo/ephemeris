@@ -168,8 +168,8 @@ fn push(s: &Arc<Shared>, msg: &Value) -> Result<Value, Refused> {
         if m.pending_confirm().is_some() {
             return Err(refused("conflict", "a confirmed commit is still waiting"));
         }
-        let text = keep_controller(text, m.running().controller.as_ref())
-            .map_err(|e| refused("bad_request", format!("{e:#}")))?;
+        let text =
+            keep_local(text, m.running()).map_err(|e| refused("bad_request", format!("{e:#}")))?;
         m.set_candidate(text)
             .map_err(|e| refused("bad_request", format!("{e:#}")))?;
         m.commit(Some(secs))
@@ -203,19 +203,31 @@ fn push(s: &Arc<Shared>, msg: &Value) -> Result<Value, Refused> {
     Ok(v)
 }
 
-/// The pushed config with the router's own `[controller]` section: a push
-/// can't hand the router to another controller, nor unenrol it.
-fn keep_controller(
-    text: &str,
-    mine: Option<&crate::config::ControllerCfg>,
-) -> anyhow::Result<String> {
+/// The pushed config with what stays the router's own: its `[controller]`
+/// section, so a push can't hand the router to another controller nor
+/// unenrol it; and `[management] token_file`, so a push can't point the API
+/// token at a file whose contents the controller knows (the config version,
+/// say) and then use that token to reset the admin password.
+fn keep_local(text: &str, running: &crate::config::Config) -> anyhow::Result<String> {
     let mut doc: DocumentMut = text.parse()?;
     doc.remove("controller");
-    if let Some(c) = mine {
+    if let Some(c) = &running.controller {
         let mut t = Table::new();
         t["url"] = value(c.url.as_str());
         t["pin"] = value(c.pin.as_str());
         doc.insert("controller", Item::Table(t));
+    }
+    let token_file = running.management.token_file.as_str();
+    match doc.get_mut("management").and_then(Item::as_table_like_mut) {
+        Some(t) => {
+            t.insert("token_file", value(token_file));
+        }
+        None if token_file != eph_config::ManagementCfg::default().token_file => {
+            let mut t = Table::new();
+            t["token_file"] = value(token_file);
+            doc.insert("management", Item::Table(t));
+        }
+        None => {}
     }
     Ok(doc.to_string())
 }
@@ -224,21 +236,40 @@ fn keep_controller(
 mod tests {
     use super::*;
 
+    const IFACE: &str =
+        "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n";
+
     #[test]
-    fn a_push_keeps_the_routers_own_controller_section() {
-        let mine = crate::config::ControllerCfg {
+    fn a_push_keeps_the_routers_own_controller_section_and_token_file() {
+        let parse = |t: &str| -> crate::config::Config { toml::from_str(t).unwrap() };
+        let mut mine = parse(IFACE);
+        mine.controller = Some(crate::config::ControllerCfg {
             url: "https://mine.example.net/".into(),
             pin: format!("sha256:{}", "ab".repeat(32)),
-        };
-        let pushed = "[dataplane]\nworkers = 2\n\n[controller]\nurl = \"https://evil.example.net/\"\npin = \"x\"\n";
-        let kept = keep_controller(pushed, Some(&mine)).unwrap();
+        });
+        let pushed = format!(
+            "[dataplane]\nworkers = 2\n\n[controller]\nurl = \"https://evil.example.net/\"\npin = \"x\"\n\n\
+             [management]\nhostnames = [\"r1.example.net\"]\ntoken_file = \"/var/lib/ephemeris/config-version\"\n\n{IFACE}"
+        );
+        let kept = keep_local(&pushed, &mine).unwrap();
         assert!(
             kept.contains("mine.example.net") && !kept.contains("evil"),
             "{kept}"
         );
-        assert!(kept.contains("workers = 2"));
+        let cfg = parse(&kept);
+        assert_eq!(cfg.dataplane.workers, 2);
+        // The rest of [management] is the push's; the token file isn't.
+        assert_eq!(cfg.management.hostnames, ["r1.example.net"]);
+        assert_eq!(cfg.management.token_file, "/var/lib/ephemeris/api-token");
         // Not enrolled: a push can't enrol it either.
-        let none = keep_controller(pushed, None).unwrap();
+        mine.controller = None;
+        mine.management.token_file = "/var/lib/ephemeris/other-token".into();
+        let none = keep_local(IFACE, &mine).unwrap();
         assert!(!none.contains("[controller]"), "{none}");
+        // Without [management], the router's own token file is kept too.
+        assert_eq!(
+            parse(&none).management.token_file,
+            "/var/lib/ephemeris/other-token"
+        );
     }
 }

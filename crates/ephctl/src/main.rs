@@ -498,6 +498,15 @@ fn run(cli: Cli) -> Result<()> {
                         Some(e) => format!("NOT APPLIED: {e}; {detail}"),
                         None => detail,
                     };
+                    let ignored: Vec<&str> = x["ignored"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let detail = if ignored.is_empty() {
+                        detail
+                    } else {
+                        format!("IGNORED: {}; {detail}", ignored.join("; "))
+                    };
                     vec![
                         str(&x["interface"]),
                         str(&x["mode"]),
@@ -1057,8 +1066,20 @@ fn config(c: &Client, cmd: ConfigCmd, json: bool) -> Result<()> {
                 .or(v["running"].as_str())
                 .unwrap_or("")
                 .to_string();
+            // It holds secrets (PPPoE passwords, tether keys): readable by
+            // us only, and a new file, never one someone put there first.
             let path = std::env::temp_dir().join(format!("ephctl-{}.toml", std::process::id()));
-            std::fs::write(&path, &start)?;
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .with_context(|| format!("creating {}", path.display()))?
+                    .write_all(start.as_bytes())?;
+            }
             let editor = std::env::var("VISUAL")
                 .or_else(|_| std::env::var("EDITOR"))
                 .unwrap_or_else(|_| "vi".into());
