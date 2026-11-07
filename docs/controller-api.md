@@ -1,8 +1,7 @@
 # The controller contract
 
 **Status:** implemented from router 0.13.0 (config and telemetry); live
-tables and operations from the release after it. This describes how an
-Ephemeris router
+tables and operations from 0.14.0. This describes how an Ephemeris router
 is managed by a controller: one place from which an organisation runs all
 its routers. It's the router's side of the contract: what a router
 promises, and what it accepts. Any controller that speaks it can manage
