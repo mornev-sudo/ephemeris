@@ -176,8 +176,8 @@ The first message after connecting, from the router:
 ```json
 {
   "type": "hello", "id": 1, "protocol": 1,
-  "router": {"version": "0.13.0-abc1234", "hostname": "cpt-br1"},
-  "config": {"version": 42, "sha256": "...", "schema": "0.13"},
+  "router": {"version": "0.14.0-abc1234", "hostname": "cpt-br1"},
+  "config": {"version": 42, "sha256": "...", "schema": "0.14"},
   "pending_confirm": null,
   "capabilities": ["config", "telemetry", "operations", "tables"]
 }
@@ -356,7 +356,7 @@ capability in `hello`; a controller sends them to no other router.
 | `routes.get` | `{"items": [...], "total": n}`: as `GET /routes`, in the forwarding table's order |
 | `neighbors.get` | `{"items": [...], "total": n}`: as `GET /neighbors` |
 | `dhcp.get` | exactly the `GET /dhcp` body |
-| `wan.get` | exactly the `GET /wan` body |
+| `wan.get` | exactly the `GET /wan` body: DHCP and PPPoE entries carry `ignored` (what the router is ignoring from the lease or session, as a list of strings, `[]` when nothing), static ones don't |
 | `overlay.get` | exactly the `GET /overlay` body |
 
 - List requests take an optional `"limit"`: default and most 1000 (a
@@ -404,7 +404,7 @@ on the router for that beyond `overlay.identity`.
   protocol version; a controller should speak the current one and the one
   before.
 - **`config.schema`:** the router's config format, named by the release
-  that defined it (`"0.13"`). The controller builds configs with the
+  that defined it (`"0.14"`). The controller builds configs with the
   `eph-config` crate of that version.
 - **`capabilities`:** what this router supports; a controller only sends
   what's listed.
