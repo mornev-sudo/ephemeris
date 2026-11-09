@@ -56,8 +56,9 @@ password_login = false
 ```
 
 ephemerisd writes the setting where sshd picks it up
-(`/run/ephemeris-ssh/`, included first by the image's sshd config) and
-reloads sshd, without a restart. A commit that turns passwords off is
+(`/run/ephemeris-ssh/`, included first by the image's sshd config): at
+boot before sshd starts, and on a change by restarting sshd, which keeps
+logged-in sessions. A commit that turns passwords off is
 refused while no key is installed for root, because SSH would then let
 nobody in. The console always takes the password.
 
