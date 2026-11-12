@@ -1,7 +1,7 @@
 use crate::config::{Dhcp, NextHop, Port, PortId, Pppoe, Role};
 use crate::filter;
 use crate::host;
-use crate::nat::{self, NatConfig};
+use crate::nat::{self, NatConfig, NewFlow};
 use crate::overlay::{
     self, Endpoints, KeyTable, Overlay, PathTable, PeerCrypto, ReplayGuard, TetherId, TetherKey,
     TetherStats, OUTER_LEN, TAG_LEN,
@@ -1130,8 +1130,15 @@ impl Pipeline {
         if ours && ipv4::is_fragment(&frame[off + ETH..]) {
             return Verdict::Drop(DropReason::FragmentToRouter);
         }
+        // A port forward's new session: carried on to the inside host, with
+        // the public address and port it was sent to.
+        let mut dnat = None;
         if ours && !self.is_nat_reply(frame, off, &h) {
-            return self.local(ingress, frame, off, len, &h, via);
+            match self.forward(ingress, via, frame, off, len, &mut h) {
+                Some(Ok(public)) => dnat = Some(public),
+                Some(Err(v)) => return v,
+                None => return self.local(ingress, frame, off, len, &h, via),
+            }
         }
 
         if h.ttl <= 1 {
@@ -1178,7 +1185,7 @@ impl Pipeline {
         } else {
             ingress
         };
-        let (nh, sess) = match self.track(ingress, at, frame, off, &mut h, allow_new) {
+        let (nh, sess) = match self.track(ingress, at, frame, off, &mut h, allow_new, dnat) {
             Ok(x) => x,
             Err(v) => return v,
         };
@@ -1240,6 +1247,8 @@ impl Pipeline {
     /// Session tracking and policy, then the route decision. Returns the next
     /// hop (and the session, if any), or the verdict to give instead. `at`
     /// is the ingress the session table sees (see [`OVERLAY_INGRESS`]).
+    /// `dnat`: a port forward's first packet, already sent on to the inside
+    /// host; the public address and port it came to.
     #[allow(clippy::too_many_arguments)]
     fn track(
         &mut self,
@@ -1249,6 +1258,7 @@ impl Pipeline {
         off: usize,
         h: &mut ipv4::Header,
         allow_new: bool,
+        dnat: Option<(Ipv4Addr, u16)>,
     ) -> Result<(NextHop, Option<u32>), Verdict> {
         let bytes = h.total_len as u64;
         let now = self.now_ns;
@@ -1267,15 +1277,17 @@ impl Pipeline {
                     let s = self.sessions.get(idx);
                     let nat = s.nat;
                     let translated_side = nat.is_some_and(|n| n.xkey == key);
-                    let dir = if translated_side {
-                        Dir::Reverse
-                    } else {
-                        s.dir(lo_to_hi)
+                    let dir = match nat {
+                        // The outside end's packets, sent to the translated
+                        // address: replies (source NAT), or the requests of
+                        // a port forward.
+                        Some(n) if translated_side => n.inside().other(),
+                        _ => s.dir(lo_to_hi),
                     };
-                    // Replies to a NATed session come to the translated
-                    // address. The same reply sent straight to the inside
-                    // host's own address is someone going around the NAT.
-                    if nat.is_some() && !translated_side && dir == Dir::Reverse {
+                    // The outside end's packets come to the translated
+                    // address. The same sent straight to the inside host's
+                    // own address is someone going around the NAT.
+                    if nat.is_some_and(|n| !translated_side && dir != n.inside()) {
                         return Err(Verdict::Drop(DropReason::SessionMismatch));
                     }
                     // A ping session carries requests one way and replies the
@@ -1310,15 +1322,15 @@ impl Pipeline {
                         return Err(Verdict::Drop(DropReason::InvalidTcpState));
                     };
                     match nat {
-                        // Reply: back to the original inside address and
-                        // port, *before* routing (that's where it goes now).
+                        // Inbound: on to the inside address and port,
+                        // *before* routing (that's where it goes now).
                         Some(n) if translated_side => {
                             nat::translate_dst(&mut frame[ip.clone()], n.orig_addr, n.orig_port);
                             h.dst = n.orig_addr;
                         }
                         // Outbound: rewrite the source. Routing only looks at
                         // the destination, so the order doesn't matter here.
-                        Some(n) if dir == Dir::Forward => {
+                        Some(n) if dir == n.inside() => {
                             nat::translate_src(&mut frame[ip.clone()], n.addr, n.port);
                             h.src = n.addr;
                         }
@@ -1342,14 +1354,46 @@ impl Pipeline {
                     s.ingress[other] = s.ingress[other].or(Some(egress_of(nh)));
                     return Ok((nh, Some(idx)));
                 }
-                // First packet of a new session: for a ping, the request.
-                if !allow_new || echo == Some(icmp::ECHO_REPLY) {
+                // First packet of a new session: for a ping, the request. A
+                // port forward allows its own sessions, and a firewall rule
+                // may allow one the interface wouldn't.
+                if echo == Some(icmp::ECHO_REPLY)
+                    || (!allow_new && dnat.is_none() && !self.nat.may_allow())
+                {
                     return Err(Verdict::Drop(DropReason::NoSession));
                 }
                 if !self.sessions.can_create(key.proto, tcp_flags) {
                     return Err(Verdict::Drop(DropReason::InvalidTcpState));
                 }
+                let (sport, dport) = if lo_to_hi {
+                    (key.lo_port, key.hi_port)
+                } else {
+                    (key.hi_port, key.lo_port)
+                };
+                // A port forward's inside host answering a session that's on
+                // another worker (the card couldn't be steered): to it.
+                if dnat.is_none()
+                    && at != OVERLAY_INGRESS
+                    && self.workers > 1
+                    && !self.handed
+                    && self.nat.forwarded(key.proto, h.src, sport)
+                {
+                    let owner = self.dnat_owner(ingress, key.proto, (h.src, sport), (h.dst, dport));
+                    if owner != self.worker_id {
+                        let len = ETH + h.total_len;
+                        return Err(self.hand_off(owner, ingress, None, frame, off, len));
+                    }
+                }
                 let nh = self.route(ingress, frame, off, h)?;
+                let rule = (!self.nat.firewall.is_empty())
+                    .then(|| self.nat.firewall(&self.new_flow(at, nh, h, Some(dport))))
+                    .flatten();
+                match rule {
+                    Some(true) => {}
+                    Some(false) => return Err(Verdict::Drop(DropReason::Firewall)),
+                    None if allow_new || dnat.is_some() => {}
+                    None => return Err(Verdict::Drop(DropReason::NoSession)),
+                }
                 // Source NAT for this new session? Decide and reserve the
                 // translated tuple *before* creating the session, so a session
                 // never exists half-translated.
@@ -1357,14 +1401,18 @@ impl Pipeline {
                     return Err(Verdict::Drop(DropReason::HostSessionLimit));
                 }
                 let mut binding = None;
-                if let NextHop::Ip { port: egress, .. } = nh {
+                if let Some((addr, port)) = dnat {
+                    binding = Some(NatBinding {
+                        xkey: FlowKey::new(h.src, sport, addr, port, key.proto).0,
+                        orig_addr: h.dst,
+                        orig_port: dport,
+                        addr,
+                        port,
+                        dnat: true,
+                    });
+                } else if let NextHop::Ip { port: egress, .. } = nh {
                     if let Some(addr) = self.nat.decide(&self.ports, ingress, egress, h.src, h.dst)
                     {
-                        let (sport, dport) = if lo_to_hi {
-                            (key.lo_port, key.hi_port)
-                        } else {
-                            (key.hi_port, key.lo_port)
-                        };
                         let Some((port, xkey)) =
                             self.alloc_nat(egress, key.proto, addr, h.dst, sport, dport)
                         else {
@@ -1376,6 +1424,7 @@ impl Pipeline {
                             orig_port: sport,
                             addr,
                             port,
+                            dnat: false,
                         });
                     }
                 }
@@ -1415,8 +1464,11 @@ impl Pipeline {
                 }
                 if let Some(b) = binding {
                     self.sessions.bind_nat(idx, b);
-                    nat::translate_src(&mut frame[ip.clone()], b.addr, b.port);
-                    h.src = b.addr;
+                    // A forward's packet was translated on its way in.
+                    if !b.dnat {
+                        nat::translate_src(&mut frame[ip.clone()], b.addr, b.port);
+                        h.src = b.addr;
+                    }
                 }
                 // The first packet decides the session's application class:
                 // the server port is its destination port.
@@ -1463,7 +1515,7 @@ impl Pipeline {
                         // About the inside host's own, untranslated packet:
                         // only something between that host and us saw it, so
                         // it comes in where the host's packets do...
-                        Some(_) if seen[Dir::Forward as usize] != Some(at) => {
+                        Some(n) if seen[n.inside() as usize] != Some(at) => {
                             return Err(Verdict::Drop(DropReason::SessionMismatch));
                         }
                         // ...and leaves translated, like the session.
@@ -1496,10 +1548,19 @@ impl Pipeline {
             // Non-first fragments carry no ports, so they can't be matched to
             // a session. Forwarded only from ports that may start sessions.
             Flow::Untracked => {
-                if !allow_new {
+                if !allow_new && !self.nat.may_allow() {
                     return Err(Verdict::Drop(DropReason::NoSession));
                 }
                 let nh = self.route(ingress, frame, off, h)?;
+                let rule = (!self.nat.firewall.is_empty())
+                    .then(|| self.nat.firewall(&self.new_flow(at, nh, h, None)))
+                    .flatten();
+                match rule {
+                    Some(true) => {}
+                    Some(false) => return Err(Verdict::Drop(DropReason::Firewall)),
+                    None if allow_new => {}
+                    None => return Err(Verdict::Drop(DropReason::NoSession)),
+                }
                 // ...and can't be translated either: one that needs source NAT
                 // must not leave with the inside address.
                 if let NextHop::Ip { port: egress, .. } = nh {
@@ -1530,6 +1591,118 @@ impl Pipeline {
                         || matches!(self.fib.lookup(src), Some(&NextHop::Ip { port, .. }) if port == ingress))
             }
         }
+    }
+
+    /// A new session as the firewall sees it.
+    fn new_flow(&self, at: PortId, nh: NextHop, h: &ipv4::Header, dport: Option<u16>) -> NewFlow {
+        NewFlow {
+            ingress: (at != OVERLAY_INGRESS).then_some(at),
+            egress: match nh {
+                NextHop::Ip { port, .. } => Some(port),
+                NextHop::Site(_) => None,
+            },
+            src: h.src,
+            dst: h.dst,
+            proto: h.proto,
+            dport: dport.filter(|_| matches!(h.proto, ipv4::PROTO_TCP | ipv4::PROTO_UDP)),
+        }
+    }
+
+    /// A packet to an interface's own address with no session: is it for a
+    /// port forward? `None`: no, it's for the router. Otherwise the public
+    /// address and port it came to, with the packet sent on to the inside
+    /// host (`h` updated), or the verdict instead: handed to the worker the
+    /// inside host's replies will reach, so the session is made there, or
+    /// dropped.
+    fn forward(
+        &mut self,
+        ingress: PortId,
+        via: Option<TetherId>,
+        frame: &mut [u8],
+        off: usize,
+        len: usize,
+        h: &mut ipv4::Header,
+    ) -> Option<Result<(Ipv4Addr, u16), Verdict>> {
+        if via.is_some()
+            || self.nat.forwards.is_empty()
+            || h.dst != self.ports[ingress as usize].addr
+            || !matches!(h.proto, ipv4::PROTO_TCP | ipv4::PROTO_UDP)
+        {
+            return None;
+        }
+        let Ok(Flow::Tracked { key, lo_to_hi, .. }) = flow_of(&frame[off + ETH..off + len], h)
+        else {
+            return None;
+        };
+        let (sport, dport) = if lo_to_hi {
+            (key.lo_port, key.hi_port)
+        } else {
+            (key.hi_port, key.lo_port)
+        };
+        let (to, to_port) = self.nat.forward(ingress, h.proto, h.src, dport)?;
+        // Errors about it would quote the inside host: none are sent.
+        if h.ttl <= 1 {
+            return Some(Err(Verdict::Drop(DropReason::TtlExceeded)));
+        }
+        if let Some(mtu) = self
+            .mtu_towards(to, h.total_len)
+            .filter(|&m| h.total_len > m)
+        {
+            // Too big for the way in: answered about the packet as the
+            // client sent it.
+            if frame[off + ETH + 6] & 0x40 == 0 {
+                return Some(Err(Verdict::Drop(DropReason::TooBig)));
+            }
+            return Some(Err(self.icmp_error(
+                ingress,
+                frame,
+                off,
+                h,
+                icmp::DEST_UNREACHABLE,
+                icmp::CODE_FRAG_NEEDED,
+                mtu as u32,
+                DropReason::TooBig,
+            )));
+        }
+        if self.workers > 1 && !self.handed {
+            if let Some(&NextHop::Ip { port: inside, .. }) = self.fib.lookup(to) {
+                let owner = self.dnat_owner(inside, h.proto, (to, to_port), (h.src, sport));
+                if owner != self.worker_id {
+                    return Some(Err(self.hand_off(owner, ingress, None, frame, off, len)));
+                }
+            }
+        }
+        let public = (h.dst, dport);
+        nat::translate_dst(&mut frame[off + ETH..off + len], to, to_port);
+        h.dst = to;
+        Some(Ok(public))
+    }
+
+    /// The worker that holds a port forward's session: the one the inside
+    /// card delivers the inside host's replies (from `server` to `client`)
+    /// to, where that can be predicted (see [`crate::steer`]), else one
+    /// picked by a fixed hash both directions can work out.
+    fn dnat_owner(
+        &self,
+        inside: PortId,
+        proto: u8,
+        server: (Ipv4Addr, u16),
+        client: (Ipv4Addr, u16),
+    ) -> u16 {
+        let p = &self.ports[inside as usize];
+        if p.pppoe == Pppoe::Off && self.steer.steers_ports(p.card, proto) {
+            if let Some(q) = self
+                .steer
+                .queue(p.card, proto, server, client)
+                .filter(|&q| q < self.workers)
+            {
+                return q;
+            }
+        }
+        let x = (u32::from(server.0) ^ u32::from(client.0))
+            ^ (server.1 ^ client.1) as u32
+            ^ proto as u32;
+        (x.wrapping_mul(0x9e37_79b1) >> 16) as u16 % self.workers
     }
 
     /// Is this packet, addressed to one of our own (outside or pool)
@@ -1700,7 +1873,7 @@ impl Pipeline {
             }
             return self.overlay_rx(ingress, frame, off, len, h);
         }
-        if via.is_none() && h.proto == ipv4::PROTO_TCP {
+        if via.is_none() && matches!(h.proto, ipv4::PROTO_TCP | ipv4::PROTO_UDP) {
             if let Some(v) = self.punt_to_host(ingress, frame, off, len, h) {
                 return v;
             }
@@ -1771,17 +1944,23 @@ impl Pipeline {
         let l4 = off + ETH + h.hdr_len;
         let ip = off + ETH..off + len;
         let port = &self.ports[ingress as usize];
+        let tcp = h.proto == ipv4::PROTO_TCP;
+        let l4_min = if tcp { 20 } else { l4::UDP_HDR_LEN };
         // Its own address only: a LAN client can't reach the router through
         // another port's address, and nothing reaches it from outside.
-        if h.dst != port.addr || ipv4::is_fragment(&frame[ip.clone()]) || len < l4 - off + 20 {
+        if h.dst != port.addr || ipv4::is_fragment(&frame[ip.clone()]) || len < l4 - off + l4_min {
             return None;
         }
         let dport = u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]]);
-        if !host::allowed_in(port, h.src, dport) {
+        if !host::allowed_in(port, h.src, h.proto, dport) {
             return None;
         }
-        let to = host::host_addr(ingress)?;
-        let mss = port.mss_adjust;
+        let to = if dport == host::DNS_PORT {
+            host::DNS_ADDR
+        } else {
+            host::host_addr(ingress)?
+        };
+        let mss = port.mss_adjust.filter(|_| tcp);
         nat::translate_dst(&mut frame[ip.clone()], to, dport);
         // Segments the host sends back must fit this port's link too.
         if let Some(max) = mss {
@@ -1821,27 +2000,49 @@ impl Pipeline {
         let len = ETH + h.total_len;
         let ip = off + ETH..off + len;
         let l4 = off + ETH + h.hdr_len;
-        let Some(pid) = host::port_of(h.src).filter(|&p| (p as usize) < self.ports.len()) else {
-            return Verdict::Drop(DropReason::LocalUnhandled);
-        };
-        let port = &self.ports[pid as usize];
-        if h.proto != ipv4::PROTO_TCP
+        let tcp = h.proto == ipv4::PROTO_TCP;
+        let l4_min = if tcp { 20 } else { l4::UDP_HDR_LEN };
+        if !matches!(h.proto, ipv4::PROTO_TCP | ipv4::PROTO_UDP)
             || ipv4::is_fragment(&frame[ip.clone()])
-            || len < l4 - off + 20
+            || len < l4 - off + l4_min
         {
             return Verdict::Drop(DropReason::LocalUnhandled);
         }
+        // Back out of an inside port, never towards the outside or a tether.
+        let out = match self.fib.lookup(h.dst) {
+            Some(&NextHop::Ip { port: out, .. })
+                if self.ports[out as usize].role == Role::Inside =>
+            {
+                Some(out)
+            }
+            _ => None,
+        };
+        // DNS answers for every interface: as the one the client is on.
+        let pid = if h.src == host::DNS_ADDR {
+            out
+        } else {
+            host::port_of(h.src).filter(|&p| (p as usize) < self.ports.len())
+        };
+        let Some(pid) = pid else {
+            return Verdict::Drop(if h.src == host::DNS_ADDR {
+                DropReason::NoRoute
+            } else {
+                DropReason::LocalUnhandled
+            });
+        };
+        let port = &self.ports[pid as usize];
         let sport = u16::from_be_bytes([frame[l4], frame[l4 + 1]]);
-        if port.role != Role::Inside || !port.host.offers(sport) || port.addr.is_unspecified() {
+        if port.role != Role::Inside
+            || !port.host.offers(h.proto, sport)
+            || (h.src == host::DNS_ADDR) != (sport == host::DNS_PORT)
+            || port.addr.is_unspecified()
+        {
             return Verdict::Drop(DropReason::LocalUnhandled);
         }
-        // Back out of an inside port, never towards the outside or a tether.
-        match self.fib.lookup(h.dst) {
-            Some(NextHop::Ip { port: out, .. })
-                if self.ports[*out as usize].role == Role::Inside => {}
-            _ => return Verdict::Drop(DropReason::NoRoute),
+        if out.is_none() {
+            return Verdict::Drop(DropReason::NoRoute);
         }
-        let (addr, mss) = (port.addr, port.mss_adjust);
+        let (addr, mss) = (port.addr, port.mss_adjust.filter(|_| tcp));
         nat::translate_src(&mut frame[ip.clone()], addr, sport);
         if let Some(max) = mss {
             clamp_mss(&mut frame[ip], &h, max);
@@ -1940,6 +2141,7 @@ impl Pipeline {
                     orig_port: sport,
                     addr,
                     port,
+                    dnat: false,
                 },
             );
             let s = self.sessions.get_mut(idx);

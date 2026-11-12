@@ -192,7 +192,10 @@ a browser.
 - [x] **VLANs (802.1Q):** several interfaces per card, each with its own tag (and at most one untagged), PPPoE over a VLAN, tag stripping and VLAN filtering handled on the NIC
 - [x] **Logging:** a category per subsystem (17) with its own level, raised at run time with a timer; packet tracing in the data plane filtered by host and rate-limited; the journal (info and up, 90 days), a capped debug.log and audit.log in /var/log/ephemeris, `ephctl log`
 - [x] **Router access on inside interfaces:** the portal and SSH on an inside interface's own address (`management = ["https", "ssh"]`, optionally limited to source prefixes), through a tun host path; never on outside interfaces (refused by the config and by the data plane)
-- [ ] **Next for the edge:** destination NAT / port forwarding, `ephsh` router CLI
+- [x] **Port forwards and firewall rules:** destination NAT to inside hosts (ports and ranges, optionally from some sources only, steered to the right worker), ordered allow/drop rules for new sessions by interface, prefix, protocol and port, both applied live
+- [x] **The router's DNS for the LAN** (`management = ["dns"]`: systemd-resolved through the host path, handed out by DHCP) and **`ephsh`**, the router's shell
+- [x] **Recovery:** reboot after a kernel panic, a hardware watchdog for hangs, and `ephctl system switch` to go back to the other installed version
+- [ ] **Next for the edge:** NAT hairpinning, local DNS names for DHCP leases
 - [ ] **Performance and capacity:**
   - [ ] Benchmarks: a microbenchmark of the per-packet pipeline (CPU ceiling per core, no NIC), and a lab test with a traffic generator (pktgen / TRex) for real packets per second on Proxmox and on hardware NICs
   - [x] Memory-aware sizing: `sessions.max_per_worker = "auto"` (the default) sized from the RAM available at start, and a start-up check that refuses or warns when the reserved tables (sessions, FIB, packet buffers) exceed what the machine has

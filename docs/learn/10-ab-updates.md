@@ -121,6 +121,35 @@ knowing about.
    ([`mkosi.initrd.conf/`](../../image/mkosi.initrd.conf)), so a broken
    version is retried and then abandoned without anyone touching the router.
 
+### A panic, a hang, or a version you want to leave
+
+Boot counting only helps if a failed try ends in a reboot. Two ways it
+might not:
+
+- **A kernel panic** would leave the router stopped at the panic message.
+  The image sets `panic=10` on the kernel command line: 10 seconds later it
+  reboots, and the try is used up.
+- **A hang** (the kernel alive but nothing moving) would never reboot by
+  itself. systemd keeps a hardware watchdog from firing while it's alive
+  ([`system.conf.d/ephemeris-watchdog.conf`](../../image/mkosi.extra/usr/lib/systemd/system.conf.d/ephemeris-watchdog.conf)):
+  if it stops for 30 seconds, the watchdog resets the machine. That needs a
+  watchdog device: `deploy-image.sh` gives Proxmox VMs one
+  (`--watchdog model=i6300esb,action=reset`); most hardware has one.
+
+And once a version has passed its health check, it's kept: a problem that
+shows up later (a feature you rely on behaves differently) doesn't send
+the router back by itself. That's your call:
+
+```bash
+ephctl system switch --once   # boot the other installed version, next boot only
+ephctl system switch          # go back to it and stay there
+```
+
+`switch` marks the running version as bad, the same way three failed tries
+would (`+0`; it stays in the boot menu), and reboots into the other one.
+The next update replaces the bad one. `switch` again goes back. The
+portal's System tab has the same.
+
 ## Updating your router
 
 ```bash
@@ -220,7 +249,10 @@ way an operator would do it ([`ci/e2e.sh`](../../ci/e2e.sh)):
 `ephctl system check` must offer *V.1*, `ephctl system update` installs it,
 and `ephctl system reboot` switches to it. CI then checks that the router
 runs *V.1* from the other slot, that the boot was blessed (boot counter
-gone), and that config, password and forwarding all survived.
+gone), and that config, password and forwarding all survived. Then it
+goes back: `ephctl system switch --once` must boot *V* for one boot only,
+and `ephctl system switch` must keep it, with *V.1* marked bad. The VM has
+a watchdog device, and CI checks that it's running.
 
 So the full path (download, write the idle slot, boot counting, health
 gate, blessing) runs on a real kernel and real UEFI firmware before any

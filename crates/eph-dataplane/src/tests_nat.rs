@@ -149,7 +149,7 @@ pub(crate) fn packet(dst_mac: Mac, src_mac: Mac, src: &str, dst: &str, l4: L4) -
 }
 
 /// TCP/UDP checksum over pseudo-header + segment (0 = valid when verifying).
-fn l4_sum(ip_pkt: &[u8]) -> u16 {
+pub(crate) fn l4_sum(ip_pkt: &[u8]) -> u16 {
     let seg = &ip_pkt[20..];
     let mut pseudo = ip_pkt[12..20].to_vec();
     pseudo.extend_from_slice(&[0, ip_pkt[9]]);
@@ -164,7 +164,7 @@ pub(crate) fn tx(v: Verdict) -> (PortId, usize, usize) {
     }
 }
 
-fn hdr(f: &[u8], off: usize, len: usize) -> ipv4::Header {
+pub(crate) fn hdr(f: &[u8], off: usize, len: usize) -> ipv4::Header {
     ipv4::parse(&f[off + 14..off + len]).expect("valid IP header")
 }
 pub(crate) fn ports_of(f: &[u8], off: usize) -> (u16, u16) {
@@ -522,7 +522,7 @@ fn query(r: &mut Pipeline) -> u16 {
     ports_of(&f, off).0
 }
 
-fn dropped(v: Verdict) -> DropReason {
+pub(crate) fn dropped(v: Verdict) -> DropReason {
     match v {
         Verdict::Drop(r) => r,
         v => panic!("expected a drop, got {v:?}"),

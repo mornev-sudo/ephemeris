@@ -98,9 +98,10 @@ client that finds its address already in use (it checks with ARP) sends a
 Leases are saved in `/var/lib/ephemeris/dhcp/leases-<interface>.json`, so a
 restart or an update doesn't reshuffle your network.
 
-**DNS:** the router doesn't run a DNS resolver itself. A LAN without its
-own `dns` list gets the DNS servers the router received with its own WAN
-lease. Point `dns` at your own resolver (a Pi-hole, say) to override that.
+**DNS:** a LAN without its own `dns` list gets the router itself when the
+interface offers DNS (`management = ["dns"]`, chapter 19), and otherwise
+the DNS servers the router received with its own WAN lease. Point `dns` at
+your own resolver (a Pi-hole, say) to override either.
 
 ## The client
 

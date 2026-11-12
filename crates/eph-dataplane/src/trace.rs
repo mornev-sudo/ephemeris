@@ -88,7 +88,7 @@ impl TraceCat {
             }
             NatExhausted | NatUntranslatable | NatNoSession | NatWrongWorker => TraceCat::Nat,
             Malformed | BadIpHeader | BadL4Header | Martian | SpoofedSource | IpOption
-            | BadFragment | FragmentToRouter | IcmpMismatch => TraceCat::Filter,
+            | BadFragment | FragmentToRouter | IcmpMismatch | Firewall => TraceCat::Filter,
             IcmpRateLimited => TraceCat::Icmp,
             NoPath | UnknownTether | BadOverlay | OverlayAuth | OverlayReplay | OverlayNoKey
             | OverlayLinksFull => TraceCat::Sdwan,

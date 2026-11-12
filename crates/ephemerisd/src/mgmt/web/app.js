@@ -374,6 +374,9 @@ $("sysreboot").onclick = async () => {
     q = `Reboot into ${u.version}? Traffic stops for about a minute. If it doesn't come up healthy, the router goes back to the current version by itself.`;
   if (!confirm(q)) return;
   try { await api("POST", "/system/reboot"); sysmsg(u.phase === "installed" ? `Rebooting into ${u.version}…` : "Rebooting…", "warn"); } catch (e) { sysmsg(e.message, "bad"); } };
+$("sysswitch").onclick = async () => {
+  if (!confirm("Reboot into the other installed version and stay on it? This version is marked bad (as a failed update would be) until the next update replaces it. Traffic stops for about a minute.")) return;
+  try { const r = await api("POST", "/system/switch", JSON.stringify({ once: false }), true); sysmsg(`Rebooting into ${r.version}…`, "warn"); } catch (e) { sysmsg(e.message, "bad"); } };
 
 $("pwform").onsubmit = async (e) => {
   e.preventDefault();
@@ -541,7 +544,7 @@ function accessFields(i) {
   const box = el("div");
   box.dataset.field = "access";
   if (i.role === "outside") {
-    box.append(el("p", "SSH and the portal are never reachable on an outside interface.", "s"));
+    box.append(el("p", "SSH, the portal and the router's DNS are never reachable on an outside interface.", "s"));
     return box;
   }
   i.management = i.management || [];
@@ -560,7 +563,8 @@ function accessFields(i) {
     l.append(el("span", label), b);
     return l;
   };
-  g.append(service("https", "Portal (HTTPS, port 8443) on this interface"), service("ssh", "SSH (port 22) on this interface"));
+  g.append(service("https", "Portal (HTTPS, port 8443) on this interface"), service("ssh", "SSH (port 22) on this interface"),
+    service("dns", "DNS (port 53): the router answers, and its DHCP server hands itself out as DNS"));
   if (i.management.length) {
     const l = el("label", undefined, "field");
     l.append(el("span", "Only from"), control({ key: "management_from", label: "Only from", type: "list", placeholder: "anyone on this network (e.g. 10.10.1.0/24)" }, i));
@@ -802,6 +806,28 @@ function renderCfg() {
       options: [["interface", "interface address"], ["pool", "pool"], ["none", "no translation"]], empty: "interface" },
     { key: "pool", label: "Pool", type: "select", options: () => [["", "—"], ...cfg.nat.pool.map(p => [p.name, p.name])] },
   ], () => ({ name: "", source: null, destination: null, outbound: null, translate: "interface", pool: null }), "Add rule");
+
+  cfg.nat.forward = cfg.nat.forward || [];
+  const outsideNames = () => [["", "—"], ...cfg.interface.filter(i => i.role === "outside").map(i => [i.name, i.name])];
+  formTable($("f-forwards"), cfg.nat.forward, [
+    { key: "name", label: "Name", placeholder: "web" },
+    { key: "interface", label: "Outside interface", type: "select", options: outsideNames },
+    { key: "protocol", label: "Protocol", type: "select", options: [["tcp", "TCP"], ["udp", "UDP"]], empty: "tcp" },
+    { key: "port", label: "Port(s)", placeholder: "443 or 5000-5010" },
+    { key: "to", label: "Inside host", placeholder: "10.0.0.20" },
+    { key: "to_port", label: "Inside port", type: "number", min: 1, max: 65535, optional: true },
+    { key: "from", label: "Only from", type: "list", placeholder: "anyone" },
+  ], () => ({ name: "", interface: (outsideNames()[1] || [""])[0], protocol: "tcp", port: "", to: "", to_port: null, from: [] }), "Add port forward");
+
+  cfg.firewall = cfg.firewall || [];
+  formTable($("f-firewall"), cfg.firewall, [
+    { key: "name", label: "Name", placeholder: "no guest to lan" },
+    { key: "action", label: "Action", type: "select", options: [["drop", "drop"], ["allow", "allow"]], empty: "drop" },
+    { key: "from", label: "From", placeholder: "any", optional: true },
+    { key: "to", label: "To", placeholder: "any", optional: true },
+    { key: "protocol", label: "Protocol", type: "select", options: [["any", "any"], ["tcp", "TCP"], ["udp", "UDP"], ["icmp", "ICMP"]], empty: "any" },
+    { key: "port", label: "Port(s)", placeholder: "any", optional: true },
+  ], () => ({ name: "", action: "drop", from: null, to: null, protocol: "any", port: null }), "Add rule");
 
   formFields($("f-sess"), cfg.sessions, [
     { key: "max_per_worker", label: "Sessions per worker", placeholder: "auto", optional: true,

@@ -253,6 +253,7 @@
       <button data-sec="routing">Static routes</button>
       <button data-sec="sdwan">SD-WAN</button>
       <button data-sec="nat">NAT</button>
+      <button data-sec="fw">Firewall</button>
       <button data-sec="sess">Sessions</button>
       <button data-sec="dp">Data plane</button>
       <button data-sec="mgmt">Management</button>
@@ -292,6 +293,19 @@
       <h2 style="margin-top:16px">Rules</h2>
       <p class="s">Checked top to bottom; the first match wins. Traffic no rule matches falls back to the default above.</p>
       <div class="tablewrap" id="f-natrules"></div>
+      <h2 style="margin-top:16px">Port forwards</h2>
+      <p class="s">New connections from the internet to an outside interface's own address, on these ports, go on to a
+        host inside. Its replies leave as the router's address and port. One port, or a range like 5000-5010 (the
+        inside port then starts the range). Only from these sources: addresses or prefixes, empty for anyone.
+        A firewall rule can still drop them. Forwards don't apply to inside hosts using the outside address.</p>
+      <div class="tablewrap" id="f-forwards"></div>
+    </section>
+    <section class="cfgsec hidden" id="sec-fw">
+      <p class="s">Whether a new connection may start, checked top to bottom: the first rule that matches decides.
+        With none matching, the interface decides: inside interfaces start connections, outside ones only take replies
+        (and port forwards). From and To: an interface, "overlay" for SD-WAN sites, an address or prefix, or empty for
+        any. Connections already open stay open when rules change. Drops count as <code>firewall</code>.</p>
+      <div class="tablewrap" id="f-firewall"></div>
     </section>
     <section class="cfgsec hidden" id="sec-sess"><div class="card" id="f-sess"></div>
       <h2>Per-application timeouts</h2>
@@ -321,6 +335,7 @@
         <button class="btn" id="syscheck">Check for updates</button>
         <button class="btn primary" id="sysupdate">Install update</button>
         <button class="btn" id="sysreboot">Reboot</button>
+        <button class="btn" id="sysswitch">Go back to the other version</button>
       </div>
       <div id="sysmsg"></div>
       <pre class="diff hidden" id="sysout"></pre>

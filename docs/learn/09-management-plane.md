@@ -28,6 +28,19 @@ when Phase 4 adds a central SD-WAN controller, it becomes a third client of
 the same API. Every serious network OS (Junos, Arista EOS, VyOS) converged on
 this design.
 
+**`ephsh`**, the router's shell, is `ephctl` at a prompt: the same
+commands, without typing `ephctl` each time, and `help` (or `help system`)
+for what's there. Logged in on the router, run `ephsh` (or `ephctl shell`
+from anywhere `ephctl` can reach the API). A command that fails says why,
+and the shell carries on; `exit` leaves. It reads plain lines, with no
+history or completion, so it also takes a script: `ephsh < commands.txt`.
+
+```text
+cpt-br1> status
+cpt-br1> config history
+cpt-br1> system switch --once
+```
+
 The API runs on its own thread with its own small async runtime (tokio).
 The workers never wait for it and it never waits for them. They touch in
 exactly two places:
