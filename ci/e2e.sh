@@ -171,6 +171,8 @@ wait_for 60 "boot to finish" sh -c "${SSH[*]} systemctl is-system-running --wait
 echo "System:"
 check "boots version $VERSION"             sh -c "[ \"\$(${SSH[*]} cat /usr/lib/ephemeris/version)\" = '$VERSION' ]"
 check "no failed services"                 sh -c "[ -z \"\$(${SSH[*]} systemctl --failed --plain --no-legend)\" ] || { ${SSH[*]} systemctl --failed; false; }"
+# The SSH policy is written before sshd starts: nothing restarts it at boot.
+check "sshd up since boot"                 sh -c "[ \"\$(${SSH[*]} systemctl show -p NRestarts --value ssh.service)\" = 0 ]"
 check "ephemerisd runs as a service"         on_router systemctl is-active --quiet ephemerisd.service
 check "Secure Boot is enabled"             sh -c "${SSH[*]} od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c | grep -q 1"
 check "root filesystem is read-only"       sh -c "! ${SSH[*]} touch /usr/bin/test-write"
@@ -322,7 +324,7 @@ echo "SSH keys only:"
 { cat "$WORK/ephemeris.toml"; printf '\n[ssh]\npassword_login = false\n'; } > "$WORK/sshkeys.toml"
 on_router "cat > /run/sshkeys.toml" < "$WORK/sshkeys.toml"
 check "turn SSH passwords off"              on_router "ephctl config load /run/sshkeys.toml && ephctl config commit"
-check "SSH password refused"                wait_for 15 "sshd to reload" sh -c "! sshpass -p '$PASSWORD' ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o ConnectTimeout=5 root@127.0.0.1 true"
+check "SSH password refused"                wait_for 15 "sshd to restart" sh -c "! sshpass -p '$PASSWORD' ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o ConnectTimeout=5 root@127.0.0.1 true"
 check "SSH key still works"                 on_router true
 check "passwords back after rollback"       sh -c "${SSH[*]} ephctl config rollback 1 && sleep 2 && sshpass -p '$PASSWORD' ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o ConnectTimeout=5 root@127.0.0.1 true"
 
@@ -549,6 +551,7 @@ if [[ -n $UPDATE_DIR ]]; then
     on_router ephctl system reboot >/dev/null 2>&1 || true
     sleep 10
     check "router comes back"              wait_for 300 "SSH after update reboot" on_router true
+    check "sshd up since boot (update)"    sh -c "[ \"\$(${SSH[*]} systemctl show -p NRestarts --value ssh.service)\" = 0 ]"
     check "runs $UPDATE_VERSION"           wait_for 30 "new version" sh -c "[ \"\$(${SSH[*]} cat /usr/lib/ephemeris/version)\" = '$UPDATE_VERSION' ]"
     check "new version blessed"            wait_for 120 "boot counter removed" sh -c "${SSH[*]} 'ls \$(bootctl --print-esp-path)/EFI/Linux' | grep -q '_${UPDATE_VERSION}_x86-64.efi\$'"
     check "config and password survive"    sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 grep -q lan-b /var/lib/ephemeris/ephemeris.toml

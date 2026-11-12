@@ -124,10 +124,13 @@ isn't implemented yet.
 |---|---|
 | **T** A malicious dependency | `cargo-deny` (RustSec advisories, licences, crates.io only), Dependabot with a cooldown, `Cargo.lock` with `--locked` |
 | **T** A compromised GitHub Action | Every action pinned to a commit |
+| **I** A malicious crate, build tool or test tool reading the signing keys | The keys are only in the job that runs mkosi; crates are compiled (build scripts, proc macros), the SBOM made and the test tools installed in jobs without them |
 | **E** A pull request reaching the signing keys | Keys only in the `release-signing` environment, usable from `v*` release tags alone (a release builds and tests its own image); other builds use throwaway keys |
 | **T** A tampered image or update | Secure Boot signature; GPG-signed `SHA256SUMS`, checked by the router before installing; SLSA build provenance; SBOM per release |
 | **T** An unexpected update | Routers never update or reboot by themselves: an operator starts both |
 
 **Residual:** the maintainer's GitHub account is a single point of trust
 (protect it with a hardware key); the signing keys are GitHub secrets, not
-in an HSM.
+in an HSM; a malicious crate can't take the keys, but could still put code
+into the binaries it's compiled into, which only review and cargo-deny
+guard against.

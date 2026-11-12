@@ -59,6 +59,10 @@ struct Args {
     /// not checked: the router may yet start from it, or fall back.
     #[arg(long)]
     nic_setup: bool,
+    /// Write the SSH policy (`[ssh]`) from the config file for sshd, before
+    /// it starts (ssh.service runs this).
+    #[arg(long)]
+    ssh_policy: bool,
     /// Measure how fast this machine seals SD-WAN packets with each cipher
     /// (one core), and whether it has AES in hardware.
     #[arg(long)]
@@ -84,6 +88,9 @@ fn main() -> anyhow::Result<()> {
         let text = std::fs::read_to_string(&args.config)?;
         print!("{}", config::nic_setup(&text)?);
         return Ok(());
+    }
+    if args.ssh_policy {
+        return mgmt::ssh::write_before_start(&args.config);
     }
     if args.bench_crypto {
         sdwan::bench_crypto();
