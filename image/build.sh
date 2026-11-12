@@ -10,8 +10,9 @@
 #   ephemeris_<v>_x86-64.efi                                  /  downloads to update one
 #   SHA256SUMS, SHA256SUMS.gpg (signed when SIGN_RELEASE=1), VERSION
 #
-# CI runs exactly this (.github/workflows/image.yml). Locally you need cargo,
-# mkosi (https://github.com/systemd/mkosi), qemu-img and xz.
+# CI runs exactly this (.github/workflows/image.yml), with BINARIES set.
+# Locally you need cargo, mkosi (https://github.com/systemd/mkosi), qemu-img
+# and xz.
 set -euo pipefail
 
 VERSION=${1:-dev}
@@ -27,13 +28,21 @@ IMAGE=$ROOT/image
 STAGE=$IMAGE/stage
 OUT=$(realpath -m "${OUT:-$IMAGE/mkosi.output}")
 
-echo "== building ephemerisd and ephctl"
-cargo build --release --locked -p ephemerisd -p ephctl --manifest-path "$ROOT/Cargo.toml"
+# BINARIES=dir: use ephemerisd and ephctl already built there (CI builds
+# them in a job without the signing keys) instead of building them here.
+if [[ -n ${BINARIES:-} ]]; then
+    BIN=$(realpath "$BINARIES")
+    echo "== using ephemerisd and ephctl from $BIN"
+else
+    echo "== building ephemerisd and ephctl"
+    cargo build --release --locked -p ephemerisd -p ephctl --manifest-path "$ROOT/Cargo.toml"
+    BIN=$ROOT/target/release
+fi
 
 echo "== staging files into the image tree"
 rm -rf "$STAGE"
-install -D -m 0755 "$ROOT/target/release/ephemerisd"      "$STAGE/usr/bin/ephemerisd"
-install -D -m 0755 "$ROOT/target/release/ephctl"         "$STAGE/usr/bin/ephctl"
+install -D -m 0755 "$BIN/ephemerisd"                    "$STAGE/usr/bin/ephemerisd"
+install -D -m 0755 "$BIN/ephctl"                        "$STAGE/usr/bin/ephctl"
 install -D -m 0644 "$ROOT/config/ephemeris.example.toml"   "$STAGE/usr/lib/ephemeris/ephemeris.example.toml"
 echo "$VERSION" > "$STAGE/usr/lib/ephemeris/version"
 # The exact source it was built from (not in the version: labels are short).

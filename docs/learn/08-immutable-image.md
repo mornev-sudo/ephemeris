@@ -110,25 +110,32 @@ millions of distinct servers.
 
 ## The build pipeline
 
-Building and releasing are two separate steps: **build once, promote the
-tested bytes**.
+Every pull request builds and tests an image the way a release does; a
+release tag runs the same workflow again for its own commit, with the real
+signing keys, and publishes exactly the image that passed.
 
 ```
-git push (main)
+pull request, or tag v0.5.0
         │
         ▼  .github/workflows/image.yml (on GitHub's Linux machines)
-  1. cargo fmt / clippy / test       ← nothing is built if a test fails
-  2. image/build.sh <version>        ← cargo build + mkosi → .raw → .qcow2
-  3. boot test in QEMU               ← UEFI + virtio-scsi, like Proxmox
-  4. artifact "ephemeris-image"        ← the tested image, kept 90 days
-
-git tag v0.5.0 <commit> && git push origin v0.5.0
+  1. test       cargo fmt / clippy / test, cargo-deny
+     fuzz, sdwan  (alongside)
+  2. binaries   cargo build of ephemerisd and ephctl   ┐ no signing keys:
+     sbom       the Rust dependencies, CycloneDX       ┘ third-party code
+  3. image      image/build.sh with those binaries:      the only job with
+                mkosi → signed UKI → .raw → .qcow2       the keys
+  4. e2e        boot it in QEMU, end-to-end test       ← no keys
         │
-        ▼  .github/workflows/release.yml (takes about a minute)
-  5. find the passing image run for that commit, download its artifact,
-     check it's release 0.5.0, verify the checksum, publish it as
-     GitHub Release v0.5.0
+        ▼  .github/workflows/release.yml (a tag only)
+  5. publish    check it's release 0.5.0 from this commit, verify the
+                checksums, publish GitHub Release v0.5.0
 ```
+
+A pull request's image is signed with throwaway keys made in step 3, so
+the test still checks Secure Boot and signed updates; only a `v*` tag can
+reach the real ones. The keys are only in the job that runs mkosi: every
+crate's build script, the SBOM tool and the test tools run elsewhere, so a
+malicious package among them can't take them.
 
 **Every image says which release it is.** The release version lives in one
 place, `version` in the workspace [`Cargo.toml`](../../Cargo.toml). CI names
