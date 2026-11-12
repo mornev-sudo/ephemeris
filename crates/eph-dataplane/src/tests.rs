@@ -1598,6 +1598,7 @@ fn host_router() -> Pipeline {
     ports[0].host = host::HostAccess {
         https: true,
         ssh: true,
+        dns: true,
         from: vec![],
     };
     ports[1].role = Role::Outside;
@@ -1634,6 +1635,69 @@ fn ssh_and_the_portal_reach_the_host_on_an_inside_port() {
     assert_eq!(
         r.process(0, &mut f, 0, n),
         Verdict::Drop(DropReason::LocalUnhandled)
+    );
+    assert!(r.host_out.is_empty());
+}
+
+/// DNS on an inside port's address goes to the router's resolver (one
+/// address for every port), over UDP and TCP; its answers go back out as
+/// that port.
+#[test]
+fn dns_reaches_the_routers_resolver_and_answers_come_back() {
+    let mut r = host_router();
+    for tcp in [None, Some(SYN)] {
+        let (mut f, n) = seg(
+            R0,
+            HOST_A,
+            ("10.10.1.10", 50000),
+            ("10.10.1.1", host::DNS_PORT),
+            tcp,
+        );
+        assert_eq!(
+            r.process(0, &mut f, 0, n),
+            Verdict::Drop(DropReason::ToHost)
+        );
+        let p = r.host_out.pop().expect("handed to the host");
+        let h = ipv4::parse(&p).unwrap();
+        assert_eq!((h.src, h.dst), (ip("10.10.1.10"), host::DNS_ADDR));
+        assert_eq!(u16::from_be_bytes([p[22], p[23]]), host::DNS_PORT);
+    }
+    // The answer, from the resolver's address: out of lan-a, as 10.10.1.1.
+    let answer = |src: &str, sport: u16| {
+        let (b, n) = seg([0; 6], [0; 6], (src, sport), ("10.10.1.10", 50000), None);
+        let mut f = vec![0u8; 2048];
+        f[256..256 + n].copy_from_slice(&b[..n]);
+        (f, n)
+    };
+    let (mut f, n) = answer("169.254.255.253", host::DNS_PORT);
+    let Verdict::Tx { port, off, len } = r.inject_host(&mut f, 256, n) else {
+        panic!("not sent")
+    };
+    let h = ipv4::parse(&f[off + 14..off + len]).unwrap();
+    assert_eq!((port, h.src, h.dst), (0, ip("10.10.1.1"), ip("10.10.1.10")));
+    assert_eq!(
+        u16::from_be_bytes([f[off + 34], f[off + 35]]),
+        host::DNS_PORT
+    );
+    // Nothing else from that address, and no DNS from a port's own one.
+    for (src, sport) in [("169.254.255.253", 5353), ("169.254.240.1", host::DNS_PORT)] {
+        let (mut f, n) = answer(src, sport);
+        assert_eq!(
+            r.inject_host(&mut f, 256, n),
+            Verdict::Drop(DropReason::LocalUnhandled)
+        );
+    }
+    // Not on the outside port, though it (wrongly) claims to offer DNS.
+    let (mut f, n) = seg(
+        R1,
+        HOST_B,
+        ("10.10.2.10", 50000),
+        ("10.10.2.1", host::DNS_PORT),
+        None,
+    );
+    assert_ne!(
+        r.process(1, &mut f, 0, n),
+        Verdict::Drop(DropReason::ToHost)
     );
     assert!(r.host_out.is_empty());
 }

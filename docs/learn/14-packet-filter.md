@@ -75,6 +75,58 @@ an answer, at most 16 384 per worker. An ARP packet that disagrees with a
 known neighbour doesn't overwrite it: the router asks again and believes
 the first answer to its own question (`arp_conflicts`).
 
+## Firewall rules
+
+Everything above is fixed. What *you* decide is which new connections may
+start. By default, an interface's role does: inside interfaces start
+sessions, outside ones only let replies in (and port forwards, chapter
+13). **Firewall rules** refine that, checked top to bottom for the first
+packet of every new session; the first rule that matches decides, and with
+none matching the interface's role still does.
+
+```toml
+# No mail servers on the guest network.
+[[firewall]]
+name = "guest: no smtp"
+action = "drop"
+from = "guest"             # an interface, "overlay", an address or prefix, or "any"
+to = "wan"
+protocol = "tcp"           # tcp, udp, icmp or any
+port = 25                  # destination ports, or a range "8000-8010" (tcp/udp)
+
+# Keep the guest network away from the LAN.
+[[firewall]]
+name = "guest: not the lan"
+action = "drop"
+from = "guest"
+to = "lan"
+
+# SSH to one server from the head office, routed without NAT.
+[[firewall]]
+name = "ssh from cpt"
+action = "allow"
+from = "overlay"
+to = "10.10.1.20"
+protocol = "tcp"
+port = 22
+```
+
+A rule sees a session the way it will be forwarded: after a port
+forward's translation (so `to` is the inside server), and after routing
+(so `to` an interface is the one it leaves by). Rules decide *new*
+sessions only. Replies, and everything else in a session, follow the
+session, so connections already open stay open when rules change. A rule
+dropping a forward's sessions works; a rule allowing sessions an outside
+interface would refuse lets them in *untranslated* (routed to inside
+addresses the outside can reach, e.g. over an SD-WAN tether or a routed
+subnet).
+
+Dropped sessions count as `firewall`, and the `filter` trace category
+shows each one (`ephctl log host <address>`). Rules apply live. They don't
+cover traffic to the router itself: that's `management` and
+`management_from` on each interface (chapter 19). In the portal:
+Configuration → Firewall.
+
 ### Exercises
 
 1. From a LAN client, run `ping -R 10.10.2.10` (Record Route). Watch the

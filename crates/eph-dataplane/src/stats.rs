@@ -104,10 +104,12 @@ pub enum DropReason {
     HandedOff,
     /// For another worker, but its queue was full.
     HandoffFull,
+    /// A new session a firewall rule (`[[firewall]]`) doesn't allow.
+    Firewall,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 44] = [
+    pub const ALL: [DropReason; 45] = [
         DropReason::Malformed,
         DropReason::NotForUs,
         DropReason::Vlan,
@@ -152,6 +154,7 @@ impl DropReason {
         DropReason::OverlayLinksFull,
         DropReason::HandedOff,
         DropReason::HandoffFull,
+        DropReason::Firewall,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -201,6 +204,7 @@ impl DropReason {
             DropReason::OverlayLinksFull => "overlay-links-full",
             DropReason::HandedOff => "handed-off",
             DropReason::HandoffFull => "handoff-full",
+            DropReason::Firewall => "firewall",
         }
     }
 }

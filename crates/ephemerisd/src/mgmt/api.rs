@@ -40,6 +40,7 @@
 //! | POST   | /system/update/check      | list installed + available versions         |
 //! | POST   | /system/update            | install newest version into inactive slot   |
 //! | POST   | /system/reboot            | reboot (into the newest installed version)  |
+//! | POST   | /system/switch {once?}    | reboot into the other installed version     |
 //! | ...    | /logs, /logging           | log lines and levels: see [`super::logapi`] |
 //!
 //! ephemerisd serves plain HTTP on loopback only; nginx in front terminates
@@ -139,6 +140,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/system/update/check", post(update_check))
         .route("/system/update", post(update_start))
         .route("/system/reboot", post(reboot))
+        .route("/system/switch", post(switch_version))
         .route("/system/password", post(change_password))
         .route("/whoami", get(whoami))
         .route("/logout", post(logout))
@@ -1629,7 +1631,8 @@ async fn restart(State(s): St) -> Json<Value> {
 // asks systemd to run things in their own, unsandboxed units.
 
 /// Run a command in a transient systemd unit and capture its output.
-async fn systemd_run(args: &'static [&'static str]) -> Result<String, ApiError> {
+async fn systemd_run(args: &[&str]) -> Result<String, ApiError> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     tokio::task::spawn_blocking(move || {
         let out = std::process::Command::new("systemd-run")
             .args([
@@ -1852,6 +1855,107 @@ pub(crate) async fn reboot_in(secs: Option<u64>) -> Result<(), ApiError> {
     }
 }
 
+/// A boot entry's file name without its boot counter:
+/// "ephemeris_0.7.1-d0d9b19_x86-64+2-1.efi" -> "ephemeris_0.7.1-d0d9b19_x86-64.efi".
+fn without_counter(path: &str) -> String {
+    match path.strip_suffix(".efi").and_then(|p| p.rsplit_once('+')) {
+        Some((base, n)) if n.chars().all(|c| c.is_ascii_digit() || c == '-') => {
+            format!("{base}.efi")
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// What switching to the other installed version takes, from
+/// `bootctl list --json=short`: the version it boots, and the commands
+/// (run as root, outside ephemerisd's sandbox) that make the boot loader
+/// start it. `once`: for the next boot only. Otherwise for good: the running
+/// version's entry is marked bad, as a failed trial boot would leave it
+/// (still in the boot menu; the next update replaces it), and the other
+/// one's mark, if it has one, is taken away.
+fn switch_plan(entries: &Value, once: bool) -> Result<(String, Vec<Vec<String>>), String> {
+    let ours: Vec<&Value> = entries
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["id"].as_str().and_then(entry_version).is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    let running = ours
+        .iter()
+        .find(|e| e["isSelected"] == true)
+        .ok_or("the boot loader doesn't say which version is running")?;
+    let other = ours
+        .iter()
+        .find(|e| e["isSelected"] != true)
+        .ok_or("only one version is installed: there's nothing to switch to")?;
+    let version = other["id"]
+        .as_str()
+        .and_then(entry_version)
+        .unwrap_or_default();
+    let id = other["id"].as_str().unwrap_or_default().to_string();
+    if once {
+        return Ok((
+            version,
+            vec![vec!["/usr/bin/bootctl".into(), "set-oneshot".into(), id]],
+        ));
+    }
+    let path = |e: &Value| {
+        e["path"]
+            .as_str()
+            .filter(|p| p.starts_with('/') && p.ends_with(".efi"))
+            .map(str::to_string)
+            .ok_or_else(|| format!("no file for boot entry {}", e["id"]))
+    };
+    let mv = |from: String, to: String| vec!["/usr/bin/mv".into(), "--".into(), from, to];
+    let mut cmds = vec![];
+    let other_path = path(other)?;
+    if other_path != without_counter(&other_path) {
+        cmds.push(mv(other_path.clone(), without_counter(&other_path)));
+    }
+    let running_path = path(running)?;
+    let bad = without_counter(&running_path).replace(".efi", "+0.efi");
+    cmds.push(mv(running_path, bad));
+    Ok((version, cmds))
+}
+
+#[derive(Deserialize, Default)]
+struct SwitchReq {
+    #[serde(default)]
+    once: bool,
+}
+
+/// Reboot into the other installed version (A/B): for the next boot only,
+/// or for good. Refused while an update is installing: it's writing the
+/// other slot.
+async fn switch_version(State(s): St, body: Option<Json<SwitchReq>>) -> ApiResult {
+    let once = body.map(|Json(b)| b.once).unwrap_or_default();
+    let (job, _) = update_now(&s).await;
+    if matches!(job["state"].as_str(), Some("activating" | "active")) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "an update is installing into the other slot: wait until it's done".into(),
+        ));
+    }
+    let list = systemd_run(&["/usr/bin/bootctl", "list", "--json=short", "--no-pager"]).await?;
+    let entries: Value = serde_json::from_str(&list)
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("bootctl list: {e}")))?;
+    let (version, cmds) =
+        switch_plan(&entries, once).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    for cmd in &cmds {
+        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        systemd_run(&args).await?;
+    }
+    s.update.lock().unwrap().default_entry = None;
+    tracing::warn!(target: crate::logging::cat::SYSTEM,
+        "switching to {version}{} via API", if once { " for one boot" } else { "" });
+    systemctl(&["reboot", "--no-block"])?;
+    Ok(Json(
+        json!({ "ok": true, "version": version, "once": once }),
+    ))
+}
+
 async fn reboot() -> ApiResult {
     tracing::warn!(target: crate::logging::cat::SYSTEM, "reboot requested via API");
     systemctl(&["reboot", "--no-block"])?;
@@ -1981,6 +2085,87 @@ address = "10.10.2.1/24"
         );
         let e = command_output(false, b"", b"Failed to acquire manifest: 404\n").unwrap_err();
         assert_eq!(e, "Failed to acquire manifest: 404");
+    }
+
+    fn boot_entries(running: &str, other: &str) -> Value {
+        let e = |file: &str, selected: bool| {
+            json!({
+                "type": "type2",
+                "id": without_counter(file),
+                "path": format!("/boot/EFI/Linux/{file}"),
+                "isSelected": selected,
+            })
+        };
+        json!([
+            e(running, true),
+            e(other, false),
+            {"type": "auto", "id": "auto-reboot-to-firmware-setup", "isSelected": false},
+        ])
+    }
+
+    #[test]
+    fn switching_once_only_sets_the_next_boot() {
+        let list = boot_entries(
+            "ephemeris_0.15.0-bbb_x86-64.efi",
+            "ephemeris_0.14.1-aaa_x86-64.efi",
+        );
+        let (version, cmds) = switch_plan(&list, true).unwrap();
+        assert_eq!(version, "0.14.1-aaa");
+        assert_eq!(
+            cmds,
+            [[
+                "/usr/bin/bootctl",
+                "set-oneshot",
+                "ephemeris_0.14.1-aaa_x86-64.efi"
+            ]]
+        );
+    }
+
+    #[test]
+    fn switching_for_good_marks_the_running_version_bad() {
+        // Running a version still on trial (2 tries left, 1 done).
+        let list = boot_entries(
+            "ephemeris_0.15.0-bbb_x86-64+2-1.efi",
+            "ephemeris_0.14.1-aaa_x86-64.efi",
+        );
+        let (version, cmds) = switch_plan(&list, false).unwrap();
+        assert_eq!(version, "0.14.1-aaa");
+        assert_eq!(
+            cmds,
+            [[
+                "/usr/bin/mv",
+                "--",
+                "/boot/EFI/Linux/ephemeris_0.15.0-bbb_x86-64+2-1.efi",
+                "/boot/EFI/Linux/ephemeris_0.15.0-bbb_x86-64+0.efi"
+            ]]
+        );
+        // Switching back: the mark on the other one goes first.
+        let list = boot_entries(
+            "ephemeris_0.14.1-aaa_x86-64.efi",
+            "ephemeris_0.15.0-bbb_x86-64+0.efi",
+        );
+        let (version, cmds) = switch_plan(&list, false).unwrap();
+        assert_eq!(version, "0.15.0-bbb");
+        assert_eq!(
+            cmds[0][2..],
+            [
+                "/boot/EFI/Linux/ephemeris_0.15.0-bbb_x86-64+0.efi",
+                "/boot/EFI/Linux/ephemeris_0.15.0-bbb_x86-64.efi"
+            ]
+        );
+        assert_eq!(
+            cmds[1][3],
+            "/boot/EFI/Linux/ephemeris_0.14.1-aaa_x86-64+0.efi"
+        );
+    }
+
+    #[test]
+    fn nothing_to_switch_to_with_one_version() {
+        let list = json!([{"id": "ephemeris_0.15.0-bbb_x86-64.efi", "path": "/boot/EFI/Linux/ephemeris_0.15.0-bbb_x86-64.efi", "isSelected": true}]);
+        assert!(switch_plan(&list, false)
+            .unwrap_err()
+            .contains("only one version"));
+        assert!(switch_plan(&json!([]), true).is_err());
     }
 
     #[test]

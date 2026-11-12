@@ -339,10 +339,14 @@ impl Service<'_> {
                 subnet: net,
                 range: r.range,
                 lease_secs: d.lease_secs,
-                dns: if r.dns.is_empty() {
-                    self.learned_dns.clone()
-                } else {
+                // None given: the router itself, if it answers DNS here,
+                // else the servers its own leases brought.
+                dns: if !r.dns.is_empty() {
                     r.dns
+                } else if i.management.iter().any(|m| m == "dns") {
+                    vec![addr]
+                } else {
+                    self.learned_dns.clone()
                 },
                 domain: d.domain.clone(),
                 reservations: r.reservations,

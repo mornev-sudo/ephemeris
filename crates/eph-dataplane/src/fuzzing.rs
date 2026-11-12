@@ -17,6 +17,7 @@
 //! ```
 
 use crate::host::HostAccess;
+use crate::nat::{FirewallRule, Forward, NatConfig, Side};
 use crate::overlay::{
     self, select_paths, Cipher, KeyTable, Overlay, PathTable, PeerCrypto, Session, Tether,
     TetherHealth, TetherKey,
@@ -85,6 +86,57 @@ pub fn router() -> Pipeline {
     };
     let mut r = Pipeline::new(p.ports.clone(), p.fib.clone(), sessions, p.overlay.clone());
     r.set_time(1_000_000_000);
+    // Port forwards on both outside ports, and firewall rules of each kind.
+    let prefix = |s: &str| s.parse().expect("a valid prefix");
+    r.set_nat(Arc::new(NatConfig {
+        forwards: vec![
+            Forward {
+                name: "web".into(),
+                port: 2,
+                proto: ipv4::PROTO_TCP,
+                ports: (8080, 8081),
+                to: ip("10.10.1.20"),
+                to_port: 80,
+                from: vec![],
+            },
+            Forward {
+                name: "game".into(),
+                port: 3,
+                proto: ipv4::PROTO_UDP,
+                ports: (5000, 5010),
+                to: ip("10.10.10.5"),
+                to_port: 5000,
+                from: vec![prefix("198.51.100.0/24")],
+            },
+        ],
+        firewall: vec![
+            FirewallRule {
+                name: "no smtp".into(),
+                allow: false,
+                from: Side::Port(1),
+                to: Side::Any,
+                proto: Some(ipv4::PROTO_TCP),
+                ports: Some((25, 25)),
+            },
+            FirewallRule {
+                name: "ssh in".into(),
+                allow: true,
+                from: Side::Port(2),
+                to: Side::Prefix(prefix("10.10.1.0/24")),
+                proto: Some(ipv4::PROTO_TCP),
+                ports: Some((22, 22)),
+            },
+            FirewallRule {
+                name: "sites".into(),
+                allow: false,
+                from: Side::Overlay,
+                to: Side::Port(1),
+                proto: None,
+                ports: None,
+            },
+        ],
+        ..NatConfig::default()
+    }));
     let up = TetherHealth {
         up: true,
         rtt_ns: 5_000_000,
@@ -144,6 +196,7 @@ fn parts() -> Parts {
     lan.host = HostAccess {
         https: true,
         ssh: true,
+        dns: true,
         from: vec![],
     };
     let guest = port(1, "guest", 0, Some(10), "10.10.10.1", 24);

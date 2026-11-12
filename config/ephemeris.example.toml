@@ -114,10 +114,11 @@ role = "inside"
 # off only where traffic returns another way than it left.
 # strict_source = false
 
-# The router's own portal (https://10.10.1.1:8443/) and SSH on this
+# The router's own portal (https://10.10.1.1:8443/), SSH and DNS on this
 # interface's address, besides the management NIC. Inside interfaces only:
-# never offered on an outside one. (docs/learn/19-router-access.md)
-# management = ["https", "ssh"]
+# never offered on an outside one. With "dns", the DHCP server hands out
+# this address as the DNS server. (docs/learn/19-router-access.md)
+# management = ["https", "ssh", "dns"]
 # management_from = ["10.10.1.0/24"]   # only these clients; empty: anyone here
 
 # Lease addresses to devices on this interface (see docs/learn/15-dhcp.md).
@@ -182,6 +183,28 @@ masquerade = true
 # outbound = "wan"
 # translate = "pool"            # "interface", "pool" or "none"
 # pool = "public"
+
+# Port forwards: new connections to an outside interface's own address, on
+# these ports, go on to an inside host (docs/learn/13-nat.md).
+# [[nat.forward]]
+# name = "web"
+# interface = "wan"
+# protocol = "tcp"             # "tcp" or "udp"
+# port = 443                   # or a range: "5000-5010"
+# to = "10.10.1.20"
+# to_port = 8443               # default: the same port
+# from = ["198.51.100.0/24"]   # default: from anyone
+
+# Firewall rules: whether a new connection may start, top to bottom, the
+# first match deciding; with none, the interface's role does (inside: yes,
+# outside: replies and port forwards only). docs/learn/14-packet-filter.md
+# [[firewall]]
+# name = "guest: not the lan"
+# action = "drop"              # "allow" or "drop"
+# from = "guest"               # interface, "overlay", address/prefix or "any"
+# to = "lan"
+# protocol = "any"             # tcp, udp, icmp or any
+# port = 22                    # with tcp or udp: a port or "8000-8010"
 
 # SD-WAN (see docs/learn/12-sdwan.md): this router's place in the network,
 # and every other router. Roles decide who builds tethers to whom: hubs

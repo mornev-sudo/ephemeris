@@ -17,20 +17,30 @@ the LAN address too.
 name = "lan"
 device = "ens19"
 address = "10.10.1.1/24"
-management = ["https", "ssh"]        # the portal (8443) and/or SSH (22)
+management = ["https", "ssh", "dns"] # the portal (8443), SSH (22), DNS (53)
 management_from = ["10.10.1.0/28"]   # optional: only these clients
 ```
 
 In the portal: Configuration → Interfaces → **Access to the router**.
 
+**DNS** makes the router the LAN's DNS server: queries to the interface's
+address (UDP or TCP 53) go to systemd-resolved on the router, which answers
+from its cache, its own host name, or by asking upstream the way the
+router's own DNS goes (the management network, or the WAN's servers with
+`outbound = "dataplane"`). The DHCP server then hands out the interface's
+address as the DNS server, unless its `dns` list names others. Every
+interface's queries go to one address on the host path,
+`169.254.255.253` (resolved's `DNSStubListenerExtra`, set in the image), and
+the answers go back out of the interface the client is on.
+
 ## Never from the outside
 
-SSH and the portal are offered on **inside interfaces only**. The rule is
+SSH, the portal and DNS are offered on **inside interfaces only**. The rule is
 enforced twice:
 
 1. **The config refuses it.** `management` on an interface with `role =
-   "outside"` fails validation ("SSH and the portal can only be reached on
-   inside interfaces"), whether it comes from the file, the portal or the
+   "outside"` fails validation ("the router's own services ... can only be
+   reached on inside interfaces"), whether it comes from the file, the portal or the
    API. The portal doesn't show the choice on an outside interface.
 2. **The data plane checks every packet**, whatever the config says. A
    packet only goes to the host if:
@@ -38,10 +48,11 @@ enforced twice:
    - it's addressed to *that interface's own* address, so a WAN packet
      to the LAN address doesn't qualify, and neither does a LAN client
      using another interface's address;
-   - it's TCP to a port the interface offers, from an allowed source;
+   - it's TCP (or, for DNS, UDP) to a port the interface offers, from an
+     allowed source;
    - it didn't come through an SD-WAN tether.
 
-   Replies go out only from those two services, and only towards an inside
+   Replies go out only from those services, and only towards an inside
    interface.
 
 ## Keys only for SSH

@@ -43,6 +43,7 @@ echo "== staging files into the image tree"
 rm -rf "$STAGE"
 install -D -m 0755 "$BIN/ephemerisd"                    "$STAGE/usr/bin/ephemerisd"
 install -D -m 0755 "$BIN/ephctl"                        "$STAGE/usr/bin/ephctl"
+ln -s ephctl "$STAGE/usr/bin/ephsh"   # the router's shell: ephctl's commands at a prompt
 install -D -m 0644 "$ROOT/config/ephemeris.example.toml"   "$STAGE/usr/lib/ephemeris/ephemeris.example.toml"
 echo "$VERSION" > "$STAGE/usr/lib/ephemeris/version"
 # The exact source it was built from (not in the version: labels are short).
