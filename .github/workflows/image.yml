@@ -4,6 +4,11 @@
 # it again. A release runs it too (release.yml calls it for a v* tag, with
 # `release: true`): that build alone is signed with the real keys and
 # attested, and the image that passes its boot test is the one published.
+#
+# The signing keys are only ever in the "image" job, which runs mkosi and
+# nothing else from outside: no crate's build script or proc macro, no SBOM
+# tool, no test tools. Those run in jobs of their own (binaries, sbom, e2e)
+# that never see a key, so a malicious package can't take them.
 name: image
 
 # Pull requests that only change documentation don't build or test an image.
@@ -96,17 +101,13 @@ jobs:
           path: sdwan-logs
           if-no-files-found: ignore
 
-  image:
+  # ephemerisd and ephctl, built where no signing key will ever be: every
+  # crate's build script and proc macros run here.
+  binaries:
     needs: test
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    # A release uses the environment holding the real signing keys (only
-    # release tags may); everything else a key-less one.
-    environment: ${{ inputs.release && startsWith(github.ref, 'refs/tags/v') && 'release-signing' || 'ci-test' }}
-    permissions:
-      contents: read
-      id-token: write      # build provenance attestation (releases only)
-      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,10 +132,73 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      - name: Build
+        run: cargo build --release --locked -p ephemerisd -p ephctl
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries
+          path: |
+            target/release/ephemerisd
+            target/release/ephctl
+          retention-days: 1
+
+  # SBOM of the Rust side (every crate in Cargo.lock), CycloneDX. The image
+  # build adds it, and mkosi's package manifest, to SHA256SUMS, so both are
+  # signed and attested with the image. A job of its own: the SBOM tool is
+  # downloaded as it runs, and mustn't be near the keys or the binaries.
+  sbom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: rust.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: rust.cdx.json
+          retention-days: 1
+
+  # The image, signed: the only job that holds signing keys, and the only
+  # code from outside it runs is mkosi and the Debian packages it installs.
+  image:
+    needs: [binaries, sbom]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # A release uses the environment holding the real signing keys (only
+    # release tags may); everything else a key-less one.
+    environment: ${{ inputs.release && startsWith(github.ref, 'refs/tags/v') && 'release-signing' || 'ci-test' }}
+    permissions:
+      contents: read
+      id-token: write      # build provenance attestation (releases only)
+      attestations: write
+    env:
+      VERSION: ${{ needs.binaries.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries
+          path: binaries
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: image
+
       - uses: systemd/mkosi@ecf7f5702bb2052b7a69cab3fe7d37bc3b9ad77b # v27.1
 
-      - name: Tools for converting and booting the image
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-utils qemu-system-x86 ovmf xz-utils
+      - name: Tools for converting the image
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-utils xz-utils
 
       # Release builds are signed with the real keys, which live in the
       # "release-signing" environment: only v* tags may use it, so a pull
@@ -180,29 +244,27 @@ jobs:
             gpg --export > image/mkosi.extra/etc/systemd/import-pubring.gpg
           fi
 
-      # SBOM of the Rust side (every crate in Cargo.lock), CycloneDX. The
-      # build adds it, and mkosi's package manifest, to SHA256SUMS, so both
-      # are signed and attested with the image.
-      - name: SBOM (Rust dependencies)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: .
-          format: cyclonedx-json
-          output-file: image/rust.cdx.json
-          upload-artifact: false
-          upload-release-assets: false
-
       - name: Build image
         env:
           SIGN_RELEASE: "1"
-        run: image/build.sh "${{ steps.version.outputs.version }}"
+          BINARIES: binaries
+        run: image/build.sh "$VERSION"
 
       # A second, newer image, only used as the target of the update test.
       - name: Build update test image
         env:
           SIGN_RELEASE: "1"
+          BINARIES: binaries
         run: |
-          OUT=update-v2 image/build.sh "${{ steps.version.outputs.version }}.1" > build-v2.log 2>&1 || { tail -50 build-v2.log; exit 1; }
+          OUT=update-v2 image/build.sh "$VERSION.1" > build-v2.log 2>&1 || { tail -50 build-v2.log; exit 1; }
+
+      # The runner is thrown away after the job, but nothing after this
+      # needs the keys either.
+      - name: Remove the signing keys
+        if: always()
+        run: |
+          shred -u image/mkosi.key 2>/dev/null || rm -f image/mkosi.key
+          rm -rf ~/.gnupg
 
       # Build provenance (SLSA): a signed statement, kept by GitHub, that
       # these exact files were built by this workflow from this commit.
@@ -212,27 +274,6 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: image/mkosi.output/SHA256SUMS
-
-      # Everything below runs on this CI machine, against the unmodified
-      # production image: see ci/e2e.sh.
-      - name: Test tools
-        run: |
-          sudo apt-get install -y -qq iperf3 sshpass dnsmasq-base busybox ppp pppoe >/dev/null
-          cd ci && npm install --no-save --silent playwright@1.48.2 && npx playwright install --with-deps chromium >/dev/null
-
-      - name: End-to-end test
-        run: |
-          sudo -E env "PATH=$PATH" PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
-            ci/e2e.sh "image/mkosi.output/ephemeris_${{ steps.version.outputs.version }}_x86-64.qcow2" "${{ steps.version.outputs.version }}" \
-              update-v2 "${{ steps.version.outputs.version }}.1"
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-logs
-          path: e2e-logs
-          if-no-files-found: ignore
 
       - name: Upload image
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -248,3 +289,53 @@ jobs:
             image/mkosi.output/VERSION
             image/mkosi.output/*.manifest
             image/mkosi.output/*.cdx.json
+
+      - name: Upload update test image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: update-test-image
+          path: update-v2
+          retention-days: 1
+
+  # The boot and end-to-end test of exactly the image uploaded above, on
+  # this CI machine (see ci/e2e.sh). No keys here: the test tools (npm,
+  # Playwright and its browser) come from outside.
+  e2e:
+    needs: [binaries, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.binaries.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ephemeris-image
+          path: image/mkosi.output
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: update-test-image
+          path: update-v2
+
+      - name: Test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-utils qemu-system-x86 ovmf iperf3 sshpass dnsmasq-base busybox ppp pppoe >/dev/null
+          cd ci && npm install --no-save --silent playwright@1.48.2 && npx playwright install --with-deps chromium >/dev/null
+
+      - name: End-to-end test
+        run: |
+          sudo -E env "PATH=$PATH" PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+            ci/e2e.sh "image/mkosi.output/ephemeris_${VERSION}_x86-64.qcow2" "$VERSION" \
+              update-v2 "$VERSION.1"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs
+          path: e2e-logs
+          if-no-files-found: ignore
