@@ -67,6 +67,11 @@ struct Args {
     /// (one core), and whether it has AES in hardware.
     #[arg(long)]
     bench_crypto: bool,
+    /// Measure how fast this machine's CPU runs packets through the data
+    /// plane (one core, no network card): routing, NAT, port forwards and
+    /// new sessions.
+    #[arg(long)]
+    bench_pipeline: bool,
     /// Development only (not in Linux builds): serve the web portal on
     /// 127.0.0.1:8080 against the config file, without a data plane.
     /// Sign in as admin / dev.
@@ -94,6 +99,19 @@ fn main() -> anyhow::Result<()> {
     }
     if args.bench_crypto {
         sdwan::bench_crypto();
+        return Ok(());
+    }
+    if args.bench_pipeline {
+        println!("One core, no network card: the CPU's ceiling per worker (64-byte packets).");
+        for m in eph_dataplane::bench::run(std::time::Duration::from_secs(1)) {
+            println!(
+                "{:<11} {:>6.0} ns per packet {:>6.2} Mpps   {}",
+                m.name,
+                m.ns_per_packet,
+                m.mpps(),
+                m.what
+            );
+        }
         return Ok(());
     }
     if args.sdwan_identity {

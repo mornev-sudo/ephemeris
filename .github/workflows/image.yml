@@ -135,6 +135,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p ephemerisd -p ephctl
 
+      # The pipeline's speed per core, and the SD-WAN ciphers', on this
+      # runner (shared, so only a rough guide; nothing fails on it).
+      - name: Benchmarks
+        run: |
+          { echo '```'; target/release/ephemerisd --bench-pipeline; target/release/ephemerisd --bench-crypto; echo '```'; } \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries
