@@ -124,15 +124,56 @@ pool = "public"
 
 All of this is also in the portal: Configuration → NAT.
 
+## Port forwards: publishing an inside server
+
+Source NAT lets inside hosts *start* connections. A **port forward**
+(destination NAT) lets the internet start one to an inside server: new
+connections to an outside interface's own address, on a port you choose,
+are carried on to that server.
+
+```toml
+[[nat.forward]]
+name = "web"
+interface = "wan"          # an outside interface: its own address, even from DHCP or PPPoE
+protocol = "tcp"           # "tcp" or "udp"
+port = 443                 # or a range: "5000-5010"
+to = "10.10.1.20"          # a host on an inside interface's subnet
+# to_port = 8443           # its port (for a range, where it starts); default: the same
+# from = ["198.51.100.0/24"]  # only from these sources; default: anyone
+```
+
+It's the same session machinery as source NAT, turned around. The first
+packet, `client → 203.0.113.1:443`, has its destination rewritten to
+`10.10.1.20:443`, and a session is made for `client ↔ 10.10.1.20`, with
+`client ↔ 203.0.113.1:443` as its second key. From then on:
+
+- the client's packets find the session by that second key and go in
+  translated, like source NAT's replies;
+- the server's replies find it by the first key and leave with
+  `203.0.113.1:443` as their source, like source NAT's requests;
+- the client sending straight to `10.10.1.20` is going around the NAT:
+  `session-mismatch`.
+
+The forward itself allows the session, though an outside interface
+otherwise takes only replies; a firewall rule (chapter 14) can still drop
+it. Errors that would quote the inside server (TTL running out on the
+way in) aren't sent.
+
+**With several workers**, the client's packets and the server's replies
+arrive on different cards, hashed differently. The session is made on the
+worker the inside card will deliver the server's replies to (predicted as
+in "Many cores" above), and the client's packets are handed to it from
+wherever they land. A card that can't be predicted falls back to a fixed
+hash both directions can work out.
+
+Forwards apply live, and the router's own UDP ports on that address (DHCP,
+the SD-WAN port) can't be forwarded. In the portal: Configuration → NAT.
+
 ## What's not here yet
 
-- **Destination NAT / port forwarding:** for example, "203.0.113.1:443 →
-  10.10.1.20:443" to publish an inside server. This is the natural next NAT
-  feature.
-- **DHCP on the outside interface:** most ISP links hand out their address
-  by DHCP. For now the outside address and default route are static.
 - **NAT hairpinning:** an inside host reaching an inside server via its
-  public address.
+  public address (`203.0.113.1:443` from the LAN). Use the server's inside
+  address, or a local DNS name for it.
 - **PPPoE with several workers:** cards can't hash inside PPPoE, so a
   PPPoE WAN's packets all arrive on one queue; the replies are handed to
   their workers from there (chapter 7). It works with any number of

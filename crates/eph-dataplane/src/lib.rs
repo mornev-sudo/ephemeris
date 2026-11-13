@@ -43,6 +43,8 @@ mod tests_dynamic;
 #[cfg(test)]
 mod tests_filter;
 #[cfg(test)]
+mod tests_forward;
+#[cfg(test)]
 mod tests_fuzz;
 #[cfg(test)]
 mod tests_nat;

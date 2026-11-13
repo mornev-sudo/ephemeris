@@ -90,6 +90,7 @@ qemu-system-x86_64 \
     -global driver=cfi.pflash01,property=secure,value=on \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
     -drive if=pflash,format=raw,file="$WORK/vars.fd" \
+    -device i6300esb -action watchdog=reset \
     -device virtio-scsi-pci,id=scsi \
     -drive id=disk,if=none,format=qcow2,file="$WORK/disk.qcow2" -device scsi-hd,drive=disk \
     -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8443-:8443 \
@@ -171,6 +172,9 @@ wait_for 60 "boot to finish" sh -c "${SSH[*]} systemctl is-system-running --wait
 echo "System:"
 check "boots version $VERSION"             sh -c "[ \"\$(${SSH[*]} cat /usr/lib/ephemeris/version)\" = '$VERSION' ]"
 check "no failed services"                 sh -c "[ -z \"\$(${SSH[*]} systemctl --failed --plain --no-legend)\" ] || { ${SSH[*]} systemctl --failed; false; }"
+check "hardware watchdog running"          wait_for 30 "the watchdog" on_router "grep -qx active /sys/class/watchdog/watchdog0/state"
+check "ephsh runs ephctl's commands"       sh -c "printf 'system status\nexit\nstatus\n' | ${SSH[*]} ephsh | grep -q '^Ephemeris '"
+check "the kernel reboots after a panic"   sh -c "[ \"\$(${SSH[*]} cat /proc/sys/kernel/panic)\" = 10 ]"
 # The SSH policy is written before sshd starts: nothing restarts it at boot.
 check "sshd up since boot"                 sh -c "[ \"\$(${SSH[*]} systemctl show -p NRestarts --value ssh.service)\" = 0 ]"
 check "ephemerisd runs as a service"         on_router systemctl is-active --quiet ephemerisd.service
@@ -302,15 +306,18 @@ check "live route add"                     sh -c "${SSH[*]} ephctl route add 0.0
 check "live route delete"                  sh -c "${SSH[*]} ephctl route del 0.0.0.0/0 && ip netns exec ci-ha ping -c1 -W1 8.8.8.8 | grep -qi 'From 10.10.1.1 .*net unreachable'"
 
 # ------------------------------------------------------------ router access
-# The portal and SSH on lan-a's own address (inside), through the host path
-# (eph-host); never on lan-b, which is outside, whatever the config says.
+# The portal, SSH and DNS on lan-a's own address (inside), through the host
+# path (eph-host); never on lan-b, which is outside, whatever the config says.
 echo "Router access on data-plane interfaces:"
-sed 's|^address = "10.10.1.1/24"$|address = "10.10.1.1/24"\nmanagement = ["https", "ssh"]|' "$WORK/ephemeris.toml" > "$WORK/access.toml"
+sed 's|^address = "10.10.1.1/24"$|address = "10.10.1.1/24"\nmanagement = ["https", "ssh", "dns"]|' "$WORK/ephemeris.toml" > "$WORK/access.toml"
 on_router "cat > /run/access.toml" < "$WORK/access.toml"
 check "offer the portal and SSH on lan-a"   on_router "ephctl config load /run/access.toml && ephctl config commit"
 check "portal from lan-a (10.10.1.1:8443)"  wait_for 30 "the portal on lan-a" sh -c "[ \"\$(ip netns exec ci-ha curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://10.10.1.1:8443/)\" = 200 ]"
 check "SSH from lan-a (10.10.1.1:22)"       ip netns exec ci-ha ssh -q -i "$WORK/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes root@10.10.1.1 true
 check "sshd sees the real client address"   on_router "journalctl -u ssh --no-pager | grep -q 'from 10.10.1.10 port'"
+# resolved answers its own host name without asking anyone upstream.
+check "DNS from lan-a (10.10.1.1:53)"       ip netns exec ci-ha timeout 10 busybox nslookup ci-router 10.10.1.1
+check "not on lan-b (outside): DNS"         sh -c "! ip netns exec ci-hb timeout 10 busybox nslookup ci-router 10.10.2.1"
 check "not on lan-b (outside): portal"      sh -c "! ip netns exec ci-hb curl -sk -o /dev/null --max-time 5 https://10.10.2.1:8443/"
 check "not on lan-b (outside): SSH"         sh -c "! ip netns exec ci-hb ssh -q -i '$WORK/key' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes root@10.10.2.1 true"
 sed 's|^address = "dhcp"$|address = "dhcp"\nmanagement = ["ssh"]|' "$WORK/access.toml" > "$WORK/access-wan.toml"
@@ -318,6 +325,25 @@ on_router "cat > /run/access-wan.toml" < "$WORK/access-wan.toml"
 check "outside access is refused"           sh -c "${SSH[*]} ephctl config load /run/access-wan.toml 2>&1 | grep -q 'only be reached on inside interfaces'"
 check "turn it off again"                   on_router "ephctl config rollback 1"
 check "portal from lan-a closed again"      wait_for 15 "lan-a closed" sh -c "! ip netns exec ci-ha curl -sk -o /dev/null --max-time 3 https://10.10.1.1:8443/"
+
+# ------------------------------------------------------------ port forwards, firewall
+# lan-b (outside) reaches a web server on host A through a forward of the
+# router's lan-b address; a firewall rule stops host A pinging host B.
+echo "Port forwards and firewall:"
+mkdir -p "$WORK/www-a" && echo ephemeris-forward-ok > "$WORK/www-a/fwd.txt"
+ip netns exec ci-ha python3 -m http.server 8001 --bind 10.10.1.10 --directory "$WORK/www-a" > "$LOGS/www-a.log" 2>&1 &
+www_a_pid=$!
+{ cat "$WORK/ephemeris.toml"; printf '\n[[nat.forward]]\nname = "web"\ninterface = "lan-b"\nprotocol = "tcp"\nport = 8080\nto = "10.10.1.10"\nto_port = 8001\n\n[[firewall]]\nname = "no ping to b"\naction = "drop"\nfrom = "lan-a"\nto = "10.10.2.10"\nprotocol = "icmp"\n'; } > "$WORK/forward.toml"
+on_router "cat > /run/forward.toml" < "$WORK/forward.toml"
+check "a forward and a rule, live"         on_router "ephctl config load /run/forward.toml && ephctl config commit"
+check "lan-b reaches host A's server"      wait_for 15 "the forward" sh -c "ip netns exec ci-hb curl -sf --max-time 3 http://10.10.2.1:8080/fwd.txt | grep -q ephemeris-forward-ok"
+check "host A sees host B's address"       grep -q '^10\.10\.2\.10 .*GET /fwd.txt' "$LOGS/www-a.log"
+check "only the forwarded port"            sh -c "! ip netns exec ci-hb curl -sf --max-time 3 http://10.10.2.1:8081/fwd.txt"
+check "the rule drops host A's ping"       sh -c "! ip netns exec ci-ha ping -c2 -i0.2 -W1 10.10.2.10"
+check "counted as firewall"                wait_for 15 "the drop counter" sh -c "${SSH[*]} ephctl status | grep -q 'firewall'"
+check "rules off again (rollback)"         on_router "ephctl config rollback 1"
+check "host A pings host B again"          wait_for 15 "the ping" ip netns exec ci-ha ping -c2 -i0.2 -W1 10.10.2.10
+kill "$www_a_pid" 2>/dev/null || true
 
 # ------------------------------------------------------------ SSH keys only
 echo "SSH keys only:"
@@ -556,6 +582,21 @@ if [[ -n $UPDATE_DIR ]]; then
     check "new version blessed"            wait_for 120 "boot counter removed" sh -c "${SSH[*]} 'ls \$(bootctl --print-esp-path)/EFI/Linux' | grep -q '_${UPDATE_VERSION}_x86-64.efi\$'"
     check "config and password survive"    sshpass -p "$PASSWORD" ssh -q -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no root@127.0.0.1 grep -q lan-b /var/lib/ephemeris/ephemeris.toml
     check "still forwarding"               wait_for 60 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W2 10.10.2.10
+
+    # Back to the other version: once, then for good.
+    switched() { # the router is back, running version $1
+        sleep 10
+        wait_for 300 "SSH after the reboot" on_router true &&
+            wait_for 60 "version $1" sh -c "[ \"\$(${SSH[*]} cat /usr/lib/ephemeris/version)\" = '$1' ]"
+    }
+    on_router ephctl system switch --once >/dev/null 2>&1 || true
+    check "switch --once: runs $VERSION"   switched "$VERSION"
+    on_router ephctl system reboot >/dev/null 2>&1 || true
+    check "then $UPDATE_VERSION again"     switched "$UPDATE_VERSION"
+    on_router ephctl system switch >/dev/null 2>&1 || true
+    check "switch: runs $VERSION"          switched "$VERSION"
+    check "$UPDATE_VERSION marked bad"     sh -c "${SSH[*]} 'ls \$(bootctl --print-esp-path)/EFI/Linux' | grep -q '_${UPDATE_VERSION}_x86-64+0.efi\$'"
+    check "status: nothing pending"        sh -c "! ${SSH[*]} ephctl system status | grep -q 'is installed'"
 fi
 
 on_router journalctl -b --no-pager > "$LOGS/journal.log" 2>&1 || true

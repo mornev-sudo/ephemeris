@@ -1,5 +1,5 @@
-//! The host path: the router's own SSH server and web portal, reached on an
-//! inside interface's address.
+//! The host path: the router's own SSH server, web portal and DNS, reached
+//! on an inside interface's address.
 //!
 //! sshd and nginx run in Linux, which never sees the data-plane NICs (AF_XDP
 //! takes every frame). So the pipeline hands their traffic to the kernel
@@ -18,6 +18,12 @@
 //!
 //! Only inside interfaces, never outside ones or SD-WAN tethers: checked
 //! here on every packet, whatever the config says.
+//!
+//! DNS goes to one address for every interface, [`DNS_ADDR`], where
+//! systemd-resolved listens (the image's `resolved.conf.d`): it answers
+//! LAN hosts with the router's own resolver. Its replies go back out of
+//! the interface their destination routes through, with that interface's
+//! address.
 //!
 //! ## The router's own connections
 //!
@@ -46,16 +52,22 @@ use std::net::Ipv4Addr;
 pub const HTTPS_PORT: u16 = 8443;
 /// SSH.
 pub const SSH_PORT: u16 = 22;
+/// DNS (UDP and TCP).
+pub const DNS_PORT: u16 = 53;
 
 /// Link-local addresses for the host side, one per interface. (Clear of
 /// 169.254.169.254, the cloud metadata address.)
 pub const HOST_NET: Ipv4Addr = Ipv4Addr::new(169, 254, 240, 0);
 pub const HOST_NET_LEN: u8 = 20;
-/// Interfaces the range has room for (its last address is [`SELF_ADDR`]).
-pub const HOST_PORTS_MAX: usize = (1 << (32 - HOST_NET_LEN)) - 3;
+/// Interfaces the range has room for (its last two addresses are
+/// [`DNS_ADDR`] and [`SELF_ADDR`]).
+pub const HOST_PORTS_MAX: usize = (1 << (32 - HOST_NET_LEN)) - 4;
 /// The source of the router's own outbound connections through the data
 /// plane: the range's last usable address.
 pub const SELF_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 255, 254);
+/// Where the router's DNS server listens for every interface (see
+/// `/usr/lib/systemd/resolved.conf.d/ephemeris-lan-dns.conf`).
+pub const DNS_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 255, 253);
 
 pub fn host_net() -> Prefix {
     Prefix::new(HOST_NET, HOST_NET_LEN).expect("a valid prefix")
@@ -77,18 +89,22 @@ pub fn port_of(addr: Ipv4Addr) -> Option<PortId> {
 pub struct HostAccess {
     pub https: bool,
     pub ssh: bool,
+    pub dns: bool,
     /// Only clients in these prefixes; empty: anyone who reaches the address.
     pub from: Vec<Prefix>,
 }
 
 impl HostAccess {
     pub fn any(&self) -> bool {
-        self.https || self.ssh
+        self.https || self.ssh || self.dns
     }
 
-    /// Is TCP port `port` one of the services offered?
-    pub fn offers(&self, port: u16) -> bool {
-        (port == HTTPS_PORT && self.https) || (port == SSH_PORT && self.ssh)
+    /// Is `port` (of TCP or UDP `proto`) one of the services offered?
+    pub fn offers(&self, proto: u8, port: u16) -> bool {
+        let tcp = proto == eph_packet::ipv4::PROTO_TCP;
+        (tcp && port == HTTPS_PORT && self.https)
+            || (tcp && port == SSH_PORT && self.ssh)
+            || (port == DNS_PORT && self.dns)
     }
 
     pub fn admits(&self, src: Ipv4Addr) -> bool {
@@ -96,10 +112,10 @@ impl HostAccess {
     }
 }
 
-/// May a TCP segment from `src` to port `dport` on `port`'s address go to
-/// the host? Inside interfaces only.
-pub fn allowed_in(port: &Port, src: Ipv4Addr, dport: u16) -> bool {
-    port.role == Role::Inside && port.host.offers(dport) && port.host.admits(src)
+/// May a TCP or UDP packet from `src` to port `dport` on `port`'s address
+/// go to the host? Inside interfaces only.
+pub fn allowed_in(port: &Port, src: Ipv4Addr, proto: u8, dport: u16) -> bool {
+    port.role == Role::Inside && port.host.offers(proto, dport) && port.host.admits(src)
 }
 
 #[cfg(test)]
@@ -120,6 +136,9 @@ mod tests {
         assert!(host_net().contains(SELF_ADDR));
         assert_eq!(port_of(SELF_ADDR), None, "not an interface's");
         assert_ne!(host_addr(HOST_PORTS_MAX as u16 - 1), Some(SELF_ADDR));
+        assert_ne!(host_addr(HOST_PORTS_MAX as u16 - 1), Some(DNS_ADDR));
+        assert!(host_net().contains(DNS_ADDR));
+        assert_eq!(port_of(DNS_ADDR), None, "not an interface's");
         assert_eq!(port_of("10.0.0.1".parse().unwrap()), None);
     }
 }

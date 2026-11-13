@@ -150,6 +150,15 @@ pub enum Dir {
     Reverse = 1,
 }
 
+impl Dir {
+    pub fn other(self) -> Dir {
+        match self {
+            Dir::Forward => Dir::Reverse,
+            Dir::Reverse => Dir::Forward,
+        }
+    }
+}
+
 /// Session state. TCP gets a real (simplified) state machine; everything
 /// else is just "have we seen one direction, or both?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,8 +305,10 @@ pub struct Unanswered {
 /// Unanswered sessions kept for tracing between two housekeeping calls.
 const UNANSWERED_LOG_MAX: usize = 256;
 
-/// A source-NAT translation: the session's initiator `orig_addr:orig_port`
-/// appears to the outside as `addr:port`.
+/// A NAT translation: the session's inside end `orig_addr:orig_port`
+/// appears to the outside as `addr:port`. Source NAT: the inside end
+/// started the session. Destination NAT (`dnat`, a port forward): the
+/// outside end did, to `addr:port`, and it's carried on to the inside host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NatBinding {
     /// The 5-tuple as the outside sees it.
@@ -306,6 +317,18 @@ pub struct NatBinding {
     pub orig_port: u16,
     pub addr: Ipv4Addr,
     pub port: u16,
+    pub dnat: bool,
+}
+
+impl NatBinding {
+    /// The direction the inside end's packets travel in.
+    pub fn inside(&self) -> Dir {
+        if self.dnat {
+            Dir::Reverse
+        } else {
+            Dir::Forward
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

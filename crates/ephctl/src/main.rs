@@ -6,6 +6,8 @@
 // all safe Rust, and the compiler keeps it that way.
 #![forbid(unsafe_code)]
 
+mod shell;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
@@ -78,6 +80,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SystemCmd,
     },
+    /// An interactive shell: these commands, typed without `ephctl`
+    /// (`ephsh` on the router).
+    Shell,
 }
 
 #[derive(Subcommand)]
@@ -96,6 +101,15 @@ enum SystemCmd {
         /// Reboot even while an update is still installing (it's cancelled).
         #[arg(long)]
         force: bool,
+    },
+    /// Reboot into the other installed version (A/B): from now on, or with
+    /// --once only for the next boot. "From now on" marks the running
+    /// version as bad, as a failed trial boot would; the next update
+    /// replaces it.
+    Switch {
+        /// Only for the next boot; after that, the usual version again.
+        #[arg(long)]
+        once: bool,
     },
     /// Change the admin password (web "admin" and console/SSH "root").
     Password {
@@ -285,7 +299,31 @@ impl Client {
 }
 
 fn main() {
-    if let Err(e) = run(Cli::parse()) {
+    // Run as `ephsh` (the router's link to ephctl): straight into the shell.
+    let ephsh = std::env::args_os()
+        .next()
+        .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n == "ephsh"))
+        .unwrap_or(false);
+    let cli = if ephsh {
+        Cli::parse_from(["ephsh", "shell"])
+    } else {
+        Cli::parse()
+    };
+    let r = match cli.cmd {
+        Cmd::Shell => {
+            let mut global = vec!["--url".to_string(), cli.url];
+            if let Some(t) = cli.token {
+                global.extend(["--token".to_string(), t]);
+            }
+            shell::run(&global, |args| match Cli::try_parse_from(args) {
+                Ok(cli) => run(cli),
+                // --help, a typo: clap says what it says, the shell goes on.
+                Err(e) => e.print().map_err(Into::into),
+            })
+        }
+        _ => run(cli),
+    };
+    if let Err(e) = r {
         eprintln!("ephctl: {e:#}");
         std::process::exit(1);
     }
@@ -308,6 +346,7 @@ fn run(cli: Cli) -> Result<()> {
     let print = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap());
 
     match cli.cmd {
+        Cmd::Shell => bail!("already in the shell"),
         Cmd::Status => {
             let s = c.get("/status")?;
             if json {
@@ -1230,6 +1269,13 @@ fn system(c: &Client, cmd: SystemCmd, json: bool) -> Result<()> {
                 _ => println!("Rebooting…"),
             }
             c.call("POST", "/system/reboot", None)?
+        }
+        SystemCmd::Switch { once } => {
+            let body = serde_json::json!({ "once": once }).to_string();
+            let r = c.call("POST", "/system/switch", Some(("application/json", &body)))?;
+            let when = if once { " for one boot" } else { "" };
+            println!("Rebooting into {}{when}…", str(&r["version"]));
+            return Ok(());
         }
         SystemCmd::Password { reset } => {
             let current = if reset {

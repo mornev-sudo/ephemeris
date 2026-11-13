@@ -41,6 +41,7 @@ The most exposed boundary: anyone on the internet can send packets here.
 |---|---|
 | **S** Spoofed sources (inside addresses, the router's own, martians) | Packet filter refuses martians, spoofed and router-owned sources, source routing, bad fragments (chapter 14) |
 | **T/I** Unsolicited traffic to inside hosts | Outside interfaces only let replies in (`allow_new_sessions = false`); stateful sessions, TCP state checks; source NAT |
+| **T/E** Port forwards widening what's reachable | Only the configured ports, to hosts on inside subnets (never the router's own addresses or its DHCP and SD-WAN ports), optionally only from some sources; firewall rules can drop them; going around the forward to the inside address is `session-mismatch`; errors that would quote the inside host aren't sent |
 | **D** Floods, malformed packets | Bounded tables (sessions, NAT, neighbours, punt queues); rate-limited ICMP errors and ARP; every parser and the whole pipeline fuzzed (no packet may panic it) |
 | **E** Reaching SSH or the portal | Never offered on outside interfaces: refused by the config and again per packet by the data plane (chapter 19) |
 | **S/T** Rogue DHCP / PPPoE server on the ISP link | Accepted values validated; network-supplied text cleaned before it's logged or shown (log injection, terminal escapes) |
@@ -56,6 +57,8 @@ Trusted more, but not fully: a compromised laptop or a guest is here too.
 |---|---|
 | **S** ARP spoofing of the router or hosts | Neighbours learned only from on-link senders; a conflicting ARP isn't believed, it triggers a check |
 | **E** Reaching SSH or the portal from any inside host | Off by default; per interface (`management`), optionally limited to source prefixes (`management_from`); only the interface's own address |
+| **E** Using the router's DNS as a way out | Off by default, inside interfaces only (`management = ["dns"]`); it answers with the router's own resolver, which only resolves; firewall rules don't apply to it, so `management_from` is what limits who may ask |
+| **E** One inside network reaching another | Firewall rules (`[[firewall]]`) drop new sessions by interface, prefix, protocol and port |
 | **T** Forged log entries via DHCP hostnames | Cleaned at the source and escaped at the writer (ASVS V16.4.1) |
 | **D** DHCP exhaustion, punt floods | Bounded lease pool and control queue; drops counted |
 
@@ -100,7 +103,7 @@ isn't implemented yet.
 
 | Threat | Mitigation |
 |---|---|
-| **E** The host used to send arbitrary traffic out | Only replies from ports 22 and 8443, only towards an inside interface |
+| **E** The host used to send arbitrary traffic out | Only replies from ports 22 and 8443 of an interface's host address, and port 53 of the DNS address, only towards an inside interface |
 | **S** Packets forged into `eph-host` | The device is local to the router; only ephemerisd writes to it |
 
 ## B6: control plane inputs (DHCP, PPPoE)

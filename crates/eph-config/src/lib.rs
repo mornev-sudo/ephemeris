@@ -12,7 +12,7 @@
 pub mod logging;
 
 use anyhow::{bail, Context, Result};
-use eph_dataplane::nat::{NatAction, NatConfig, NatRule};
+use eph_dataplane::nat::{FirewallRule, Forward, NatAction, NatConfig, NatRule, Side};
 use eph_dataplane::overlay::{Class, Overlay, PeerCrypto, Tether, TetherKey, DEFAULT_MTU};
 use eph_dataplane::{
     build_fib, NextHop, OverlayRoute, Port, Role, SessionConfig, StaticRoute, Timeouts,
@@ -49,6 +49,10 @@ pub struct Config {
     /// outside interface's address).
     #[serde(default)]
     pub nat: NatCfg,
+    /// Firewall rules: whether new sessions may start, in order, the first
+    /// match deciding. With none matching, the interface's own policy.
+    #[serde(default, rename = "firewall", skip_serializing_if = "Vec::is_empty")]
+    pub firewall: Vec<FirewallRuleCfg>,
     /// SD-WAN overlay (absent = plain router).
     #[serde(default)]
     pub overlay: Option<OverlayCfg>,
@@ -455,8 +459,9 @@ pub struct InterfaceCfg {
     #[serde(default)]
     pub role: RoleCfg,
     /// The router's own services reachable on this interface's address:
-    /// "https" (the portal, port 8443) and/or "ssh" (port 22). Inside
-    /// interfaces only; none by default.
+    /// "https" (the portal, port 8443), "ssh" (port 22) and "dns" (port 53:
+    /// the router answers DNS queries, and its DHCP server hands itself out
+    /// as the DNS server). Inside interfaces only; none by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub management: Vec<String>,
     /// Only clients in these prefixes may use them (empty: anyone who can
@@ -705,6 +710,9 @@ pub struct NatCfg {
     pub pools: Vec<NatPoolCfg>,
     #[serde(rename = "rule", skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<NatRuleCfg>,
+    /// Port forwards (destination NAT).
+    #[serde(rename = "forward", skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<ForwardCfg>,
 }
 
 impl Default for NatCfg {
@@ -713,8 +721,80 @@ impl Default for NatCfg {
             masquerade: true,
             pools: vec![],
             rules: vec![],
+            forwards: vec![],
         }
     }
+}
+
+/// A port, or a range of them: `443` or `"8000-8010"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PortsCfg {
+    One(u16),
+    Range(String),
+}
+
+impl PortsCfg {
+    pub fn range(&self) -> Result<(u16, u16)> {
+        let (lo, hi) = match self {
+            PortsCfg::One(p) => (*p, *p),
+            PortsCfg::Range(r) => {
+                let (a, b) = r.split_once('-').unwrap_or((r, r));
+                let p = |x: &str| {
+                    x.trim().parse::<u16>().with_context(|| {
+                        format!("{r:?} isn't a port or a range like \"8000-8010\"")
+                    })
+                };
+                (p(a)?, p(b)?)
+            }
+        };
+        if lo == 0 || lo > hi {
+            bail!("ports {lo}-{hi}: must be 1-65535, low to high");
+        }
+        Ok((lo, hi))
+    }
+}
+
+/// `[[nat.forward]]`: new sessions to an outside interface's own address
+/// on `port` are carried on to an inside host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardCfg {
+    pub name: String,
+    /// The outside interface (its own address, whatever it is now).
+    pub interface: String,
+    /// "tcp" or "udp".
+    pub protocol: String,
+    pub port: PortsCfg,
+    /// The inside host.
+    pub to: Ipv4Addr,
+    /// Its port (for a range, where the range starts). Default: `port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_port: Option<u16>,
+    /// Only from these sources (addresses or prefixes). Default: anyone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from: Vec<String>,
+}
+
+/// `[[firewall]]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirewallRuleCfg {
+    pub name: String,
+    /// "allow" or "drop".
+    pub action: String,
+    /// An interface name, "overlay", an address or prefix, or "any"
+    /// (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// "tcp", "udp", "icmp" or "any" (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Destination ports (with "tcp" or "udp").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<PortsCfg>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -744,6 +824,17 @@ pub struct NatRuleCfg {
 
 fn default_true() -> bool {
     true
+}
+
+/// "10.0.0.0/8", or an address on its own (a /32).
+fn parse_prefix(s: &str) -> Result<Prefix> {
+    let s = s.trim();
+    let p = if s.contains('/') {
+        s.to_string()
+    } else {
+        format!("{s}/32")
+    };
+    p.parse::<Prefix>().map_err(anyhow::Error::msg)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1227,21 +1318,21 @@ impl Config {
                 }
             }
             for m in &i.management {
-                if !["https", "ssh"].contains(&m.as_str()) {
+                if !["https", "ssh", "dns"].contains(&m.as_str()) {
                     bail!(
-                        "{which}: management {m:?}: choose \"https\" (the portal) and/or \"ssh\""
+                        "{which}: management {m:?}: choose from \"https\" (the portal), \"ssh\" and \"dns\""
                     );
                 }
             }
-            // The router's own SSH and portal are never offered to the
+            // The router's own SSH, portal and DNS are never offered to the
             // internet (the data plane refuses them there as well).
             if !i.management.is_empty() && i.role == RoleCfg::Outside {
                 bail!(
-                    "{which}: SSH and the portal can only be reached on inside interfaces, not on an outside one"
+                    "{which}: the router's own services (SSH, the portal, DNS) can only be reached on inside interfaces, not on an outside one"
                 );
             }
             if !i.management_from.is_empty() && i.management.is_empty() {
-                bail!("{which}: management_from without management (\"https\", \"ssh\") has no effect");
+                bail!("{which}: management_from without management (\"https\", \"ssh\", \"dns\") has no effect");
             }
             for p in &i.management_from {
                 p.parse::<Prefix>()
@@ -1457,6 +1548,7 @@ impl Config {
                     host: eph_dataplane::host::HostAccess {
                         https: i.management.iter().any(|m| m == "https"),
                         ssh: i.management.iter().any(|m| m == "ssh"),
+                        dns: i.management.iter().any(|m| m == "dns"),
                         from: i
                             .management_from
                             .iter()
@@ -1598,11 +1690,153 @@ impl Config {
                 action,
             });
         }
+        let forwards = self.forwards()?;
+        let firewall = self.firewall_rules()?;
         Ok(NatConfig {
             masquerade: n.masquerade,
             pools,
             rules,
+            forwards,
+            firewall,
         })
+    }
+
+    fn port_of(&self, name: &str) -> Option<u16> {
+        self.interfaces
+            .iter()
+            .position(|i| i.name == name)
+            .map(|i| i as u16)
+    }
+
+    /// `[[nat.forward]]`, checked.
+    fn forwards(&self) -> Result<Vec<Forward>> {
+        let mut out: Vec<Forward> = Vec::new();
+        for f in &self.nat.forwards {
+            let ctx = || format!("port forward {}", f.name);
+            let port = self
+                .port_of(&f.interface)
+                .with_context(|| format!("{}: no interface named {:?}", ctx(), f.interface))?;
+            if self.interfaces[port as usize].role != RoleCfg::Outside {
+                bail!("{}: {} isn't an outside interface", ctx(), f.interface);
+            }
+            let proto = match f.protocol.as_str() {
+                "tcp" => eph_packet::ipv4::PROTO_TCP,
+                "udp" => eph_packet::ipv4::PROTO_UDP,
+                p => bail!("{}: protocol must be \"tcp\" or \"udp\", not {p:?}", ctx()),
+            };
+            let ports = f.port.range().with_context(ctx)?;
+            let to_port = f.to_port.unwrap_or(ports.0);
+            if to_port == 0 || to_port as u32 + (ports.1 - ports.0) as u32 > 65535 {
+                bail!(
+                    "{}: to_port {to_port} leaves no room for {} ports",
+                    ctx(),
+                    ports.1 - ports.0 + 1
+                );
+            }
+            // The router's own UDP services on that address.
+            if proto == eph_packet::ipv4::PROTO_UDP {
+                let overlay = self.overlay.as_ref().map(|o| o.udp_port);
+                for own in [Some(67), Some(68), overlay].into_iter().flatten() {
+                    if (ports.0..=ports.1).contains(&own) {
+                        bail!("{}: UDP {own} is the router's own (DHCP or SD-WAN)", ctx());
+                    }
+                }
+            }
+            let addrs = self.interface_addrs()?;
+            let host = addrs.iter().zip(&self.interfaces).any(|((a, net), i)| {
+                i.role == RoleCfg::Inside
+                    && !a.is_unspecified()
+                    && net.contains(f.to)
+                    && (net.len() >= 31 || (f.to != net.addr() && f.to != broadcast(*net)))
+            });
+            let own = addrs.iter().any(|(a, _)| *a == f.to);
+            if own || !host {
+                bail!(
+                    "{}: {} isn't a host on an inside interface's subnet",
+                    ctx(),
+                    f.to
+                );
+            }
+            let from = f
+                .from
+                .iter()
+                .map(|s| parse_prefix(s).with_context(ctx))
+                .collect::<Result<_>>()?;
+            if let Some(o) = out.iter().find(|o| {
+                o.port == port && o.proto == proto && o.ports.0 <= ports.1 && ports.0 <= o.ports.1
+            }) {
+                bail!("{}: its ports overlap port forward {}'s", ctx(), o.name);
+            }
+            out.push(Forward {
+                name: f.name.clone(),
+                port,
+                proto,
+                ports,
+                to: f.to,
+                to_port,
+                from,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `[[firewall]]`, checked.
+    fn firewall_rules(&self) -> Result<Vec<FirewallRule>> {
+        self.firewall
+            .iter()
+            .map(|r| {
+                let ctx = || format!("firewall rule {}", r.name);
+                let side = |s: &Option<String>| -> Result<Side> {
+                    Ok(match s.as_deref().map(str::trim) {
+                        None | Some("" | "any") => Side::Any,
+                        Some("overlay") => {
+                            if self.overlay.is_none() {
+                                bail!("\"overlay\" needs an [overlay] section");
+                            }
+                            Side::Overlay
+                        }
+                        Some(x) => match self.port_of(x) {
+                            Some(p) => Side::Port(p),
+                            None => Side::Prefix(parse_prefix(x).with_context(|| {
+                                format!(
+                                    "{x:?} isn't an interface, \"overlay\", \"any\" or a prefix"
+                                )
+                            })?),
+                        },
+                    })
+                };
+                let allow = match r.action.as_str() {
+                    "allow" => true,
+                    "drop" => false,
+                    a => bail!("{}: action must be \"allow\" or \"drop\", not {a:?}", ctx()),
+                };
+                let proto = match r.protocol.as_deref().unwrap_or("any") {
+                    "any" => None,
+                    "tcp" => Some(eph_packet::ipv4::PROTO_TCP),
+                    "udp" => Some(eph_packet::ipv4::PROTO_UDP),
+                    "icmp" => Some(eph_packet::ipv4::PROTO_ICMP),
+                    p => bail!(
+                        "{}: protocol must be tcp, udp, icmp or any, not {p:?}",
+                        ctx()
+                    ),
+                };
+                let ports = match &r.port {
+                    None => None,
+                    Some(_) if !matches!(proto, Some(6 | 17)) => {
+                        bail!("{}: a port needs protocol \"tcp\" or \"udp\"", ctx())
+                    }
+                    Some(p) => Some(p.range().with_context(ctx)?),
+                };
+                Ok(FirewallRule {
+                    name: r.name.clone(),
+                    allow,
+                    from: side(&r.from).with_context(ctx)?,
+                    to: side(&r.to).with_context(ctx)?,
+                    proto,
+                    ports,
+                })
+            })
+            .collect()
     }
 
     /// Compile the SD-WAN section into the data plane's form (ids, not names).
@@ -1959,6 +2193,99 @@ mod tests {
         let ports = c.ports(|_| Ok([0; 6])).unwrap();
         let strict: Vec<_> = ports.iter().map(|p| p.strict_source).collect();
         assert_eq!(strict, [true, false, false]);
+    }
+
+    const EDGE: &str = "[[interface]]\nname = \"lan\"\ndevice = \"eth1\"\naddress = \"10.0.0.1/24\"\n\n\
+         [[interface]]\nname = \"wan\"\ndevice = \"eth2\"\naddress = \"192.0.2.2/24\"\nrole = \"outside\"\n";
+
+    #[test]
+    fn port_forwards_are_checked() {
+        let fwd = |body: &str| parse(&format!("{EDGE}\n[[nat.forward]]\nname = \"f\"\n{body}"));
+        let c = fwd("interface = \"wan\"\nprotocol = \"udp\"\nport = \"5000-5009\"\nto = \"10.0.0.20\"\nto_port = 6000\nfrom = [\"198.51.100.0/24\", \"203.0.113.9\"]\n").unwrap();
+        let f = &c.nat().unwrap().forwards[0];
+        assert_eq!(
+            (f.port, f.ports, f.to_port, f.from.len()),
+            (1, (5000, 5009), 6000, 2)
+        );
+        let ok = "protocol = \"tcp\"\nport = 443\nto = \"10.0.0.20\"\n";
+        assert!(fwd(&format!("interface = \"wan\"\n{ok}")).is_ok());
+        for (bad, why) in [
+            (
+                format!("interface = \"lan\"\n{ok}"),
+                "isn't an outside interface",
+            ),
+            (
+                format!(
+                    "interface = \"wan\"\n{}",
+                    ok.replace("10.0.0.20", "10.0.0.1")
+                ),
+                "isn't a host",
+            ),
+            (
+                format!(
+                    "interface = \"wan\"\n{}",
+                    ok.replace("10.0.0.20", "172.16.0.5")
+                ),
+                "isn't a host",
+            ),
+            (
+                format!("interface = \"wan\"\n{}", ok.replace("tcp", "gre")),
+                "protocol",
+            ),
+            (
+                format!("interface = \"wan\"\n{}", ok.replace("443", "\"90-80\"")),
+                "low to high",
+            ),
+            (
+                "interface = \"wan\"\nprotocol = \"udp\"\nport = 68\nto = \"10.0.0.20\"\n".into(),
+                "router's own",
+            ),
+            (
+                format!("interface = \"wan\"\n{ok}to_port = 65535\n").replace("443", "\"443-444\""),
+                "no room",
+            ),
+        ] {
+            let e = format!("{:#}", fwd(&bad).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        let two = format!("interface = \"wan\"\n{ok}\n[[nat.forward]]\nname = \"g\"\ninterface = \"wan\"\nprotocol = \"tcp\"\nport = \"400-500\"\nto = \"10.0.0.21\"\n");
+        assert!(format!("{:#}", fwd(&two).unwrap_err()).contains("overlap"));
+    }
+
+    #[test]
+    fn firewall_rules_are_checked() {
+        let rule = |body: &str| parse(&format!("{EDGE}\n[[firewall]]\nname = \"r\"\n{body}"));
+        let c = rule("action = \"drop\"\nfrom = \"lan\"\nto = \"10.9.0.0/16\"\nprotocol = \"tcp\"\nport = \"20-25\"\n").unwrap();
+        let r = &c.nat().unwrap().firewall[0];
+        assert_eq!(
+            (r.allow, r.from, r.to, r.proto, r.ports),
+            (
+                false,
+                Side::Port(0),
+                Side::Prefix("10.9.0.0/16".parse().unwrap()),
+                Some(6),
+                Some((20, 25))
+            )
+        );
+        let any = &rule("action = \"allow\"\n")
+            .unwrap()
+            .nat()
+            .unwrap()
+            .firewall[0];
+        assert_eq!((any.from, any.to, any.proto), (Side::Any, Side::Any, None));
+        for (bad, why) in [
+            ("action = \"reject\"\n", "action"),
+            (
+                "action = \"drop\"\nfrom = \"guest\"\n",
+                "isn't an interface",
+            ),
+            ("action = \"drop\"\nto = \"overlay\"\n", "[overlay]"),
+            ("action = \"drop\"\nport = 22\n", "needs protocol"),
+            ("action = \"drop\"\nprotocol = \"esp\"\n", "protocol"),
+        ] {
+            let e = format!("{:#}", rule(bad).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]
@@ -2407,7 +2734,11 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
             .contains("only be reached on inside interfaces"));
         assert!(err("management = [\"https\"]\n", "outside")
             .contains("only be reached on inside interfaces"));
-        assert!(err("management = [\"telnet\"]\n", "inside").contains("choose \"https\""));
+        assert!(err("management = [\"telnet\"]\n", "inside").contains("choose from"));
+        assert!(err("management = [\"dns\"]\n", "outside").contains("inside interfaces"));
+        let c = parse(&iface("inside", "management = [\"dns\"]\n")).unwrap();
+        let h = &c.ports(|_| Ok([0; 6])).unwrap()[0].host;
+        assert!(h.dns && !h.ssh && !h.https);
         assert!(err("management_from = [\"10.0.0.0/8\"]\n", "inside").contains("has no effect"));
         assert!(err(
             "management = [\"ssh\"]\nmanagement_from = [\"nope\"]\n",

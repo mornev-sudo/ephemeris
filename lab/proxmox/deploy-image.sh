@@ -133,6 +133,7 @@ qm create "$VMID" --name "$NAME" --ostype l26 --machine q35 \
     --net1 "virtio,bridge=$LAN_A,queues=$QUEUES" \
     --net2 "virtio,bridge=$LAN_B,queues=$QUEUES" \
     --agent enabled=1 --onboot 1 \
+    --watchdog model=i6300esb,action=reset \
     --description "Ephemeris router, image $(basename "$(dirname "$IMAGE")") ($(date -I))"
 qm disk resize "$VMID" scsi0 "$DISK"   # /var grows into this on first boot
 qm set "$VMID" --args "$args" >/dev/null

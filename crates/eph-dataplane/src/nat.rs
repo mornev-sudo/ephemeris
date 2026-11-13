@@ -46,6 +46,103 @@ impl NatRule {
     }
 }
 
+/// A port forward (destination NAT): new sessions to `port`'s own address
+/// on `ports`, arriving on `port`, are carried on to `to:to_port` (the same
+/// offset into the range).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    pub name: String,
+    pub port: PortId,
+    pub proto: u8,
+    pub ports: (u16, u16),
+    pub to: Ipv4Addr,
+    pub to_port: u16,
+    /// Only from these sources (empty: from anywhere).
+    pub from: Vec<Prefix>,
+}
+
+impl Forward {
+    /// Where a new session from `src` to port `dport` goes, if this
+    /// forward takes it.
+    fn target(&self, ingress: PortId, proto: u8, src: Ipv4Addr, dport: u16) -> Option<u16> {
+        let (lo, hi) = self.ports;
+        (ingress == self.port
+            && proto == self.proto
+            && (lo..=hi).contains(&dport)
+            && (self.from.is_empty() || self.from.iter().any(|p| p.contains(src))))
+        .then(|| self.to_port + (dport - lo))
+    }
+
+    /// Is `addr:port` (of `proto`) where this forward leads?
+    fn leads_to(&self, proto: u8, addr: Ipv4Addr, port: u16) -> bool {
+        let n = self.ports.1 - self.ports.0;
+        proto == self.proto && addr == self.to && (self.to_port..=self.to_port + n).contains(&port)
+    }
+}
+
+/// One side of a firewall rule: where packets come from, or go to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Any,
+    /// Arriving on (from) or leaving by (to) this interface.
+    Port(PortId),
+    /// Out of, or into, the SD-WAN overlay.
+    Overlay,
+    /// From (to) an address in this prefix.
+    Prefix(Prefix),
+}
+
+impl Side {
+    fn matches(&self, port: Option<PortId>, addr: Ipv4Addr) -> bool {
+        match *self {
+            Side::Any => true,
+            Side::Port(p) => port == Some(p),
+            Side::Overlay => port.is_none(),
+            Side::Prefix(p) => p.contains(addr),
+        }
+    }
+}
+
+/// A firewall rule: whether a new session may start. The first rule that
+/// matches decides; with none, the ingress interface's own policy
+/// (`allow_new_sessions`) does, and a port forward allows its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirewallRule {
+    pub name: String,
+    pub allow: bool,
+    pub from: Side,
+    pub to: Side,
+    /// None: any protocol.
+    pub proto: Option<u8>,
+    /// Destination ports (TCP and UDP only).
+    pub ports: Option<(u16, u16)>,
+}
+
+impl FirewallRule {
+    fn matches(&self, f: &NewFlow) -> bool {
+        self.from.matches(f.ingress, f.src)
+            && self.to.matches(f.egress, f.dst)
+            && self.proto.is_none_or(|p| p == f.proto)
+            && self
+                .ports
+                .is_none_or(|(lo, hi)| f.dport.is_some_and(|d| (lo..=hi).contains(&d)))
+    }
+}
+
+/// A new session, as the firewall sees it: after a port forward's
+/// translation, and after routing. `None` for an interface: the overlay.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFlow {
+    pub ingress: Option<PortId>,
+    pub egress: Option<PortId>,
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
+    pub proto: u8,
+    pub dport: Option<u16>,
+}
+
+/// What new sessions may do: source NAT, port forwards (destination NAT)
+/// and the firewall. Swapped as one when the config changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NatConfig {
     /// Inside → outside traffic not matched by a rule: PAT to the outside
@@ -55,6 +152,9 @@ pub struct NatConfig {
     pub pools: Vec<Vec<Ipv4Addr>>,
     /// Checked in order; the first match wins.
     pub rules: Vec<NatRule>,
+    pub forwards: Vec<Forward>,
+    /// Checked in order; the first match wins.
+    pub firewall: Vec<FirewallRule>,
 }
 
 impl Default for NatConfig {
@@ -63,6 +163,8 @@ impl Default for NatConfig {
             masquerade: true,
             pools: vec![],
             rules: vec![],
+            forwards: vec![],
+            firewall: vec![],
         }
     }
 }
@@ -76,9 +178,43 @@ impl NatConfig {
     pub fn off() -> Self {
         NatConfig {
             masquerade: false,
-            pools: vec![],
-            rules: vec![],
+            ..NatConfig::default()
         }
+    }
+
+    /// The port forward for a new session arriving on `ingress` from `src`
+    /// to port `dport` of the interface's own address: the inside host and
+    /// port it goes to.
+    pub fn forward(
+        &self,
+        ingress: PortId,
+        proto: u8,
+        src: Ipv4Addr,
+        dport: u16,
+    ) -> Option<(Ipv4Addr, u16)> {
+        self.forwards
+            .iter()
+            .find_map(|f| f.target(ingress, proto, src, dport).map(|p| (f.to, p)))
+    }
+
+    /// Is `addr:port` an inside host's end of a port forward? (Its replies
+    /// belong to a session that may be on another worker.)
+    pub fn forwarded(&self, proto: u8, addr: Ipv4Addr, port: u16) -> bool {
+        self.forwards.iter().any(|f| f.leads_to(proto, addr, port))
+    }
+
+    /// The firewall's verdict on a new session: `Some(true)` allowed,
+    /// `Some(false)` dropped, `None` no rule says.
+    pub fn firewall(&self, flow: &NewFlow) -> Option<bool> {
+        self.firewall
+            .iter()
+            .find(|r| r.matches(flow))
+            .map(|r| r.allow)
+    }
+
+    /// Could a firewall rule allow a session the interface itself wouldn't?
+    pub fn may_allow(&self) -> bool {
+        self.firewall.iter().any(|r| r.allow)
     }
 
     /// The address a new session from `src` to `dst`, entering on `ingress`
