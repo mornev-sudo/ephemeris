@@ -11,20 +11,22 @@ throughput is that core's, however many workers the router has.
 
 Today that happens in three cases:
 
-- the receiving card hashes UDP on addresses only;
+- the receiving card can't hash UDP on ports;
 - the hub is sending to a branch behind NAT;
 - the branch behind NAT is sending to the hub.
 
-This design fixes all three, in two parts:
+The first can't be fixed in software: ephemerisd already asks every
+card to hash ports, and a card that refuses has no other way. This
+design fixes the other two, in two parts:
 
-1. **Cards hash UDP ports.** `nic-setup` asks each data-plane card to
-   include UDP ports in its hash. That's one `ethtool` line, and it fixes
-   the first case.
+1. **Inside cards hash ports too** (built). ephemerisd asked only outside
+   cards. Asking inside cards as well lets it predict which worker gets a
+   LAN host's UDP replies, so traffic out of a tether goes straight to the
+   worker that holds its session, instead of being handed over.
 2. **Several source ports for routers behind NAT** (`[overlay]
    source_ports`). A branch sends from a few UDP ports instead of one, so
    its NAT keeps a mapping per port. The hub learns every mapping as an
-   address and port per tether, and sends each flow to one of them. This
-   fixes the other two cases.
+   address and port per tether, and sends each flow to one of them.
 
 The header, the crypto, nonces and replay protection don't change, and
 routers on older versions keep working with newer ones.
@@ -55,7 +57,7 @@ routers on older versions keep working with newer ones.
 
 | Case | Why it's one 5-tuple, or hashed like one |
 |---|---|
-| **A.** The receiving card hashes UDP on addresses only | Many cards do by default (several Intel drivers, for example). Every packet from one peer address then hashes the same, whatever the ports. `nic-setup` doesn't change it today. |
+| **A.** The receiving card can't hash UDP on ports | Several cards hash UDP on addresses only by default, but ephemerisd already asks every outside card (where tethers arrive) to hash ports too ([`iface::hash_ports`](../../crates/eph-xdp/src/iface.rs), `ETHTOOL_SRXFH`). Only a card that refuses stays on addresses, and nothing in software changes that. |
 | **B.** Hub → branch behind NAT | The branch's NAT has one mapping for the tether: branch `4800` ↔ hub `4800`. The hub must send to that mapping's public port, from `4800`, so every packet arrives at the branch as the same 5-tuple. |
 | **C.** Branch behind NAT → hub | Towards a hub that learns its address, the branch always sends from the overlay port, so its NAT keeps one mapping. Every packet arrives at the hub from the same NAT address and port. |
 | D. A PPPoE WAN | Cards can't hash inside PPPoE. Out of scope here, as for all PPPoE traffic (chapter 13). |
@@ -75,7 +77,7 @@ worker adds a copy per packet on top of that.
 
 Goals:
 
-- Spread the work of receiving a tether across workers in cases A, B and C.
+- Spread the work of receiving a tether across workers in cases B and C.
 - Keep each inner flow on one path, with no reordering within a flow while
   nothing changes.
 - Keep crypto, nonces, replay protection and the header exactly as they
@@ -86,33 +88,33 @@ Goals:
 
 Non-goals:
 
-- PPPoE WANs (case D).
+- Cards that can't hash UDP on ports (case A), and PPPoE WANs (case D).
 - Choosing ports so packets land directly on the worker that holds the
   inner session. The sender can't know how the receiver's card hashes,
   so the handoff stays.
 - IPv6 underlays.
 
-## Part 1: cards hash UDP ports
+## Part 1: inside cards hash ports too (built)
 
-In `nic-setup`, for each data-plane device, after the RSS setup that's
-there today:
+At start, ephemerisd asks each data-plane card to hash TCP and UDP on
+ports as well as addresses (`ETHTOOL_SRXFH`, what `ethtool -N … rx-flow-hash
+udp4 sdfn` does), and reads back what the card actually does
+([`CardRss`](../../crates/eph-dataplane/src/steer.rs)). Until now it only
+asked outside cards: that's where NAT replies and tethers arrive, so it
+covered case A already.
 
-```sh
-ethtool -N "$dev" rx-flow-hash udp4 sdfn 2>/dev/null || true
-```
+Inside cards matter too. A packet out of a tether is handed to the
+worker the inside card will deliver the LAN host's replies to
+(`tether_owner`), and a port forward's session goes to the same worker
+(`dnat_owner`). For UDP, that prediction needs the inside card to hash
+ports. Without them, the router falls back to a fixed hash, and the
+replies are handed between workers. So every card is asked now.
 
-- `sdfn` adds the source and destination ports to the hash. Cards that
-  can't do it refuse, and keep hashing on addresses: no worse than today.
-- ephemerisd already reads which fields a card hashes
-  ([`CardRss::udp_ports`](../../crates/eph-dataplane/src/steer.rs)) and
-  logs it at start. With ports in the hash, source NAT can steer UDP
-  replies to their worker too, as it does TCP, so this helps beyond
-  tethers.
-- Risk: none that I know of. A card's hash is symmetric only if both
-  directions hash alike, and with `symmetric-xor` ports are XORed like
-  addresses, so that still holds.
-
-This is small enough to ship on its own, before part 2.
+- A card that can't do it refuses, and keeps hashing on addresses: no worse
+  than before.
+- Hashing stays symmetric where the card supports `symmetric-xor`: ports
+  are XORed like addresses, so both directions of a flow still meet.
+- CI's VM checks that both its cards hash TCP and UDP on ports.
 
 ## Part 2: several source ports for routers behind NAT
 
@@ -237,8 +239,7 @@ turned on one router at a time.
 
 ## Rollout
 
-1. Part 1 on its own, in the next release. It's one line in `nic-setup`,
-   checked in CI's VM, if its virtio-net cards (with RSS) accept `rx-flow-hash`; if they don't, the step still does no harm.
+1. Part 1 on its own, in the next release.
 2. Part 2, with `source_ports` defaulting to 1, in the release after.
 3. Default to 4 once the lab confirms it through real NATs (including
    carrier-grade NAT on LTE, which is where mappings get scarce).
