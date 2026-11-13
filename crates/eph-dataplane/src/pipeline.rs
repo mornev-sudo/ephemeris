@@ -221,6 +221,9 @@ pub struct Pipeline {
     steer: Arc<Steering>,
     /// Working on a packet another worker handed over: never hand it on.
     handed: bool,
+    /// The session `is_nat_reply` found for the packet being processed, so
+    /// `track` doesn't look it up again (cleared for every packet).
+    nat_hit: Option<(FlowKey, u32)>,
     /// SD-WAN handshake messages for the control plane.
     pub handshakes: Vec<HandshakeIn>,
     /// Packet tracing (debug logging), off unless asked for; the worker
@@ -289,6 +292,7 @@ impl Pipeline {
             handoffs: Vec::new(),
             steer: Arc::new(Steering::default()),
             handed: false,
+            nat_hit: None,
             handshakes: Vec::new(),
             tracer: Tracer::default(),
             host_out: Vec::new(),
@@ -1086,6 +1090,7 @@ impl Pipeline {
         len: usize,
         via: Option<TetherId>,
     ) -> Verdict {
+        self.nat_hit = None;
         let mut h = match ipv4::parse(&frame[off + ETH..off + len]) {
             Ok(h) => h,
             Err(_) => return Verdict::Drop(DropReason::BadIpHeader),
@@ -1271,7 +1276,11 @@ impl Pipeline {
                 echo,
             } => {
                 let tcp_flags = tcp.map_or(0, |t| t.flags);
-                if let Some(idx) = self.sessions.lookup(&key) {
+                let found = match self.nat_hit.take() {
+                    Some((k, idx)) if k == key => Some(idx),
+                    _ => self.sessions.lookup(&key),
+                };
+                if let Some(idx) = found {
                     // Known session: the common case. A packet carrying the
                     // *translated* tuple is a reply from the outside.
                     let s = self.sessions.get(idx);
@@ -1707,15 +1716,19 @@ impl Pipeline {
 
     /// Is this packet, addressed to one of our own (outside or pool)
     /// addresses, actually a reply belonging to a NATed session?
-    fn is_nat_reply(&self, frame: &[u8], off: usize, h: &ipv4::Header) -> bool {
+    fn is_nat_reply(&mut self, frame: &[u8], off: usize, h: &ipv4::Header) -> bool {
         let key = match flow_of(&frame[off + ETH..off + ETH + h.total_len], h) {
             Ok(Flow::Tracked { key, .. }) | Ok(Flow::Related { key, .. }) => key,
             _ => return false,
         };
-        self.sessions
-            .lookup(&key)
-            .and_then(|i| self.sessions.get(i).nat)
-            .is_some_and(|n| n.xkey == key)
+        let Some(idx) = self.sessions.lookup(&key) else {
+            return false;
+        };
+        let reply = self.sessions.get(idx).nat.is_some_and(|n| n.xkey == key);
+        if reply {
+            self.nat_hit = Some((key, idx));
+        }
+        reply
     }
 
     /// Pick a free outside port for a new translation of `addr` towards

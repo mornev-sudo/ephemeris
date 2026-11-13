@@ -15,6 +15,7 @@
 // all safe Rust, and the compiler keeps it that way.
 #![forbid(unsafe_code)]
 
+pub mod bench;
 mod config;
 mod filter;
 #[cfg(any(test, feature = "fuzzing"))]

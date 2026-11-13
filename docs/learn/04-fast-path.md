@@ -184,6 +184,36 @@ Look at [`worker.rs`](../../crates/ephemerisd/src/worker.rs) with these in mind:
   *symmetric*, so A→B and B→A land on the same core, because both directions
   need the same session entry.)
 
+## Measuring it
+
+`ephemerisd --bench-pipeline` runs packets through the pipeline on one
+core, with no network card: the CPU's ceiling per worker, before AF_XDP,
+the NIC and the wire take their share
+([`bench.rs`](../../crates/eph-dataplane/src/bench.rs)). Each case cycles
+through 1024 flows of 64-byte UDP packets, copying each into the buffer
+first as a receive ring would hand it over. On an Apple M-series core:
+
+```text
+routed          73 ns per packet  13.64 Mpps   established, no NAT
+nat-out         78 ns per packet  12.88 Mpps   established, source NAT
+nat-in          78 ns per packet  12.80 Mpps   replies to source NAT
+forward-in      78 ns per packet  12.76 Mpps   established, port forward
+new            172 ns per packet   5.81 Mpps   new sessions, source NAT
+new-fw20       191 ns per packet   5.24 Mpps   new sessions, 20 firewall rules
+```
+
+So an established flow sits right at the budget above, and a new session
+costs about two of them (a hash insert, a NAT port, the first route
+lookup). Run it on your own router to see its ceiling; CI prints it for
+its runner on every build (shared machines, so only a rough guide).
+
+It already found something: replies to NAT used to cost 15–20 ns more than
+requests, because a packet to the router's own address was looked up in
+the session table twice, once to see whether it's a NAT reply and again to
+handle it. The second lookup now reuses the first.
+
+`--bench-crypto` does the same for the SD-WAN ciphers.
+
 ## Why Rust for this
 
 - **No garbage collector**, so there are no surprise pauses mid-burst.
