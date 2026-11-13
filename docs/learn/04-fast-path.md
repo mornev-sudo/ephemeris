@@ -200,7 +200,13 @@ nat-in          78 ns per packet  12.80 Mpps   replies to source NAT
 forward-in      78 ns per packet  12.76 Mpps   established, port forward
 new            172 ns per packet   5.81 Mpps   new sessions, source NAT
 new-fw20       191 ns per packet   5.24 Mpps   new sessions, 20 firewall rules
+tether-out     614 ns per packet   1.63 Mpps   into a tether (sealing)
+tether-in      612 ns per packet   1.63 Mpps   out of a tether (opening)
 ```
+
+The tether cases use a pre-shared key, so ChaCha20-Poly1305: encryption
+costs eight routed packets, which is why spreading tethers over workers
+matters (docs/design/tether-spreading.md).
 
 So an established flow sits right at the budget above, and a new session
 costs about two of them (a hash insert, a NAT port, the first route

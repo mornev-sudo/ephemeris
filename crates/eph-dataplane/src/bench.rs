@@ -6,12 +6,16 @@
 //! The router is a plain edge router: a LAN (10.0.0.0/24, 256 hosts) and a
 //! WAN (203.0.113.1/24, default route via .254). Each case cycles through
 //! 1024 flows of small UDP packets (64 bytes on the wire), copying each one
-//! into the buffer first, as a receive ring would hand it over.
+//! into the buffer first, as a receive ring would hand it over. The SD-WAN
+//! cases add a tether to another site (10.9.0.0/16, pre-shared key, so
+//! ChaCha20-Poly1305): into it (sealing), and out of it (opening).
 
 use crate::config::{Dhcp, Pppoe, Role};
 use crate::nat::{FirewallRule, Forward, NatConfig, Side};
-use crate::overlay::Overlay;
-use crate::{build_fib, Neighbor, Pipeline, Port, SessionConfig, StaticRoute, Verdict};
+use crate::overlay::{select_paths, Overlay, PathTable, Tether, TetherHealth, TetherKey};
+use crate::{
+    build_fib, Neighbor, OverlayRoute, Pipeline, Port, SessionConfig, StaticRoute, Verdict,
+};
 use eph_packet::{eth, ipv4, Mac};
 use std::hint::black_box;
 use std::net::Ipv4Addr;
@@ -127,7 +131,157 @@ pub fn run(budget: Duration) -> Vec<Measure> {
         &mut r,
         n,
     ));
+
+    // Into a tether to site 9, and out of one: sealed by a second router
+    // (site 9) as fresh packets, since a replayed one is rightly refused.
+    let mut r = router_with_tether(1, 1 << 16);
+    let t: Vec<Vec<u8>> = (0..FLOWS)
+        .map(|i| {
+            let mac = [0x52, 0, 0, 0, 1, (i % 240) as u8];
+            udp(R_LAN, mac, host(i), 40000 + i, site9(i), 443)
+        })
+        .collect();
+    out.push(measure(
+        "tether-out",
+        "into a tether (sealing)",
+        &mut r,
+        0,
+        &t,
+        budget,
+    ));
+    let mut far = router_with_tether(9, 1 << 16);
+    let n = 200_000u32;
+    let sealed: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            let i = (i % FLOWS as u32) as u16;
+            let t = udp(
+                R_LAN,
+                [0x52, 0, 0, 0, 1, 0],
+                site9(i),
+                443,
+                host(i),
+                40000 + i,
+            );
+            // Room after it for the tag, as a receive buffer has.
+            let mut f = vec![0u8; 2048];
+            f[..t.len()].copy_from_slice(&t);
+            let v = far.process(0, &mut f, OFF, t.len() - OFF);
+            let Verdict::Tx { off, len, .. } = v else {
+                panic!("site 9 didn't seal a packet: {v:?}");
+            };
+            let mut out = vec![0u8; OFF];
+            out.extend_from_slice(&f[off..off + len]);
+            out
+        })
+        .collect();
+    out.push(once(
+        "tether-in",
+        "out of a tether (opening)",
+        &mut r,
+        1,
+        &sealed,
+    ));
     out
+}
+
+fn site9(i: u16) -> Ipv4Addr {
+    Ipv4Addr::new(10, 9, (i / 240) as u8, 10 + (i % 240) as u8)
+}
+
+/// [`router`] with a tether to the other site, over the WAN: site 1's
+/// tether leads to site 9 (203.0.113.9, networks 10.9.0.0/16), site 9's
+/// back. Site 9's LAN plays the far side's hosts.
+fn router_with_tether(site: u16, max_sessions: u32) -> Pipeline {
+    let other = if site == 1 { 9 } else { 1 };
+    let mut o = Overlay::disabled();
+    o.site_id = site;
+    o.sites = vec![other];
+    o.tethers = vec![Tether {
+        id: 0,
+        name: "wan".into(),
+        port: 1,
+        remote: Ipv4Addr::new(203, 0, 113, other as u8),
+        gateway: None,
+        peer_site: other,
+        site_idx: 0,
+        key: Some(TetherKey([7; 32])),
+    }];
+    let o = Arc::new(o);
+    let mut r = router_inner(
+        NatConfig::off(),
+        max_sessions,
+        o.clone(),
+        if site == 1 { "10.0.0.1" } else { "10.9.0.1" },
+        if site == 1 {
+            "10.0.0.0/24"
+        } else {
+            "10.9.0.0/16"
+        },
+        &format!("203.0.113.{site}"),
+        &[OverlayRoute {
+            prefix: if site == 1 {
+                "10.9.0.0/16"
+            } else {
+                "10.0.0.0/24"
+            }
+            .parse()
+            .expect("a prefix"),
+            site_idx: 0,
+        }],
+    );
+    // Both routers' WAN ports have the same MAC here (they never share a
+    // link with anyone else): send to it, or the other side ignores it.
+    r.learn(Neighbor {
+        port: 1,
+        ip: Ipv4Addr::new(203, 0, 113, other as u8),
+        mac: R_WAN,
+    });
+    if site != 1 {
+        for i in 0..FLOWS {
+            r.learn(Neighbor {
+                port: 0,
+                ip: site9(i),
+                mac: [0x52, 0, 0, 0, 9, (i % 240) as u8],
+            });
+        }
+    }
+    let up = TetherHealth {
+        up: true,
+        rtt_ns: 5_000_000,
+        jitter_ns: 0,
+        loss_pct: 0.0,
+    };
+    r.set_paths(Arc::new(select_paths(&o, &[up], &PathTable::empty(&o))));
+    r
+}
+
+/// Each of `packets` through `r` once.
+fn once(
+    name: &'static str,
+    what: &'static str,
+    r: &mut Pipeline,
+    card: u16,
+    packets: &[Vec<u8>],
+) -> Measure {
+    let mut buf = vec![0u8; 2048];
+    let start = Instant::now();
+    for (i, p) in packets.iter().enumerate() {
+        buf[..p.len()].copy_from_slice(p);
+        let v = r.process(card, &mut buf, OFF, p.len() - OFF);
+        // The first ones always, so a release run can't time a drop.
+        if i < 16 || cfg!(debug_assertions) {
+            assert!(matches!(v, Verdict::Tx { .. }), "{name}: {v:?}");
+        }
+        black_box(v);
+        if i % 1024 == 0 {
+            clear(r);
+        }
+    }
+    Measure {
+        name,
+        what,
+        ns_per_packet: start.elapsed().as_secs_f64() * 1e9 / packets.len() as f64,
+    }
 }
 
 fn host(i: u16) -> Ipv4Addr {
@@ -139,6 +293,32 @@ fn client(i: u16) -> Ipv4Addr {
 }
 
 fn router(nat: NatConfig, max_sessions: u32) -> Pipeline {
+    let mut r = router_inner(
+        nat,
+        max_sessions,
+        Arc::new(Overlay::disabled()),
+        "10.0.0.1",
+        "10.0.0.0/24",
+        "203.0.113.1",
+        &[],
+    );
+    r.learn(Neighbor {
+        port: 1,
+        ip: Ipv4Addr::new(203, 0, 113, 254),
+        mac: ISP,
+    });
+    r
+}
+
+fn router_inner(
+    nat: NatConfig,
+    max_sessions: u32,
+    overlay: Arc<Overlay>,
+    lan: &str,
+    lan_net: &str,
+    wan: &str,
+    overlay_routes: &[OverlayRoute],
+) -> Pipeline {
     let port = |id: u16, name: &str, mac: Mac, addr: &str, subnet: &str, role: Role| Port {
         id,
         card: id,
@@ -159,31 +339,19 @@ fn router(nat: NatConfig, max_sessions: u32) -> Pipeline {
         mtu: 1500,
     };
     let ports: Arc<[Port]> = Arc::new([
-        port(0, "lan", R_LAN, "10.0.0.1", "10.0.0.0/24", Role::Inside),
-        port(
-            1,
-            "wan",
-            R_WAN,
-            "203.0.113.1",
-            "203.0.113.0/24",
-            Role::Outside,
-        ),
+        port(0, "lan", R_LAN, lan, lan_net, Role::Inside),
+        port(1, "wan", R_WAN, wan, "203.0.113.0/24", Role::Outside),
     ]);
     let routes = [StaticRoute {
         prefix: "0.0.0.0/0".parse().expect("a prefix"),
         via: Ipv4Addr::new(203, 0, 113, 254),
     }];
-    let fib = build_fib(&ports, &routes, &[]).expect("a valid table");
+    let fib = build_fib(&ports, &routes, overlay_routes).expect("a valid table");
     let sessions = SessionConfig {
         max_sessions,
         ..SessionConfig::default()
     };
-    let mut r = Pipeline::new(
-        ports,
-        Arc::new(fib),
-        sessions,
-        Arc::new(Overlay::disabled()),
-    );
+    let mut r = Pipeline::new(ports, Arc::new(fib), sessions, overlay);
     r.set_nat(Arc::new(nat));
     r.set_time(1_000_000_000);
     for i in 0..240 {
@@ -193,11 +361,6 @@ fn router(nat: NatConfig, max_sessions: u32) -> Pipeline {
             mac: [0x52, 0, 0, 0, 1, i as u8],
         });
     }
-    r.learn(Neighbor {
-        port: 1,
-        ip: Ipv4Addr::new(203, 0, 113, 254),
-        mac: ISP,
-    });
     r
 }
 
@@ -305,7 +468,9 @@ fn new_sessions(name: &'static str, what: &'static str, r: &mut Pipeline, n: u32
         buf[OFF + 34..OFF + 36].copy_from_slice(&sport.to_be_bytes());
         buf[OFF + 36..OFF + 38].copy_from_slice(&dport.to_be_bytes());
         let v = r.process(0, &mut buf, OFF, t.len() - OFF);
-        debug_assert!(matches!(v, Verdict::Tx { .. }), "{name}: {v:?}");
+        if i < 16 || cfg!(debug_assertions) {
+            assert!(matches!(v, Verdict::Tx { .. }), "{name}: {v:?}");
+        }
         black_box(v);
         if i % 1024 == 0 {
             clear(r);
@@ -333,7 +498,7 @@ mod tests {
     fn every_case_sends_its_packets() {
         // Short: this checks the cases are set up right, not the speed.
         let m = super::run(std::time::Duration::from_millis(5));
-        assert_eq!(m.len(), 6);
+        assert_eq!(m.len(), 8);
         assert!(m.iter().all(|m| m.ns_per_packet > 0.0));
     }
 }

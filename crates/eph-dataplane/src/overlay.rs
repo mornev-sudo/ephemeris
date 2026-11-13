@@ -113,6 +113,14 @@ pub struct Endpoints {
 /// A slot not heard from for this long may be rebound.
 pub const STALE_SECS: u64 = 30;
 
+/// Addresses and ports a slot keeps for a peer behind NAT that sends from
+/// several ports (its `source_ports`): one NAT mapping each.
+pub const MAX_SOURCE_PORTS: usize = 8;
+/// A mapping not heard from for this long isn't sent to any more. The
+/// peer's probes go round its ports, so a live one is heard about every
+/// second at most.
+pub const PORT_EXPIRE_MS: u64 = 3_000;
+
 #[derive(Default)]
 struct Slot {
     /// KNOWN | address << 16 | port.
@@ -121,6 +129,9 @@ struct Slot {
     sender: std::sync::atomic::AtomicU32,
     /// When it was last heard from, seconds (the workers' clock).
     heard_s: AtomicU64,
+    /// Every address and port the peer was heard from lately (as `addr`),
+    /// and when, in ms: each a NAT mapping its flows can be sent to.
+    ports: [(AtomicU64, AtomicU64); MAX_SOURCE_PORTS],
 }
 
 impl Endpoints {
@@ -205,10 +216,64 @@ impl Endpoints {
         true
     }
 
+    /// Remember `ip:port` as one of the peer's NAT mappings (after
+    /// [`Endpoints::learn_from`] accepted the packet). A mapping already
+    /// known is refreshed; a new one takes a free or expired place. With
+    /// every place live, it isn't added: the set a flow is sent to only
+    /// changes as mappings go quiet, not with every new source port.
+    pub fn heard_port(&self, tether: TetherId, ip: Ipv4Addr, port: u16, now_ms: u64) {
+        let Some(s) = self.slots.get(tether as usize) else {
+            return;
+        };
+        let v = Self::KNOWN | (u32::from(ip) as u64) << 16 | port as u64;
+        let live = |(_, heard): &(AtomicU64, AtomicU64)| {
+            now_ms.saturating_sub(heard.load(Ordering::Relaxed)) < PORT_EXPIRE_MS
+        };
+        if let Some((_, heard)) = s.ports.iter().find(|(e, _)| e.load(Ordering::Relaxed) == v) {
+            heard.store(now_ms, Ordering::Relaxed);
+            return;
+        }
+        if let Some((e, heard)) = s
+            .ports
+            .iter()
+            .find(|p| p.0.load(Ordering::Relaxed) & Self::KNOWN == 0 || !live(p))
+        {
+            e.store(v, Ordering::Relaxed);
+            heard.store(now_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Where to send a flow (by its hash) to a peer behind NAT: one of its
+    /// live mappings, the same one for the flow while they don't change.
+    /// None live: wherever the peer was last heard from, as [`Endpoints::get`].
+    pub fn pick(&self, tether: TetherId, hash: u32, now_ms: u64) -> Option<(Ipv4Addr, u16)> {
+        let s = self.slots.get(tether as usize)?;
+        let mut live = [0u64; MAX_SOURCE_PORTS];
+        let mut n = 0;
+        for (e, heard) in &s.ports {
+            let v = e.load(Ordering::Relaxed);
+            if v & Self::KNOWN != 0
+                && now_ms.saturating_sub(heard.load(Ordering::Relaxed)) < PORT_EXPIRE_MS
+            {
+                live[n] = v;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return self.get(tether);
+        }
+        live[..n].sort_unstable();
+        let v = live[hash as usize % n];
+        Some((Ipv4Addr::from((v >> 16) as u32), v as u16))
+    }
+
     /// The peer announced it moved: send to `ip:port` from now on, and let
     /// the next authenticated packet bind the slot again.
     pub fn retarget(&self, tether: TetherId, ip: Ipv4Addr, port: u16) {
         if let Some(s) = self.slots.get(tether as usize) {
+            for (e, _) in &s.ports {
+                e.store(0, Ordering::Relaxed);
+            }
             s.sender.store(0, Ordering::Relaxed);
             s.addr.store(
                 Self::KNOWN | (u32::from(ip) as u64) << 16 | port as u64,
@@ -279,6 +344,11 @@ impl Class {
 pub struct Overlay {
     pub site_id: u16,
     pub udp_port: u16,
+    /// Send to peers with a fixed address from this many ports, `udp_port`
+    /// and the ones after it, each flow from one (for a router behind NAT:
+    /// its NAT keeps a mapping per port, which the peer can spread flows
+    /// over). 0: from `49152 | flow hash`, as many ports as flows.
+    pub source_ports: u16,
     /// Largest inner IP packet that fits in one underlay packet.
     pub mtu: u16,
     /// May traffic arriving from other sites start sessions here?
@@ -298,6 +368,7 @@ impl Overlay {
         Overlay {
             site_id: 0,
             udp_port: 4800,
+            source_ports: 0,
             mtu: DEFAULT_MTU,
             allow_new_sessions: true,
             sites: vec![],
@@ -929,6 +1000,50 @@ pub fn select_paths(o: &Overlay, health: &[TetherHealth], prev: &PathTable) -> P
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_peer_behind_nat_gets_each_flow_on_one_of_its_mappings() {
+        let e = Endpoints::new(1);
+        let ip = Ipv4Addr::new(198, 51, 100, 7);
+        let ms = 10_000;
+        assert!(e.learn_from(0, 3, ip, 61000, 10));
+        // Nothing heard as a mapping yet: where it was last heard from.
+        assert_eq!(e.pick(0, 1, ms), Some((ip, 61000)));
+        for p in [61000, 61001, 61002, 61003] {
+            e.heard_port(0, ip, p, ms);
+        }
+        let picks: Vec<_> = (0..64).map(|h| e.pick(0, h, ms).unwrap().1).collect();
+        for p in [61000, 61001, 61002, 61003] {
+            assert!(picks.contains(&p), "every mapping used");
+        }
+        // A flow keeps its mapping while the set doesn't change, whatever
+        // order the mappings were heard in.
+        assert_eq!(e.pick(0, 5, ms), e.pick(0, 5, ms + 100));
+        // A full set takes no newcomer while every mapping is live...
+        for p in 61004..61012 {
+            e.heard_port(0, ip, p, ms);
+        }
+        for p in 61012..61020 {
+            e.heard_port(0, ip, p, ms + 1);
+        }
+        let set: std::collections::BTreeSet<_> =
+            (0..256).map(|h| e.pick(0, h, ms + 2).unwrap().1).collect();
+        assert_eq!(set, (61000..61008).collect());
+        // ...and a quiet one goes: only 61000 is still heard.
+        e.heard_port(0, ip, 61000, ms + 2_500);
+        let later = ms + PORT_EXPIRE_MS + 1;
+        assert_eq!(e.pick(0, 9, later), Some((ip, 61000)));
+        e.heard_port(0, ip, 62000, later);
+        let set: std::collections::BTreeSet<_> =
+            (0..64).map(|h| e.pick(0, h, later).unwrap().1).collect();
+        assert_eq!(set, [61000, 62000].into());
+        // Moving clears the set: everything goes to the new place.
+        e.retarget(0, Ipv4Addr::new(203, 0, 113, 9), 4800);
+        assert_eq!(
+            e.pick(0, 9, later),
+            Some((Ipv4Addr::new(203, 0, 113, 9), 4800))
+        );
+    }
+
     use super::*;
 
     fn c(run: u16, n: u64) -> u64 {

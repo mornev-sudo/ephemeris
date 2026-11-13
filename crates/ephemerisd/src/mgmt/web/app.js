@@ -685,6 +685,8 @@ function renderSdwanCfg() {
     { key: "role", label: "Role", type: "select", options: [["hub", "hub: connects to every site"], ["spoke", "spoke: connects only to hubs"], ["mesh", "mesh: connects to hubs and other meshes"]], empty: "mesh" },
     { key: "udp_port", label: "UDP port", type: "number", min: 1 },
     { key: "mtu", label: "Overlay MTU", type: "number", min: 576 },
+    { key: "source_ports", label: "Source ports (behind NAT)", type: "number", min: 1, max: 8, optional: true, placeholder: "one per flow",
+      help: "Behind NAT, 2-8: send from that many ports (the UDP port and the ones after it), so the NAT keeps that many mappings and the hub spreads its traffic back over this router's workers." },
     { key: "allow_new_sessions", label: "Hosts at other sites may start sessions here", type: "check" },
     { key: "cipher", label: "Cipher (sites with a public key)", type: "select", empty: "auto",
       options: [["auto", "auto: AES-256-GCM if both have AES in hardware"], ["aes-256-gcm", "AES-256-GCM only"], ["chacha20-poly1305", "ChaCha20-Poly1305 only"]] },

@@ -2416,7 +2416,8 @@ impl Pipeline {
         if new_off + OUTER_LEN + inner + TAG_LEN > frame.len() {
             return Verdict::Drop(DropReason::TooBig);
         }
-        let Some((port, remote, dport, neighbor_ip)) = self.tether_dest(tether) else {
+        let hash = flow_hash(&frame[new_off + OUTER_LEN..new_off + OUTER_LEN + inner]);
+        let Some((port, remote, dport, neighbor_ip)) = self.tether_dest(tether, Some(hash)) else {
             return Verdict::Drop(DropReason::NoPath); // peer not heard from yet
         };
         let Some(mac) = self.neighbor(port, neighbor_ip) else {
@@ -2426,17 +2427,20 @@ impl Pipeline {
         // Vary the outer source port by flow, so multi-queue NICs and ECMP
         // routers along the path spread tethers traffic like normal traffic.
         // The hash is symmetric: both directions of a flow get the same port.
-        // ...except towards a peer whose address we learned: it may be behind
-        // NAT, which only lets replies in from the port it sent to.
+        // With `source_ports`, one of that many (a NAT in front of us then
+        // keeps that many mappings, a stable set the peer can use). Towards
+        // a peer whose address we learned, always the overlay port: it may
+        // be behind NAT, which only lets replies in from the port it sent to.
+        let n = self.overlay.source_ports;
         let sport = if self.overlay.tethers[tether as usize]
             .remote
             .is_unspecified()
         {
             self.overlay.udp_port
+        } else if n > 0 {
+            self.overlay.udp_port + (hash % n as u32) as u16
         } else {
-            49152
-                | (flow_hash(&frame[new_off + OUTER_LEN..new_off + OUTER_LEN + inner]) & 0x3fff)
-                    as u16
+            49152 | (hash & 0x3fff) as u16
         };
         let Some(total) = self.write_outer(
             &mut frame[new_off..],
@@ -2463,11 +2467,19 @@ impl Pipeline {
 
     /// Where a tether's packets go: (port, remote address, remote UDP port,
     /// next hop to ARP for). `None` for a peer without a fixed address that
-    /// hasn't been heard from yet.
-    fn tether_dest(&self, tether: TetherId) -> Option<(PortId, Ipv4Addr, u16, Ipv4Addr)> {
+    /// hasn't been heard from yet. A flow's packets (`flow`, its hash) to
+    /// such a peer go to one of its NAT mappings, the same one each time.
+    fn tether_dest(
+        &self,
+        tether: TetherId,
+        flow: Option<u32>,
+    ) -> Option<(PortId, Ipv4Addr, u16, Ipv4Addr)> {
         let t = &self.overlay.tethers[tether as usize];
         let (remote, dport) = if t.remote.is_unspecified() {
-            self.endpoints.get(tether)?
+            match flow {
+                Some(h) => self.endpoints.pick(tether, h, self.now_ns / 1_000_000)?,
+                None => self.endpoints.get(tether)?,
+            }
         } else {
             // Configured: unless the peer has moved since (see `Endpoints`).
             self.endpoints
@@ -2734,7 +2746,10 @@ impl Pipeline {
         } else {
             self.overlay.udp_port
         };
-        self.endpoints.learn_from(tid, sender, h.src, port, now_s);
+        if self.endpoints.learn_from(tid, sender, h.src, port, now_s) && dynamic {
+            self.endpoints
+                .heard_port(tid, h.src, port, self.now_ns / 1_000_000);
+        }
         let inner = body.len();
         match typ {
             overlay::TYPE_DATA => {
@@ -2862,7 +2877,7 @@ impl Pipeline {
                 p,
                 self.underlay_next_hop(tether, ip),
             ),
-            None => match self.tether_dest(tether) {
+            None => match self.tether_dest(tether, None) {
                 Some(d) => d,
                 None => return false,
             },
@@ -2912,7 +2927,8 @@ impl Pipeline {
             if !self.can_seal(i as TetherId) {
                 continue; // nothing to seal with (yet): the tether stays down
             }
-            let Some((port, remote, dport, neighbor_ip)) = self.tether_dest(i as TetherId) else {
+            let Some((port, remote, dport, neighbor_ip)) = self.tether_dest(i as TetherId, None)
+            else {
                 continue; // peer not heard from yet: it will probe us
             };
             let Some(mac) = self.neighbor(port, neighbor_ip) else {
@@ -2926,7 +2942,14 @@ impl Pipeline {
             };
             e.frame[OUTER_LEN..OUTER_LEN + 4].copy_from_slice(&self.probe_seq.to_be_bytes());
             e.frame[OUTER_LEN + 4..OUTER_LEN + 12].copy_from_slice(&self.now_ns.to_be_bytes());
-            let udp = self.overlay.udp_port;
+            // From each of our `source_ports` in turn, to a peer with a fixed
+            // address: a NAT in front of us keeps every mapping alive.
+            let n = self.overlay.source_ports as u32;
+            let udp = if n > 0 && !self.overlay.tethers[i].remote.is_unspecified() {
+                self.overlay.udp_port + (self.probe_seq % n) as u16
+            } else {
+                self.overlay.udp_port
+            };
             let Some(total) = self.write_outer(
                 &mut e.frame,
                 port,
