@@ -448,8 +448,8 @@ on_router "cat > /run/workers.toml" < "$WORK/workers.toml"
 check "two workers (restart)"              on_router "ephctl config load /run/workers.toml && ephctl config commit && ephctl restart"
 check "forwarding with two workers"        wait_for 90 "forwarding" ip netns exec ci-ha ping -c3 -i0.2 -W1 10.10.2.10
 check "one queue per worker on each card"  on_router '[ "$(ephctl --json status | grep -o "\"workers\": [0-9]*")" = "\"workers\": 2" ] && for d in enp0s19 enp0s20; do [ "$(ls /sys/class/net/$d/queues | grep -c "^rx-")" = 2 ] || { ethtool -l $d; exit 1; }; done'
-check "outside card's RSS read, ports hashed" \
-                                           on_router "journalctl -u ephemerisd -b --no-pager | grep 'enp0s20: Toeplitz RSS over' | tail -n1 | grep -q 'ports hashed: TCP yes, UDP yes' || { journalctl -u ephemerisd -b --no-pager | grep -E 'RSS|spreading|hash' | tail -5; false; }"
+check "both cards' RSS read, ports hashed" \
+                                           on_router "for d in enp0s19 enp0s20; do journalctl -u ephemerisd -b --no-pager | grep \"\$d: Toeplitz RSS over\" | tail -n1 | grep -q 'ports hashed: TCP yes, UDP yes' || { journalctl -u ephemerisd -b --no-pager | grep -E 'RSS|spreading|hash' | tail -5; exit 1; }; done"
 # A counter or drop reason from the router (counters are sampled every
 # stats interval: 5 s here).
 counter() {

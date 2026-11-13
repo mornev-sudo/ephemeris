@@ -259,8 +259,10 @@ together:
 - **Steering NAT replies** ([`steer.rs`](../../crates/eph-dataplane/src/steer.rs)).
   Source NAT changes the reply's addresses, so no symmetric hash can match
   it to the request. But the NAT port is ours to choose. At start the
-  router reads each card's key and table (`ethtool -x`), asks outside cards
-  to hash TCP and UDP on ports too, and computes the hash itself; a worker
+  router reads each card's key and table (`ethtool -x`), asks every card
+  to hash TCP and UDP on ports too (on an inside card, that's what lets it
+  predict where a LAN host's UDP replies land), and computes the hash
+  itself; a worker
   then picks a NAT port whose reply lands on *its own* queue. About one
   port in *n* qualifies for *n* workers, so the search is short; and it
   stops after 8,192 of the worker's own ports (`nat-exhausted`), so a

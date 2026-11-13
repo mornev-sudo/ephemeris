@@ -1042,24 +1042,21 @@ fn apply_handshakes(shared: &Shared, out: crate::sdwan::Output) {
     }
 }
 
-/// Each card's spreading (see `eph_dataplane::steer`). Outside cards are
-/// first told to hash TCP and UDP on ports too, so a NAT port decides where
-/// replies land. A card that can't say is left to hand-offs.
+/// Each card's spreading (see `eph_dataplane::steer`). Every card is first
+/// told to hash TCP and UDP on ports too: on an outside card a NAT port
+/// then decides where replies land, and on an inside one the worker that
+/// gets a LAN host's UDP replies can be predicted (traffic out of tethers,
+/// port forwards), as it can for TCP. A card that can't say is left to
+/// hand-offs.
 fn read_steering(cfg: &Config, cards: &[&str]) -> eph_dataplane::steer::Steering {
     let card_rss: Vec<_> = cards
         .iter()
         .map(|&dev| {
-            let outside = cfg
-                .interfaces
-                .iter()
-                .any(|i| i.device == dev && i.role == crate::config::RoleCfg::Outside);
-            if outside {
-                let (tcp, udp) = iface::hash_ports(dev);
-                if !(tcp && udp) {
-                    info!(target: crate::logging::cat::DATAPLANE,
-                        "{dev}: can't hash {} on ports: NAT replies handed between workers as needed",
-                        if tcp { "UDP" } else if udp { "TCP" } else { "TCP or UDP" });
-                }
+            let (tcp, udp) = iface::hash_ports(dev);
+            if !(tcp && udp) {
+                info!(target: crate::logging::cat::DATAPLANE,
+                    "{dev}: can't hash {} on ports: replies handed between workers as needed",
+                    if tcp { "UDP" } else if udp { "TCP" } else { "TCP or UDP" });
             }
             match iface::rss(dev) {
                 Ok(r) => {
