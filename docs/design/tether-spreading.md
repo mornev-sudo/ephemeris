@@ -1,6 +1,6 @@
 # Design: spreading SD-WAN tether traffic across workers
 
-Status: proposed, for review. Nothing here is built yet.
+Status: built. Part 1 shipped in #44; part 2 is described as built below (the lab test with a real NAT is still to do).
 
 ## Summary
 
@@ -9,11 +9,12 @@ the network card puts it on. When the card puts all of a tether's packets
 on one queue, one core decrypts the whole tether, and the tether's
 throughput is that core's, however many workers the router has.
 
-Today that happens in three cases:
+Before this work it happened, or nearly, in three cases:
 
 - the receiving card can't hash UDP on ports;
 - the hub is sending to a branch behind NAT;
-- the branch behind NAT is sending to the hub.
+- (less than the first draft of this design thought) the branch behind
+  NAT sending to the hub.
 
 The first can't be fixed in software: ephemerisd already asks every
 card to hash ports, and a card that refuses has no other way. This
@@ -58,8 +59,8 @@ routers on older versions keep working with newer ones.
 | Case | Why it's one 5-tuple, or hashed like one |
 |---|---|
 | **A.** The receiving card can't hash UDP on ports | Several cards hash UDP on addresses only by default, but ephemerisd already asks every outside card (where tethers arrive) to hash ports too ([`iface::hash_ports`](../../crates/eph-xdp/src/iface.rs), `ETHTOOL_SRXFH`). Only a card that refuses stays on addresses, and nothing in software changes that. |
-| **B.** Hub → branch behind NAT | The branch's NAT has one mapping for the tether: branch `4800` ↔ hub `4800`. The hub must send to that mapping's public port, from `4800`, so every packet arrives at the branch as the same 5-tuple. |
-| **C.** Branch behind NAT → hub | Towards a hub that learns its address, the branch always sends from the overlay port, so its NAT keeps one mapping. Every packet arrives at the hub from the same NAT address and port. |
+| **B.** Hub → branch behind NAT | The hub learned the branch's address and port from every authenticated packet and kept only the last one, sending everything there. Its sends hopped from mapping to mapping, packet by packet: spread by accident, but a flow's packets could arrive at the branch out of order, on different workers. |
+| **C.** Branch behind NAT → hub | Spread already: the hub has a configured address, so the branch sends each flow from `49152 \| hash(flow)`, and its NAT makes a mapping per port. (The first draft of this design missed that.) The cost was on the hub's side, case B: a mapping per branch flow, and the hub chasing the newest. |
 | D. A PPPoE WAN | Cards can't hash inside PPPoE. Out of scope here, as for all PPPoE traffic (chapter 13). |
 
 Cases B and C are a hub and its home or LTE branches, the common setup.
@@ -120,13 +121,21 @@ replies are handed between workers. So every card is asked now.
 
 ### The idea
 
-A router configured with `[overlay] source_ports = N` (N from 1 to 8,
-default 1, so off) sends its tether packets **from N UDP ports**:
+What reading the code showed, and the first draft got wrong: a branch
+already sends from many ports (a port per flow, towards a hub with a
+configured address). What was missing was the hub keeping more than the
+last of them. So part 2 is mostly on the hub's side, with an option on
+the branch's to make the set small and steady.
+
+A router configured with `[overlay] source_ports = N` (N from 1 to 8;
+unset, a port per flow as before) sends its tether packets **from N UDP
+ports**:
 
 - the overlay port and the N − 1 ports after it (`4800`–`4803` for N = 4);
 - each inner flow always from the same one, `port + hash(flow) % N`.
 
-It also accepts tether traffic **to** any of those N ports.
+It accepts tether traffic to any of them already: anything from a peer's
+overlay port is tether traffic (`is_overlay`), whichever port it's to.
 
 Behind NAT, each source port gets its own NAT mapping. The far end
 learns each mapping as one more address and port for the tether, and
@@ -138,9 +147,9 @@ firewall rules and its upstream NAT's rules simple: one range.
 
 ### Sending side (the branch)
 
-- **`encap`:** towards a peer with a learned address (today: always the
-  overlay port), use `udp_port + flow_hash % N`. Towards a peer with a
-  configured address, nothing changes: `49152 | hash` already spreads.
+- **`encap`:** towards a peer with a configured address (the hub, from a
+  branch): `udp_port + flow_hash % N` instead of `49152 | flow_hash`.
+  Towards a peer with a learned address: the overlay port, as before.
 - **Probes** (5 a second per tether): sent from each of the N ports in
   turn, rather than from the overlay port only. Each NAT mapping then
   sees a packet every N × 200 ms (800 ms for N = 4), far inside any UDP
@@ -148,8 +157,7 @@ firewall rules and its upstream NAT's rules simple: one range.
   RTT, jitter and loss stay per tether, as today.
 - **Handshakes:** keep sending from the overlay port. Their rate is too
   low to matter.
-- **`is_overlay`:** accept UDP to any of the N ports, as well as from a
-  peer's overlay port, as now.
+- **`is_overlay`:** unchanged (see above).
 
 ### Receiving side (the hub)
 
@@ -158,7 +166,9 @@ firewall rules and its upstream NAT's rules simple: one range.
 
 - **Learning:** as today, only after a packet authenticates and passes the
   replay check. An address and port already known is refreshed; a new one
-  takes a free entry, or the stalest. All entries in a slot belong to the
+  takes a free or expired entry. With all 8 live, a new one isn't added,
+  so a branch sending from a port per flow (no `source_ports`) doesn't
+  churn the set with every flow. All entries in a slot belong to the
   same sending tether, which the slot is already bound to by the
   sender's tether id.
 - **Expiry:** an entry not heard from for 3 seconds is dropped. With
@@ -200,7 +210,7 @@ know which mapping is which, only that each one reaches the branch.
 | new (N = 4) → old hub | The old hub learns one port at a time, the newest. It may switch between the branch's four mappings, but each still reaches the branch, which listens on all four. It works, without spreading at the branch. |
 | old → new hub | One mapping: one entry. Same as today. |
 | new (N = 4) → new hub, configured address for the branch | The hub ignores the source port for configured peers, as today. The branch's spreading still helps the hub's receive side, if the hub's card hashes ports. |
-| new (N = 1) → anything | Today's behaviour exactly. |
+| unset → new hub | The branch sends from a port per flow, as before. The hub keeps the first 8 mappings it hears and sends each flow on one of them, so flows no longer hop between mappings. A set that changes as mappings go quiet can move some flows. `source_ports` avoids that. |
 
 `source_ports` needs no agreement between the two ends, so it can be
 turned on one router at a time.
@@ -234,8 +244,16 @@ turned on one router at a time.
   - Check that a flow's packets stay in order.
   - Flush conntrack mid-test: one mapping disappears, its flows recover
     within 3 s, and the others don't notice.
-- **The benchmark** (`--bench-pipeline`): add a case for tether receive
-  (decrypt + handoff), so the per-core cost is visible before and after.
+- **The benchmark** (`--bench-pipeline`, built): `tether-out` and
+  `tether-in`, small packets into and out of a tether with a pre-shared
+  key (ChaCha20-Poly1305). On an Apple M-series core both take about
+  610 ns, eight times a routed packet: the work worth spreading.
+- **Built and tested:** `Endpoints` keeping, refreshing, expiring and
+  choosing mappings (`overlay.rs`); a branch with `source_ports = 4`
+  sending each flow from one of 4800-4803 and its probes from each in
+  turn, and the hub sending each flow back on one of the four
+  (`tests_overlay.rs`); the config's limits (`eph-config`). The lab test
+  with a real NAT is still to do.
 
 ## Rollout
 

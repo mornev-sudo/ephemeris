@@ -216,6 +216,9 @@ masquerade = true
 # cipher = "auto"   # session keys: AES-256-GCM when both routers have AES in
 #                   # hardware, else ChaCha20-Poly1305; or force one of them.
 #                   # `ephemerisd --bench-crypto` measures both here.
+# source_ports = 4  # behind NAT: send from 4800-4803, so the NAT keeps four
+#                   # mappings and the hub spreads its traffic back over this
+#                   # router's workers (docs/learn/12-sdwan.md)
 
 # [[site]]
 # name = "jhb"

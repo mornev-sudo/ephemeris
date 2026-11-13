@@ -162,6 +162,12 @@ The exception: towards a peer whose address is *learned* (see
 Configuration), the source port is always the overlay port, because that
 peer may be behind a NAT that only lets replies in from the port it sent to.
 
+A router behind NAT can narrow its ports down: `source_ports = 4` in
+`[overlay]` sends from the overlay port and the three after it (4800-4803),
+each flow from one, and its probes take them in turn. Its NAT then keeps
+four mappings, always the same four, and the hub (below) sends each flow
+back on one of them.
+
 ## Measuring paths: probes
 
 One worker (the *prober*) sends a probe down every tether 5 times a second:
@@ -324,6 +330,16 @@ address *and port*, and sends there.
   hub's overlay port, so the NAT lets the replies in.
 - **Keepalives:** the branch's probes, five a second, keep the NAT's
   mapping alive.
+- **Spread over both routers' workers.** The branch's
+  traffic arrives from as many NAT mappings as it sends from ports, so the
+  hub's card spreads it over the hub's workers. The hub remembers up to 8
+  of those mappings per tether (only from authenticated packets, each
+  forgotten after 3 seconds of silence) and sends each flow back on one of
+  them, the same one every time: the branch's card spreads that too, and a
+  flow's packets stay in order. Give the branch `source_ports = 4` (above),
+  so the set it sends from is small and steady; without it, it sends from a
+  port per flow, and the hub keeps the first 8 it hears until they go
+  quiet.
 - **Several links:** a branch with fibre *and* LTE, each behind its own
   NAT, reaches the hub from two addresses. Tell the hub how many links it
   has (`links = 2` in its `[[site]]`; "Copy entry" fills it in), and the

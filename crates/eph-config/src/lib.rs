@@ -276,6 +276,22 @@ pub struct OverlayCfg {
     /// ChaCha20-Poly1305), or only "aes-256-gcm" or "chacha20-poly1305".
     #[serde(default, skip_serializing_if = "is_auto")]
     pub cipher: crate::CipherPref,
+    /// Behind NAT: send to other sites from this many UDP ports (1-8:
+    /// `udp_port` and the ones after it), each flow from one. The NAT then
+    /// keeps that many mappings, and a hub spreads its flows back over them,
+    /// so they arrive on more than one of this router's workers. Unset:
+    /// from as many ports as there are flows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ports: Option<u16>,
+}
+
+impl OverlayCfg {
+    /// The UDP ports this router's tethers use: the overlay port, and the
+    /// rest of `source_ports`.
+    pub fn ports(&self) -> (u16, u16) {
+        let n = self.source_ports.unwrap_or(1).max(1);
+        (self.udp_port, self.udp_port.saturating_add(n - 1))
+    }
 }
 
 fn is_auto(c: &crate::CipherPref) -> bool {
@@ -1735,10 +1751,13 @@ impl Config {
             }
             // The router's own UDP services on that address.
             if proto == eph_packet::ipv4::PROTO_UDP {
-                let overlay = self.overlay.as_ref().map(|o| o.udp_port);
-                for own in [Some(67), Some(68), overlay].into_iter().flatten() {
-                    if (ports.0..=ports.1).contains(&own) {
-                        bail!("{}: UDP {own} is the router's own (DHCP or SD-WAN)", ctx());
+                let overlay = self.overlay.as_ref().map(|o| o.ports());
+                for (lo, hi) in [Some((67, 68)), overlay].into_iter().flatten() {
+                    if ports.0 <= hi && lo <= ports.1 {
+                        bail!(
+                            "{}: UDP {lo}-{hi} is the router's own (DHCP or SD-WAN)",
+                            ctx()
+                        );
                     }
                 }
             }
@@ -1851,6 +1870,12 @@ impl Config {
         };
         o.site_id = oc.site_id;
         o.udp_port = oc.udp_port;
+        if let Some(n) = oc.source_ports {
+            if !(1..=8).contains(&n) || oc.udp_port.checked_add(n - 1).is_none() {
+                bail!("overlay.source_ports must be 1 to 8, with that many ports after udp_port");
+            }
+            o.source_ports = n;
+        }
         o.mtu = oc.mtu;
         // Tethers over a PPPoE WAN lose 8 more bytes: shrink the default.
         if oc.mtu == DEFAULT_MTU && self.interfaces.iter().any(|i| i.is_pppoe()) {
@@ -2580,6 +2605,35 @@ key = "2222222222222222222222222222222222222222222222222222222222222222"
                 "{dst} via the hub"
             );
         }
+    }
+
+    #[test]
+    fn source_ports_are_one_to_eight_ports_after_the_overlay_port() {
+        let with = |v: &str| {
+            let text = SITES_CFG.replacen(
+                "[overlay]\n",
+                &format!("[overlay]\nsource_ports = {v}\n"),
+                1,
+            );
+            parse(&text).and_then(|c| c.overlay())
+        };
+        assert_eq!(
+            parse(SITES_CFG).unwrap().overlay().unwrap().source_ports,
+            0,
+            "unset: by flow"
+        );
+        assert_eq!(with("4").unwrap().source_ports, 4);
+        for bad in ["0", "9"] {
+            assert!(
+                format!("{:#}", with(bad).unwrap_err()).contains("source_ports"),
+                "{bad}"
+            );
+        }
+        // All of them are the router's own (a port forward can't take them).
+        let text = SITES_CFG.replacen("[overlay]\n", "[overlay]\nsource_ports = 4\n", 1);
+        let c: Config = toml::from_str(&text).unwrap();
+        let o = c.overlay.as_ref().unwrap();
+        assert_eq!(o.ports(), (o.udp_port, o.udp_port + 3));
     }
 
     #[test]

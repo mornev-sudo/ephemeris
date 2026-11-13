@@ -51,6 +51,17 @@ pub(crate) fn router_full(
     dynamic: bool,
     handshake: bool,
 ) -> Pipeline {
+    router_with(site, key, dynamic, handshake, |_| {})
+}
+
+/// [`router_full`], with `tweak` applied to its overlay settings.
+fn router_with(
+    site: u8,
+    key: Option<TetherKey>,
+    dynamic: bool,
+    handshake: bool,
+    tweak: impl FnOnce(&mut Overlay),
+) -> Pipeline {
     let other = 3 - site;
     let lan = format!("10.{site}.0.1/24");
     let ports: Arc<[Port]> = Arc::new([
@@ -108,6 +119,7 @@ pub(crate) fn router_full(
         site_idx: 0,
     }];
     let fib = build_fib(&ports, &[], &routes).unwrap();
+    tweak(&mut o);
     let o = Arc::new(o);
     let mut r = Pipeline::new(ports, Arc::new(fib), SessionConfig::default(), o.clone());
     r.set_time(1_000_000_000);
@@ -726,6 +738,111 @@ fn a_tether_inside_a_tether_is_rejected() {
         drop_reason(r2.process(1, &mut f, OFF, len)),
         DropReason::BadOverlay
     );
+}
+
+/// A TCP segment between host A (site 1) and host B (site 2): `a_to_b`,
+/// from A port 40000 to B port `bport`, else back.
+fn tcp_ab(a_to_b: bool, bport: u16, flags: u8) -> (Vec<u8>, usize) {
+    let (mut f, n) = if a_to_b {
+        packet(
+            mac(1, 0),
+            HOST_A,
+            "10.1.0.10",
+            "10.2.0.10",
+            Some(bport),
+            0,
+            true,
+        )
+    } else {
+        packet(
+            mac(2, 0),
+            HOST_B,
+            "10.2.0.10",
+            "10.1.0.10",
+            Some(40000),
+            0,
+            true,
+        )
+    };
+    let l = OFF + 34;
+    let (sport, dport) = if a_to_b {
+        (40000, bport)
+    } else {
+        (bport, 40000)
+    };
+    f[l..l + 2].copy_from_slice(&sport.to_be_bytes());
+    f[l + 2..l + 4].copy_from_slice(&dport.to_be_bytes());
+    f[l + 13] = flags;
+    set_tcp_checksum(&mut f[OFF + 14..OFF + n]);
+    (f, n)
+}
+
+/// R1 behind NAT with `source_ports = 4`: each flow leaves from one of
+/// 4800-4803, always the same one, and its probes take them in turn. R2,
+/// which learns R1's address, sends each flow back to one of the mappings
+/// it has heard, always the same one, instead of wherever R1 last sent from.
+#[test]
+fn a_router_behind_nat_sends_from_its_source_ports_and_gets_flows_back_on_them() {
+    let mut r1 = router_with(1, Some(KEY), false, false, |o| o.source_ports = 4);
+    let mut r2 = router_opts(2, Some(KEY), true);
+    let mut sports = std::collections::BTreeMap::new();
+    for id in 1000..1064u16 {
+        for flags in [l4::TCP_SYN, l4::TCP_ACK] {
+            let (mut f, n) = tcp_ab(true, id, flags);
+            let (port, off, len) = tx(r1.process(0, &mut f, OFF, n));
+            assert_eq!(port, 1, "over the fibre");
+            let sport = u16::from_be_bytes([f[off + 34], f[off + 35]]);
+            assert!((4800..4804).contains(&sport), "{sport}");
+            assert_eq!(
+                *sports.entry(id).or_insert(sport),
+                sport,
+                "a flow keeps its port"
+            );
+            // R2 hears it, as if through a NAT that kept the port.
+            tx(r2.process(1, &mut f, off, len));
+        }
+    }
+    let used: std::collections::BTreeSet<_> = sports.values().copied().collect();
+    assert_eq!(used, (4800..4804).collect(), "all four ports used");
+
+    // R2's replies: each flow to one of R1's four mappings, the same one
+    // every time, and between them all four.
+    let mut back = std::collections::BTreeMap::new();
+    for id in 1000..1064u16 {
+        for flags in [l4::TCP_SYN | l4::TCP_ACK, l4::TCP_ACK] {
+            let (mut f, n) = tcp_ab(false, id, flags);
+            let (_, off, len) = tx(r2.process(0, &mut f, OFF, n));
+            let dport = u16::from_be_bytes([f[off + 36], f[off + 37]]);
+            assert_eq!(
+                u16::from_be_bytes([f[off + 34], f[off + 35]]),
+                4800,
+                "from the overlay port"
+            );
+            assert_eq!(
+                *back.entry(id).or_insert(dport),
+                dport,
+                "a flow keeps its mapping"
+            );
+            tx(r1.process(1, &mut f, off, len));
+        }
+    }
+    let used: std::collections::BTreeSet<_> = back.values().copied().collect();
+    assert_eq!(used, (4800..4804).collect());
+
+    // Probes go round the four ports.
+    let mut probe_ports = std::collections::BTreeSet::new();
+    r1.set_prober(true);
+    for k in 1..=8u64 {
+        r1.set_time(1_000_000_000 + k * overlay::PROBE_INTERVAL_NS);
+        r1.housekeeping();
+        for e in r1.emits.drain(..) {
+            let f = &e.frame[..e.len];
+            if f.len() > 36 && u16::from_be_bytes([f[36], f[37]]) == 4800 && e.port == 1 {
+                probe_ports.insert(u16::from_be_bytes([f[34], f[35]]));
+            }
+        }
+    }
+    assert_eq!(probe_ports, (4800..4804).collect());
 }
 
 #[test]
